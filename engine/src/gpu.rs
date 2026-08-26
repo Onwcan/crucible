@@ -26,6 +26,12 @@ const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// slower -- the exact failure this project checks for elsewhere.
 const ARCH: &str = "compute_120";
 
+/// A projection's device buffers, borrowed so a fused kernel can take two.
+pub enum Proj2<'a> {
+    F32(&'a CudaSlice<f32>),
+    Int8(&'a CudaSlice<i8>, &'a CudaSlice<f32>),
+}
+
 /// Indices into the per-step parameter buffer that lives on the device.
 ///
 /// A captured CUDA graph freezes kernel arguments, so anything that changes per
@@ -69,6 +75,8 @@ pub struct Gpu {
     gemv_i8_vec4: CudaFunction,
     gemv_i8_warp: CudaFunction,
     gemv_warp: CudaFunction,
+    mlp_swiglu_i8: CudaFunction,
+    mlp_swiglu_f32: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -119,6 +127,8 @@ impl Gpu {
             gemv_i8_vec4: cu(module.load_function("gemv_i8_f32_vec4"))?,
             gemv_i8_warp: cu(module.load_function("gemv_i8_f32_warp"))?,
             gemv_warp: cu(module.load_function("gemv_f32_warp"))?,
+            mlp_swiglu_i8: cu(module.load_function("mlp_swiglu_i8_warp"))?,
+            mlp_swiglu_f32: cu(module.load_function("mlp_swiglu_f32"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -160,7 +170,15 @@ impl Gpu {
         params: &CudaSlice<i32>,
         y_base: usize,
         y_idx: usize,
+        accumulate: bool,
     ) -> Result<()> {
+        // The f32 kernels do not implement accumulation. Silently overwriting
+        // the residual instead of adding to it produces a model that still
+        // generates fluent text, so fail loudly rather than let a caller find
+        // out from a perplexity check.
+        if accumulate {
+            anyhow::bail!("accumulate is not implemented for the f32 path");
+        }
         // Block per row. A warp-per-row variant exists and is used for int8,
         // but at f32 it measured 737/736/864 tok/s against 825 for this path --
         // a possible regression sitting inside its own 17% spread, so unproven
@@ -174,8 +192,9 @@ impl Gpu {
             shared_mem_bytes: 0,
         };
         let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
+        let acc = i32::from(accumulate);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx);
+        b.arg(w).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx).arg(&acc);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -368,6 +387,7 @@ impl Gpu {
         params: &CudaSlice<i32>,
         y_base: usize,
         y_idx: usize,
+        accumulate: bool,
     ) -> Result<()> {
         // One warp per row when a block would be starved. At int8 a 768-column
         // row is 192 char4 loads against 256 threads: a quarter of the block
@@ -400,8 +420,9 @@ impl Gpu {
             )
         };
         let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
+        let acc = i32::from(accumulate);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx);
+        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx).arg(&acc);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -429,6 +450,50 @@ impl Gpu {
         let mut b = self.stream.launch_builder(func);
         b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Fused SwiGLU: out = silu(gate . x) * (up . x).
+    ///
+    /// Replaces three kernels -- two projections and an elementwise product --
+    /// with one, removing two dispatches per layer and two round trips through
+    /// a `hidden`-sized buffer. CUDA graphs removed the CPU cost of launching,
+    /// but each kernel still pays GPU-side dispatch, so kernel count continues
+    /// to matter.
+    pub fn mlp_swiglu(
+        &self,
+        gate: &Proj2,
+        up: &Proj2,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        let (r, c) = (rows as i32, cols as i32);
+        match (gate, up) {
+            (Proj2::Int8(gw, gs), Proj2::Int8(uw, us)) => {
+                let warps = (REDUCE_THREADS / 32) as usize;
+                let cfg = LaunchConfig {
+                    grid_dim: (rows.div_ceil(warps) as u32, 1, 1),
+                    block_dim: (REDUCE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut b = self.stream.launch_builder(&self.mlp_swiglu_i8);
+                b.arg(*gw).arg(*gs).arg(*uw).arg(*us).arg(x).arg(out).arg(&r).arg(&c);
+                unsafe { cu(b.launch(cfg))? };
+            }
+            (Proj2::F32(gw), Proj2::F32(uw)) => {
+                let cfg = LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (REDUCE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut b = self.stream.launch_builder(&self.mlp_swiglu_f32);
+                b.arg(*gw).arg(*uw).arg(x).arg(out).arg(&r).arg(&c);
+                unsafe { cu(b.launch(cfg))? };
+            }
+            _ => anyhow::bail!("gate and up must share a precision"),
+        }
         Ok(())
     }
 

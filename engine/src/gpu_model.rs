@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use cudarc::driver::{CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{Gpu, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{Gpu, Proj2, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::quant::QuantTensor;
 use crate::weights::Weights;
@@ -50,6 +50,13 @@ enum Proj {
 }
 
 impl Proj {
+    fn view(&self) -> Proj2<'_> {
+        match self {
+            Proj::F32(d) => Proj2::F32(d),
+            Proj::Int8 { data, scales } => Proj2::Int8(data, scales),
+        }
+    }
+
     fn bytes(&self, rows: usize, cols: usize) -> usize {
         match self {
             Proj::F32(_) => rows * cols * 4,
@@ -237,12 +244,15 @@ impl GpuModel {
         params: &CudaSlice<i32>,
         y_base: usize,
         y_idx: usize,
+        accumulate: bool,
     ) -> Result<()> {
         match w {
-            Proj::F32(data) => gpu.gemv_at(data, x, y, rows, cols, params, y_base, y_idx),
-            Proj::Int8 { data, scales } => {
-                gpu.gemv_i8_at(data, scales, x, y, rows, cols, params, y_base, y_idx)
+            Proj::F32(data) => {
+                gpu.gemv_at(data, x, y, rows, cols, params, y_base, y_idx, accumulate)
             }
+            Proj::Int8 { data, scales } => gpu.gemv_i8_at(
+                data, scales, x, y, rows, cols, params, y_base, y_idx, accumulate,
+            ),
         }
     }
 
@@ -309,14 +319,14 @@ impl GpuModel {
             // K and V land directly in the cache; the slot offset comes from
             // the parameter buffer so the graph stays valid as pos advances.
             Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
-                              kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                              kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
             Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
-                              kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                              kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
             self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
                              n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
 
             Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
-                              d, d, &self.params, 0, PARAM_ZERO)?;
+                              d, d, &self.params, 0, PARAM_ZERO, false)?;
             self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
                              n_head, hd, &self.params, 0, PARAM_ZERO)?;
 
@@ -324,30 +334,46 @@ impl GpuModel {
                                       n_head, n_kv, hd, &self.params,
                                       self.capacity, kv_dim, layer_base)?;
 
-            Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
-                              d, d, &self.params, 0, PARAM_ZERO)?;
-            self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
+            // Fused residual: the projection accumulates straight into the
+            // stream, removing a kernel. Only the warp-per-row path supports
+            // it, so f32 keeps the separate add.
+            if self.precision == Precision::Int8 {
+                Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.x,
+                                  d, d, &self.params, 0, PARAM_ZERO, true)?;
+            } else {
+                Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
+                                  d, d, &self.params, 0, PARAM_ZERO, false)?;
+                self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
+            }
 
             self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
             match &layer.gate_proj {
-                Some(gate) => {
-                    Self::project_dyn(&self.gpu, gate, &s.normed, &mut s.gate,
-                                      self.hidden, d, &self.params, 0, PARAM_ZERO)?;
-                    Self::project_dyn(&self.gpu, &layer.up_proj, &s.normed, &mut s.up,
-                                      self.hidden, d, &self.params, 0, PARAM_ZERO)?;
-                    self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
-                }
+                // One kernel instead of three: both projections and the
+                // elementwise product, with no hidden-sized intermediates.
+                Some(gate) => self.gpu.mlp_swiglu(
+                    &gate.view(),
+                    &layer.up_proj.view(),
+                    &s.normed,
+                    &mut s.gate,
+                    self.hidden,
+                    d,
+                )?,
                 None => bail!("the GPU path currently implements swiglu only"),
             }
-            Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
-                              d, self.hidden, &self.params, 0, PARAM_ZERO)?;
-            self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+            if self.precision == Precision::Int8 {
+                Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.x,
+                                  d, self.hidden, &self.params, 0, PARAM_ZERO, true)?;
+            } else {
+                Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
+                                  d, self.hidden, &self.params, 0, PARAM_ZERO, false)?;
+                self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+            }
         }
 
         let s = &mut self.scratch;
         self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
         Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
-                          cfg.vocab_size, d, &self.params, 0, PARAM_ZERO)?;
+                          cfg.vocab_size, d, &self.params, 0, PARAM_ZERO, false)?;
         Ok(())
     }
 
@@ -390,7 +416,15 @@ impl GpuModel {
     /// The syncs serialise work that normally overlaps, so absolute totals come
     /// out higher than real decode. The proportions are what this is for --
     /// which stage to attack, not how fast the engine is.
+    ///
+    /// This mirrors `queue_token` stage for stage, including the fused paths.
+    /// The two are separate functions because timing needs syncs between
+    /// stages and decode must not have them, which means they can drift: an
+    /// earlier version profiled the unfused MLP after decode had been fused,
+    /// and reported a `residual` stage that no longer existed. Any change to
+    /// `queue_token` belongs here too.
     pub fn profile_step(&mut self, token: usize, iters: usize) -> Result<ProfileReport> {
+        let int8 = self.precision == Precision::Int8;
         let cfg = self.cfg.clone();
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
@@ -418,7 +452,7 @@ impl GpuModel {
             ("attention".into(), n_layer),
             ("o_proj".into(), n_layer),
             ("mlp".into(), n_layer),
-            ("residual".into(), 2 * n_layer),
+            ("residual".into(), if int8 { 0 } else { 2 * n_layer }),
             ("lm_head".into(), 1),
             ("logits_copy".into(), 1),
         ];
@@ -461,11 +495,11 @@ impl GpuModel {
                 });
                 timed!(2, {
                     Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
-                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
                     Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
-                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
                     Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
-                                      d, d, &self.params, 0, PARAM_ZERO)?;
+                                      d, d, &self.params, 0, PARAM_ZERO, false)?;
                 });
                 timed!(3, {
                     self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
@@ -479,39 +513,55 @@ impl GpuModel {
                                               self.capacity, kv_dim, layer_base)?;
                 });
                 timed!(5, {
-                    Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
-                                      d, d, &self.params, 0, PARAM_ZERO)?;
+                    if int8 {
+                        // Residual folded into the projection.
+                        Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.x,
+                                          d, d, &self.params, 0, PARAM_ZERO, true)?;
+                    } else {
+                        Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
+                                          d, d, &self.params, 0, PARAM_ZERO, false)?;
+                    }
                 });
-                timed!(7, {
-                    self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
-                });
+                if !int8 {
+                    timed!(7, {
+                        self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
+                    });
+                }
                 timed!(1, {
                     self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
                 });
                 timed!(6, {
                     match &layer.gate_proj {
-                        Some(gate) => {
-                            Self::project_dyn(&self.gpu, gate, &s.normed, &mut s.gate,
-                                              self.hidden, d, &self.params, 0, PARAM_ZERO)?;
-                            Self::project_dyn(&self.gpu, &layer.up_proj, &s.normed, &mut s.up,
-                                              self.hidden, d, &self.params, 0, PARAM_ZERO)?;
-                            self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
-                        }
+                        Some(gate) => self.gpu.mlp_swiglu(
+                            &gate.view(),
+                            &layer.up_proj.view(),
+                            &s.normed,
+                            &mut s.gate,
+                            self.hidden,
+                            d,
+                        )?,
                         None => bail!("swiglu only"),
                     }
-                    Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
-                                      d, self.hidden, &self.params, 0, PARAM_ZERO)?;
+                    if int8 {
+                        Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.x,
+                                          d, self.hidden, &self.params, 0, PARAM_ZERO, true)?;
+                    } else {
+                        Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
+                                          d, self.hidden, &self.params, 0, PARAM_ZERO, false)?;
+                    }
                 });
-                timed!(7, {
-                    self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
-                });
+                if !int8 {
+                    timed!(7, {
+                        self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+                    });
+                }
             }
 
             timed!(8, {
                 let s = &mut self.scratch;
                 self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
                 Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
-                                  cfg.vocab_size, d, &self.params, 0, PARAM_ZERO)?;
+                                  cfg.vocab_size, d, &self.params, 0, PARAM_ZERO, false)?;
             });
 
             let t0 = std::time::Instant::now();

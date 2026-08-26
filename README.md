@@ -4,9 +4,9 @@ Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **~1149 tok/s on GPU** (int8 + CUDA graphs + coalesced kernels,
-> 119x the CPU reference), with cross-entropy unchanged and output matching the
-> CPU path whose logits match PyTorch.
+> generates at **~1320 tok/s on GPU** (int8 + CUDA graphs + fused kernels, 137x
+> the CPU reference), with cross-entropy unchanged and output matching the CPU
+> path whose logits match PyTorch.
 
 ## Why Blackwell specifically
 
@@ -834,11 +834,79 @@ help. An f32 row carries four times the bytes, so its block is far less starved.
 **119x the CPU reference**, with cross-entropy unchanged at every step
 (3.720334 for int8, before and after both kernel rewrites).
 
-Still only ~17% of the bandwidth ceiling: 0.114 GB of int8 weights at 0.87 ms is
-131 GB/s against 757 measured. The MLP is now the largest stage and its three
-projections are most of the model's weights, so 28.5% of time for ~76% of the
-bytes is not obviously wrong -- the next real gain likely needs fusing the
-per-layer sequence rather than tuning individual kernels further.
+Still well under the bandwidth ceiling. The MLP was the largest stage and its
+three projections are most of the model's weights, so the next gain looked like
+it needed fusing the per-layer sequence rather than tuning kernels further --
+which is what happened next.
+
+### Kernel fusion
+
+Graphs removed the CPU cost of launching, but each kernel still pays GPU-side
+dispatch, so kernel *count* keeps mattering. Three fusions, all int8:
+
+- **SwiGLU**: `silu(gate . x) * (up . x)` in one kernel instead of three, with
+  no `hidden`-sized intermediates. MLP time halved, 0.349 to 0.174 ms.
+- **Residual into projection**: `o_proj` and `down_proj` accumulate straight
+  into the residual stream, removing the separate `add_inplace` at both sites.
+
+Decode went 1149 to **1320 tok/s** (median of five), 0.76 ms/token. Cross-entropy
+unchanged at 3.720334.
+
+**The fusion shipped broken first, and speed alone would have passed it.**
+`gemv_i8_at` routes to warp-per-row only when `cols/4 < 256`; `down_proj` has
+2048 columns, so it took the block-per-row kernel, which had no `accumulate`
+parameter. It overwrote the residual stream instead of adding to it. The engine
+ran *faster* while doing this, generated fluent text, and perplexity went from
+41.28 to **64,300**. Only the held-out cross-entropy check caught it. The f32
+path now fails loudly rather than silently overwriting.
+
+The profiler broke in the same way, more quietly: `profile_step` duplicates the
+forward pass so it can sync between stages, and only `queue_token` was fused --
+so it spent a round reporting a `residual` stage that no longer existed. Both
+now mirror each other, and the duplication is called out in the code as
+something that must be kept in step.
+
+### Where decode stands
+
+| path | tok/s | ms/token |
+|---|---:|---:|
+| CPU reference (scalar) | 9.7 | 103 |
+| GPU eager, f32 | 509 | 1.96 |
+| GPU graph, f32 | 825 | 1.21 |
+| GPU graph, int8 | 1149 | 0.87 |
+| GPU graph, int8, fused | **1320** | **0.76** |
+
+**137x the CPU reference**, cross-entropy unchanged at every step.
+
+Current stage breakdown (`gpu-profile`, position ~256):
+
+| stage | adjusted ms | share |
+|---|---:|---:|
+| attention | 0.427 | 38.8% |
+| mlp | 0.174 | 15.8% |
+| qkv_proj | 0.173 | 15.7% |
+| rmsnorm | 0.100 | 9.1% |
+| rope | 0.073 | 6.7% |
+| lm_head | 0.061 | 5.5% |
+| logits_copy | 0.060 | 5.5% |
+| o_proj | 0.031 | 2.8% |
+
+### Next: attention is occupancy-bound, not bandwidth-bound
+
+Attention now dominates at 38.8%, and the reason is not kernel quality. At
+position 256 it reads roughly 4.7 MB of KV cache per token, which at 757 GB/s
+should take about 6 us. It takes 427.
+
+The kernel launches **one block per head -- 12 blocks**, or 3072 threads, on a
+GPU with dozens of SMs. Most of the machine is idle. Coalescing the reads (an
+earlier fix) helped, but no amount of per-thread tuning fixes a grid that cannot
+fill the device.
+
+The fix is to parallelise over positions as well as heads: split the sequence
+into chunks, have each block compute a partial softmax over its chunk, and
+combine the partials in a second pass -- the flash-decoding approach. That is
+the next piece of work, and it is worth more than anything left in the other
+stages combined.
 
 ## Layout
 
@@ -908,6 +976,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] int8 quantisation: 4x smaller weights, +0.001% cross-entropy
 - [x] CUDA graphs: 1.39x (f32) / 1.60x (int8), and int8's own gain rose 1.05x -> 1.21x
 - [x] Profiler with sync-overhead correction; coalesced attention; warp-per-row int8 GEMV
+- [x] Kernel fusion: SwiGLU in one kernel, residual folded into the projections
+- [ ] Split-position attention (flash-decoding) — the kernel fills 12 blocks of a many-SM GPU
 - [ ] Paged attention → continuous batching
 - [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
 

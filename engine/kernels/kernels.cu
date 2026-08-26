@@ -405,7 +405,8 @@ extern "C" __global__ void gemv_i8_f32(
     const int cols,
     const int* __restrict__ params,
     const int y_base,
-    const int y_idx)
+    const int y_idx,
+    const int accumulate)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -418,7 +419,10 @@ extern "C" __global__ void gemv_i8_f32(
 
     acc = block_reduce_sum(acc);
     // The row scale is applied once to the reduced value, not per term.
-    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
+    if (threadIdx.x == 0) {
+        const int o = y_base + params[y_idx] + row;
+        y[o] = accumulate ? y[o] + acc * scales[row] : acc * scales[row];
+    }
 }
 
 // Same, reading four weights per load.
@@ -437,7 +441,8 @@ extern "C" __global__ void gemv_i8_f32_vec4(
     const int cols,
     const int* __restrict__ params,
     const int y_base,
-    const int y_idx)
+    const int y_idx,
+    const int accumulate)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -455,7 +460,10 @@ extern "C" __global__ void gemv_i8_f32_vec4(
     }
 
     acc = block_reduce_sum(acc);
-    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
+    if (threadIdx.x == 0) {
+        const int o = y_base + params[y_idx] + row;
+        y[o] = accumulate ? y[o] + acc * scales[row] : acc * scales[row];
+    }
 }
 
 // Embedding lookup from an int8 table, applying that row's scale.
@@ -501,7 +509,8 @@ extern "C" __global__ void gemv_i8_f32_warp(
     const int cols,
     const int* __restrict__ params,
     const int y_base,
-    const int y_idx)
+    const int y_idx,
+    const int accumulate)
 {
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
@@ -522,7 +531,13 @@ extern "C" __global__ void gemv_i8_f32_warp(
     }
 
     acc = warp_reduce_sum(acc);
-    if (lane == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
+    if (lane == 0) {
+        const int o = y_base + params[y_idx] + row;
+        // accumulate folds the residual add into this write: o_proj and
+        // down_proj land directly in the residual stream, removing one kernel
+        // per site. The branch is uniform across the warp, so it costs nothing.
+        y[o] = accumulate ? y[o] + acc * scales[row] : acc * scales[row];
+    }
 }
 
 extern "C" __global__ void gemv_f32_warp(
@@ -533,7 +548,8 @@ extern "C" __global__ void gemv_f32_warp(
     const int cols,
     const int* __restrict__ params,
     const int y_base,
-    const int y_idx)
+    const int y_idx,
+    const int accumulate)
 {
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
@@ -553,5 +569,95 @@ extern "C" __global__ void gemv_f32_warp(
     }
 
     acc = warp_reduce_sum(acc);
-    if (lane == 0) y[y_base + params[y_idx] + row] = acc;
+    if (lane == 0) {
+        const int o = y_base + params[y_idx] + row;
+        y[o] = accumulate ? y[o] + acc : acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused SwiGLU: silu(gate . x) * (up . x)
+//
+// Unfused this is three kernels writing three `hidden`-sized buffers: gate, up,
+// then the elementwise product. Fusing removes two kernel dispatches per layer
+// -- 24 per token at 12 layers -- and two round trips through a 2048-element
+// buffer.
+//
+// CUDA graphs removed the CPU cost of launching, but each kernel still pays
+// GPU-side dispatch, so kernel COUNT continues to matter. One warp per output
+// row, as with the standalone GEMV, since a 768-column row starves a block.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void mlp_swiglu_i8_warp(
+    const signed char* __restrict__ gate_w,
+    const float* __restrict__ gate_scales,
+    const signed char* __restrict__ up_w,
+    const float* __restrict__ up_scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    const int rows,
+    const int cols)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int row = blockIdx.x * (blockDim.x / WARP_SIZE) + warp;
+    if (row >= rows) return;
+
+    const char4* g_row = reinterpret_cast<const char4*>(gate_w + (size_t)row * cols);
+    const char4* u_row = reinterpret_cast<const char4*>(up_w + (size_t)row * cols);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const int cols4 = cols / 4;
+
+    float g = 0.0f;
+    float u = 0.0f;
+    for (int i = lane; i < cols4; i += WARP_SIZE) {
+        const float4 b = x4[i];
+        const char4 a = g_row[i];
+        const char4 c = u_row[i];
+        g += (float)a.x * b.x + (float)a.y * b.y + (float)a.z * b.z + (float)a.w * b.w;
+        u += (float)c.x * b.x + (float)c.y * b.y + (float)c.z * b.z + (float)c.w * b.w;
+    }
+
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+
+    if (lane == 0) {
+        const float gs = g * gate_scales[row];
+        const float us = u * up_scales[row];
+        out[row] = (gs / (1.0f + __expf(-gs))) * us;
+    }
+}
+
+extern "C" __global__ void mlp_swiglu_f32(
+    const float* __restrict__ gate_w,
+    const float* __restrict__ up_w,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    const int rows,
+    const int cols)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float4* g_row = reinterpret_cast<const float4*>(gate_w + (size_t)row * cols);
+    const float4* u_row = reinterpret_cast<const float4*>(up_w + (size_t)row * cols);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const int cols4 = cols / 4;
+
+    float g = 0.0f;
+    float u = 0.0f;
+    for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
+        const float4 b = x4[i];
+        const float4 a = g_row[i];
+        const float4 c = u_row[i];
+        g += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        u += c.x * b.x + c.y * b.y + c.z * b.z + c.w * b.w;
+    }
+
+    g = block_reduce_sum(g);
+    u = block_reduce_sum(u);
+
+    if (threadIdx.x == 0) {
+        out[row] = (g / (1.0f + __expf(-g))) * u;
+    }
 }
