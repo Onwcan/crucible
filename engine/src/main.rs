@@ -57,6 +57,9 @@ enum Command {
         /// Weight precision: f32 or int8
         #[arg(long, default_value = "f32")]
         quant: String,
+        /// Replay decode from a captured CUDA graph
+        #[arg(long)]
+        graph: bool,
     },
     /// Cross-entropy on held-out tokens, per precision.
     ///
@@ -73,6 +76,9 @@ enum Command {
         /// Comma-separated precisions to compare
         #[arg(long, default_value = "f32,int8")]
         quant: String,
+        /// Replay decode from a captured CUDA graph
+        #[arg(long)]
+        graph: bool,
     },
     /// Encode text and print token ids, to compare against tiktoken.
     Tokenize {
@@ -98,6 +104,9 @@ enum Command {
         /// Run on the GPU instead of the CPU reference path
         #[arg(long)]
         gpu: bool,
+        /// Replay decode from a captured CUDA graph (implies --gpu)
+        #[arg(long)]
+        graph: bool,
     },
 }
 
@@ -111,11 +120,13 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuBench { rows, cols, iters } => llm_engine::gpu::bench(rows, cols, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuLogits { model, tokens, top, decode, quant } => {
-            gpu_logits(model, &tokens, top, decode, &quant)
+        Command::GpuLogits { model, tokens, top, decode, quant, graph } => {
+            gpu_logits(model, &tokens, top, decode, &quant, graph)
         }
         #[cfg(feature = "cuda")]
-        Command::GpuEval { model, data, tokens, quant } => gpu_eval(model, data, tokens, &quant),
+        Command::GpuEval { model, data, tokens, quant, graph } => {
+            gpu_eval(model, data, tokens, &quant, graph)
+        }
         Command::Generate {
             model,
             tokenizer,
@@ -125,7 +136,8 @@ fn main() -> Result<()> {
             top_k,
             seed,
             gpu,
-        } => generate(model, tokenizer, &prompt, max_tokens, temperature, top_k, seed, gpu),
+            graph,
+        } => generate(model, tokenizer, &prompt, max_tokens, temperature, top_k, seed, gpu || graph, graph),
     }
 }
 
@@ -201,6 +213,7 @@ fn generate(
     top_k: usize,
     seed: u64,
     use_gpu: bool,
+    use_graph: bool,
 ) -> Result<()> {
     let cfg = Config::from_file(model_dir.join("config.json"))?;
     let weights = Weights::open(model_dir.join("model.safetensors"))?;
@@ -216,11 +229,13 @@ fn generate(
     let mut backend = if use_gpu {
         #[cfg(feature = "cuda")]
         {
-            Backend::Gpu(llm_engine::gpu_model::GpuModel::load(
+            let mut m = llm_engine::gpu_model::GpuModel::load(
                 cfg.clone(),
                 &weights,
                 block_size,
-            )?)
+            )?;
+            m.enable_graph(use_graph);
+            Backend::Gpu(m)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -255,7 +270,8 @@ fn generate(
     let mut rng = Rng(seed | 1);
 
     println!("prompt      : {prompt:?} ({prompt_len} tokens)");
-    println!("backend     : {}", if use_gpu { "gpu" } else { "cpu" });
+    println!("backend     : {}{}", if use_gpu { "gpu" } else { "cpu" },
+             if use_graph { " (cuda graph)" } else { "" });
     println!("sampling    : temperature {temperature}, top-k {top_k}, seed {seed}");
     println!();
     print!("{prompt}");
@@ -421,7 +437,8 @@ fn inspect(dir: PathBuf, verbose: bool) -> Result<()> {
 
 
 #[cfg(feature = "cuda")]
-fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str, graph: bool) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let precision = Precision::parse(quant)
@@ -438,7 +455,8 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
 
     let started = std::time::Instant::now();
     let mut gpu_model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
-    println!("precision   {quant}");
+    gpu_model.enable_graph(graph);
+    println!("precision   {quant}, graph {}", if graph { "on" } else { "off" });
     println!("load        {:.0} ms, {:.0} MB weights + {:.0} MB cache",
              started.elapsed().as_secs_f64() * 1000.0,
              gpu_model.weight_bytes() as f64 / 1e6,
@@ -502,9 +520,10 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
         }
         let secs = started.elapsed().as_secs_f64();
         println!();
-        println!("decode      {decode} tokens in {secs:.2} s  ({:.1} tok/s, {:.2} ms/token)",
+        println!("decode      {decode} tokens in {secs:.2} s  ({:.1} tok/s, {:.2} ms/token){}",
                  decode as f64 / secs,
-                 secs * 1000.0 / decode as f64);
+                 secs * 1000.0 / decode as f64,
+                 if gpu_model.graph_active() { "  [graph]" } else { "" });
     }
 
     Ok(())
@@ -512,7 +531,7 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
 
 
 #[cfg(feature = "cuda")]
-fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str) -> Result<()> {
+fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let cfg = Config::from_file(dir.join("config.json"))?;
@@ -540,6 +559,7 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str) -> Result
             .ok_or_else(|| anyhow::anyhow!("unknown precision {name:?}"))?;
 
         let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        model.enable_graph(graph);
 
         // Teacher forcing: feed the true token at every step and score the
         // model's prediction of the next one. Feeding its own samples back

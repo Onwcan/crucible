@@ -7,11 +7,30 @@
 // ceiling regardless of how much arithmetic throughput the card has. These
 // kernels are therefore written to maximise read bandwidth, not FLOPs.
 //
-// gemv reaches 723-770 GB/s, so it is already bandwidth-saturated: the only
-// remaining lever for decode speed is reading fewer bytes, i.e. quantisation.
+// gemv reaches 723-770 GB/s, so it is already bandwidth-saturated.
 //
 // Every kernel has a scalar CPU twin in src/ops.rs. The CPU version is the
 // reference; when the two disagree the GPU one is wrong.
+//
+// ---------------------------------------------------------------------------
+// Why per-token scalars come from device memory
+//
+// A captured CUDA graph freezes its kernels' arguments. Passing `pos`, the
+// token id, or the cache slot offset by value would bake step 0's values into
+// the graph, and every replay would recompute the same token.
+//
+// So every value that changes per step lives in a small device buffer that
+// kernels index into. One host-to-device copy of 5 ints happens before each
+// replay -- one transfer per token, replacing ~170 kernel launches. Slot 0 is
+// permanently zero, so call sites needing a constant offset point there and
+// take the same code path rather than needing a second kernel variant.
+//
+//   params[0] = 0        (always)
+//   params[1] = token id
+//   params[2] = position
+//   params[3] = pos + 1  (positions visible to attention)
+//   params[4] = pos * n_kv_head * head_dim   (slot within a layer)
+// ---------------------------------------------------------------------------
 
 // No includes: NVRTC compiles without a header search path, and nothing here
 // needs one. INFINITY and the intrinsics below are NVRTC builtins.
@@ -56,7 +75,9 @@ extern "C" __global__ void gemv_f32(
     float* __restrict__ y,
     const int rows,
     const int cols,
-    const int y_offset)
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -68,7 +89,7 @@ extern "C" __global__ void gemv_f32(
     }
 
     acc = block_reduce_sum(acc);
-    if (threadIdx.x == 0) y[y_offset + row] = acc;
+    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc;
 }
 
 // Same, reading four floats at a time. float4 issues one 16-byte load per
@@ -80,7 +101,9 @@ extern "C" __global__ void gemv_f32_vec4(
     float* __restrict__ y,
     const int rows,
     const int cols,
-    const int y_offset)
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -97,7 +120,7 @@ extern "C" __global__ void gemv_f32_vec4(
     }
 
     acc = block_reduce_sum(acc);
-    if (threadIdx.x == 0) y[y_offset + row] = acc;
+    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc;
 }
 
 // out = x * rsqrt(mean(x^2) + eps) * weight
@@ -139,20 +162,23 @@ extern "C" __global__ void rope_f32(
     const float* __restrict__ sin_table,
     const int n_heads,
     const int head_dim,
-    const int pos,
-    const int v_offset)
+    const int* __restrict__ params,
+    const int pos_idx,
+    const int v_base,
+    const int v_idx)
 {
     const int half = head_dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_heads * half) return;
 
+    const int pos = params[pos_idx];
     const int head = idx / half;
     const int i = idx % half;
 
     const float c = cos_table[pos * half + i];
     const float s = sin_table[pos * half + i];
 
-    float* h = v + v_offset + head * head_dim;
+    float* h = v + v_base + params[v_idx] + head * head_dim;
     const float lo = h[i];
     const float hi = h[i + half];
     h[i] = lo * c - hi * s;
@@ -233,11 +259,12 @@ extern "C" __global__ void softmax_f32(float* __restrict__ x, const int n) {
 extern "C" __global__ void embed_f32(
     const float* __restrict__ table,
     float* __restrict__ out,
-    const int token,
+    const int* __restrict__ params,
+    const int token_idx,
     const int d)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < d) out[i] = table[(size_t)token * d + i];
+    if (i < d) out[i] = table[(size_t)params[token_idx] * d + i];
 }
 
 // Fused single-token attention over the KV cache.
@@ -248,8 +275,10 @@ extern "C" __global__ void embed_f32(
 // launches per token, and launch overhead alone would dominate decoding a model
 // this size.
 //
-// Scores live in dynamic shared memory, so `seq_len` floats must be requested
-// at launch.
+// Shared memory is sized for the maximum context at launch, not the current
+// sequence length: a captured graph fixes its shared-memory allocation, so
+// sizing it to the current length would invalidate the graph as the sequence
+// grows.
 extern "C" __global__ void attention_decode_f32(
     const float* __restrict__ q,        // [n_head * head_dim]
     const float* __restrict__ k_cache,  // [capacity][n_kv_head * head_dim]
@@ -258,13 +287,16 @@ extern "C" __global__ void attention_decode_f32(
     const int n_head,
     const int n_kv_head,
     const int head_dim,
-    const int seq_len,                  // positions 0..seq_len-1, current included
+    const int* __restrict__ params,
+    const int seq_idx,                  // positions 0..seq_len-1, current included
     const int cache_stride)             // n_kv_head * head_dim
 {
     extern __shared__ float scores[];
 
     const int h = blockIdx.x;
     if (h >= n_head) return;
+
+    const int seq_len = params[seq_idx];
 
     // Query head h reads KV head h / n_rep, matching repeat_interleave's
     // mapping of KV head j to query heads [j*n_rep, (j+1)*n_rep).
@@ -346,7 +378,9 @@ extern "C" __global__ void gemv_i8_f32(
     float* __restrict__ y,
     const int rows,
     const int cols,
-    const int y_offset)
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -359,7 +393,7 @@ extern "C" __global__ void gemv_i8_f32(
 
     acc = block_reduce_sum(acc);
     // The row scale is applied once to the reduced value, not per term.
-    if (threadIdx.x == 0) y[y_offset + row] = acc * scales[row];
+    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
 }
 
 // Same, reading four weights per load.
@@ -376,7 +410,9 @@ extern "C" __global__ void gemv_i8_f32_vec4(
     float* __restrict__ y,
     const int rows,
     const int cols,
-    const int y_offset)
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
 {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -394,7 +430,7 @@ extern "C" __global__ void gemv_i8_f32_vec4(
     }
 
     acc = block_reduce_sum(acc);
-    if (threadIdx.x == 0) y[y_offset + row] = acc * scales[row];
+    if (threadIdx.x == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
 }
 
 // Embedding lookup from an int8 table, applying that row's scale.
@@ -407,9 +443,11 @@ extern "C" __global__ void embed_i8(
     const signed char* __restrict__ table,
     const float* __restrict__ scales,
     float* __restrict__ out,
-    const int token,
+    const int* __restrict__ params,
+    const int token_idx,
     const int d)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = params[token_idx];
     if (i < d) out[i] = (float)table[(size_t)token * d + i] * scales[token];
 }

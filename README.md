@@ -4,9 +4,9 @@ Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **431 tok/s on GPU** with int8 weights (4x smaller, +0.001%
-> cross-entropy), byte-identical output to the CPU reference path whose logits
-> match PyTorch. Decode is launch-bound; CUDA graphs next.
+> generates at **852 tok/s on GPU** (int8 weights + CUDA graph replay, 88x the
+> CPU reference), byte-identical output to the CPU path whose logits match
+> PyTorch.
 
 ## Why Blackwell specifically
 
@@ -643,8 +643,9 @@ Two levers, in order of expected value:
    1.06× on speed. See the int8 section below: the ceiling rose, but the engine
    was never near it.)*
 2. **CUDA graphs**, capturing the per-token launch sequence once and replaying
-   it, to remove per-launch overhead. *(This turned out to be the real
-   bottleneck, and should have come first.)*
+   it, to remove per-launch overhead. *(Implemented — 1.39x on its own, and it
+   raised int8's contribution from 1.05x to 1.21x. See the CUDA graphs section
+   below.)*
 
 ### int8 quantisation
 
@@ -686,6 +687,82 @@ either. Quantisation cashes in only once per-token overhead is gone.
 and replaying it — now comes before further quantisation work, because it is
 what makes quantisation pay. int8 is worth keeping regardless for the 4× memory
 reduction, which is what determines how large a model fits in 16 GB.
+
+### CUDA graphs
+
+```bash
+./target/release/llm-engine gpu-logits export/120m --quant int8 --decode 256 --graph
+./target/release/llm-engine generate export/120m --tokenizer export/gpt2.tok \
+    --prompt "The capital of France is" --graph
+```
+
+Decoding one token issues ~170 kernel launches, each costing microseconds of
+driver work. A CUDA graph captures that sequence once and replays it as a single
+submission.
+
+| | eager | graph | graph gain |
+|---|---:|---:|---:|
+| f32 | 509 tok/s | 707 tok/s | 1.39x |
+| int8 | 533 tok/s | **852 tok/s** | 1.60x |
+| int8 gain | 1.05x | **1.21x** | |
+
+Output is byte-identical to eager and to the CPU reference under the same seed,
+and cross-entropy is unchanged to six decimals.
+
+**The two optimisations compose, and one enables the other.** int8 alone was
+worth 1.05x; once graphs removed the launch overhead it became 1.21x, because
+only then was there enough bandwidth-bound time left for fewer bytes to matter.
+Combined: 509 to 852 tok/s, and **88x over the 9.66 tok/s CPU reference**.
+
+### Making capture work
+
+Two failures, neither obvious from the error text, both worth recording.
+
+**A captured graph freezes its kernel arguments.** `token`, `pos`, `seq_len`
+and the KV cache slot offset all change every step, so passing them by value
+would bake step 0 into the graph and every replay would recompute the same
+token. Every per-step scalar therefore lives in a small device buffer that
+kernels index into, updated with one host-to-device copy of 5 ints per token --
+one transfer replacing ~170 launches. Slot 0 holds a permanent zero so call
+sites needing a constant offset take the same code path instead of requiring a
+second kernel variant. Shared memory for attention is sized for maximum context
+rather than current length, for the same reason: a graph fixes its allocation at
+capture.
+
+**`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.** CUDA forbids capturing the legacy
+default stream, which is what `ctx.default_stream()` returns. Fixed by creating
+a dedicated stream.
+
+**`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`.** cudarc records a CUDA event per
+buffer and inserts `cuStreamWaitEvent` on every kernel touching it, to order
+work across streams. A captured launch waiting on an event recorded by
+uncaptured work is exactly what capture isolation forbids -- so the safety
+mechanism made capture impossible. Creating a dedicated stream is also what
+*activated* that tracking, since cudarc only engages it in multi-stream mode.
+
+Resolved with `disable_event_tracking()`, which is sound here because the engine
+uses a single stream and issues everything in program order, so the stream
+itself provides the ordering those events exist to guarantee. It must be called
+before any allocation: the flag is read when a buffer is created, so buffers
+allocated earlier keep their events and still poison capture.
+
+### What limits it now
+
+1.17 ms/token at int8 moves 0.11 GB of weights, which at 757 GB/s is 0.15 ms.
+So roughly **1.0 ms per token is still unaccounted for**, and decode sits at
+about 13% of the bandwidth ceiling.
+
+Launch overhead is no longer the main suspect -- graphs removed most of it. The
+remaining candidates, untested:
+
+- **The attention kernel's inner loop is uncoalesced.** Each thread walks one
+  cached position's key vector sequentially, so threads in a warp read addresses
+  `head_dim` apart rather than adjacent. At 12 layers x 12 heads that is the
+  most-executed loop in the model.
+- **Logits transfer.** 50,304 floats copied device-to-host every token, 201 KB,
+  when only the argmax or a top-k slice is needed.
+- **Small-matrix inefficiency.** A 768x768 GEMV launches 768 blocks doing very
+  little each.
 
 ## Layout
 
@@ -753,7 +830,7 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] CUDA kernels, validated against the CPU reference
 - [x] GPU forward pass end to end (49x over CPU, identical output)
 - [x] int8 quantisation: 4x smaller weights, +0.001% cross-entropy
-- [ ] CUDA graphs to remove per-launch overhead — the actual bottleneck at 120M
+- [x] CUDA graphs: 1.39x (f32) / 1.60x (int8), and int8's own gain rose 1.05x -> 1.21x
 - [ ] Paged attention → continuous batching
 - [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
 

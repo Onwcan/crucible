@@ -11,10 +11,10 @@
 //! model against PyTorch.
 
 use anyhow::{bail, Result};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::Gpu;
+use crate::gpu::{Gpu, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::quant::QuantTensor;
 use crate::weights::Weights;
@@ -101,6 +101,15 @@ pub struct GpuModel {
     capacity: usize,
     cache_len: usize,
     hidden: usize,
+
+    /// Per-step scalars the kernels read from device memory. A captured graph
+    /// freezes kernel arguments, so these cannot be passed by value.
+    params: CudaSlice<i32>,
+    host_params: Vec<i32>,
+
+    /// Captured decode graph, if graph mode is enabled and warm.
+    graph: Option<CudaGraph>,
+    use_graph: bool,
 }
 
 impl GpuModel {
@@ -185,6 +194,10 @@ impl GpuModel {
             },
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
+            params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
+            host_params: vec![0i32; PARAM_COUNT],
+            graph: None,
+            use_graph: false,
             layers,
             capacity,
             cache_len: 0,
@@ -195,19 +208,22 @@ impl GpuModel {
     }
 
     /// y[offset..] = W · x, dispatching on how the weights were stored.
-    fn project(
+    #[allow(clippy::too_many_arguments)]
+    fn project_dyn(
         gpu: &Gpu,
         w: &Proj,
         x: &CudaSlice<f32>,
         y: &mut CudaSlice<f32>,
         rows: usize,
         cols: usize,
-        y_offset: usize,
+        params: &CudaSlice<i32>,
+        y_base: usize,
+        y_idx: usize,
     ) -> Result<()> {
         match w {
-            Proj::F32(data) => gpu.gemv_at(data, x, y, rows, cols, y_offset),
+            Proj::F32(data) => gpu.gemv_at(data, x, y, rows, cols, params, y_base, y_idx),
             Proj::Int8 { data, scales } => {
-                gpu.gemv_i8_at(data, scales, x, y, rows, cols, y_offset)
+                gpu.gemv_i8_at(data, scales, x, y, rows, cols, params, y_base, y_idx)
             }
         }
     }
@@ -218,6 +234,103 @@ impl GpuModel {
 
     pub fn reset(&mut self) {
         self.cache_len = 0;
+    }
+
+    /// Enable CUDA graph capture for single-token decode.
+    ///
+    /// The graph is captured lazily, on the first single-token step after at
+    /// least one position exists: capture requires the exact launch sequence a
+    /// replay will repeat, and that sequence is only stable once the cache is
+    /// non-empty.
+    pub fn enable_graph(&mut self, on: bool) {
+        self.use_graph = on;
+        if !on {
+            self.graph = None;
+        }
+    }
+
+    pub fn graph_active(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    /// Write this step's scalars into the buffer the kernels read.
+    fn set_params(&mut self, token: usize, pos: usize) -> Result<()> {
+        let kv_dim = self.cfg.n_kv_head * self.cfg.head_dim();
+        self.host_params[PARAM_ZERO] = 0;
+        self.host_params[PARAM_TOKEN] = token as i32;
+        self.host_params[PARAM_POS] = pos as i32;
+        self.host_params[PARAM_SEQ] = (pos + 1) as i32;
+        self.host_params[PARAM_SLOT] = (pos * kv_dim) as i32;
+        let host = self.host_params.clone();
+        self.gpu.write_i32(&mut self.params, &host)
+    }
+
+    /// Queue every kernel for one token. Shared by the eager path and by graph
+    /// capture, so a replay executes exactly what the eager path would.
+    fn queue_token(&mut self) -> Result<()> {
+        let cfg = &self.cfg;
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+
+        {
+            let s = &mut self.scratch;
+            match &self.tok_emb {
+                Proj::F32(t) => self.gpu.embed(t, &mut s.x, &self.params, d)?,
+                Proj::Int8 { data, scales } => {
+                    self.gpu.embed_i8(data, scales, &mut s.x, &self.params, d)?
+                }
+            }
+        }
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            let layer_base = l * self.capacity * kv_dim;
+            let s = &mut self.scratch;
+
+            self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
+
+            // K and V land directly in the cache; the slot offset comes from
+            // the parameter buffer so the graph stays valid as pos advances.
+            Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
+                              kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+            Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
+                              kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+            self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
+                             n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+
+            Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
+                              d, d, &self.params, 0, PARAM_ZERO)?;
+            self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
+                             n_head, hd, &self.params, 0, PARAM_ZERO)?;
+
+            self.gpu.attention_decode(&s.q, &self.k_cache, &self.v_cache, &mut s.attn,
+                                      n_head, n_kv, hd, &self.params,
+                                      self.capacity, kv_dim, layer_base)?;
+
+            Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
+                              d, d, &self.params, 0, PARAM_ZERO)?;
+            self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
+
+            self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
+            match &layer.gate_proj {
+                Some(gate) => {
+                    Self::project_dyn(&self.gpu, gate, &s.normed, &mut s.gate,
+                                      self.hidden, d, &self.params, 0, PARAM_ZERO)?;
+                    Self::project_dyn(&self.gpu, &layer.up_proj, &s.normed, &mut s.up,
+                                      self.hidden, d, &self.params, 0, PARAM_ZERO)?;
+                    self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
+                }
+                None => bail!("the GPU path currently implements swiglu only"),
+            }
+            Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
+                              d, self.hidden, &self.params, 0, PARAM_ZERO)?;
+            self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+        }
+
+        let s = &mut self.scratch;
+        self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
+        Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
+                          cfg.vocab_size, d, &self.params, 0, PARAM_ZERO)?;
+        Ok(())
     }
 
     /// Bytes of device memory held by weights and cache.
@@ -254,13 +367,13 @@ impl GpuModel {
     ///
     /// Kernels are queued without synchronising between them: the stream
     /// executes in order, so correctness holds, and the host does not stall on
-    /// each of the ~170 launches a token requires. The single sync happens when
-    /// logits are copied back.
+    /// each launch. The single sync happens when logits are copied back.
+    ///
+    /// With graph mode enabled, a single-token step replays a captured graph
+    /// instead of issuing ~170 launches. The graph is captured once, on the
+    /// second single-token step, because capture needs the exact sequence a
+    /// replay will repeat.
     pub fn forward(&mut self, tokens: &[usize]) -> Result<Vec<f32>> {
-        let cfg = &self.cfg;
-        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
-        let kv_dim = n_kv * hd;
-
         if tokens.is_empty() {
             bail!("no tokens to process");
         }
@@ -271,73 +384,37 @@ impl GpuModel {
                 self.capacity
             );
         }
+        for &t in tokens {
+            if t >= self.cfg.vocab_size {
+                bail!("token id {t} outside vocabulary {}", self.cfg.vocab_size);
+            }
+        }
 
         for &token in tokens {
-            if token >= cfg.vocab_size {
-                bail!("token id {token} outside vocabulary {}", cfg.vocab_size);
-            }
             let pos = self.cache_len;
-            let s = &mut self.scratch;
+            self.set_params(token, pos)?;
 
-            match &self.tok_emb {
-                Proj::F32(t) => self.gpu.embed(t, &mut s.x, token, d)?,
-                Proj::Int8 { data, scales } => {
-                    self.gpu.embed_i8(data, scales, &mut s.x, token, d)?
+            let single = tokens.len() == 1;
+            match (&self.graph, self.use_graph && single && pos > 0) {
+                // Warm graph: replay it.
+                (Some(g), true) => self.gpu.graph_launch(g)?,
+                // Graph wanted but not captured yet: capture this step.
+                (None, true) => {
+                    self.gpu.begin_capture()?;
+                    let queued = self.queue_token();
+                    // End capture unconditionally: leaving the stream in
+                    // capture mode would break every subsequent launch.
+                    let graph = self.gpu.end_capture();
+                    queued?;
+                    let graph = graph?;
+                    self.gpu.graph_launch(&graph)?;
+                    self.graph = Some(graph);
                 }
-            }
-
-            for (l, layer) in self.layers.iter().enumerate() {
-                // Offsets of this layer's cache region and this position's slot.
-                let layer_base = l * self.capacity * kv_dim;
-                let slot = layer_base + pos * kv_dim;
-
-                self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
-
-                // K and V are written straight into the cache: passing an
-                // output offset avoids a separate copy kernel per layer.
-                Self::project(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache, kv_dim, d, slot)?;
-                Self::project(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache, kv_dim, d, slot)?;
-                self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin, n_kv, hd, pos, slot)?;
-
-                Self::project(&self.gpu, &layer.q_proj, &s.normed, &mut s.q, d, d, 0)?;
-                self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin, n_head, hd, pos, 0)?;
-
-                self.gpu.attention_decode(
-                    &s.q,
-                    &self.k_cache,
-                    &self.v_cache,
-                    &mut s.attn,
-                    n_head,
-                    n_kv,
-                    hd,
-                    pos + 1,
-                    kv_dim,
-                    layer_base,
-                )?;
-
-                Self::project(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj, d, d, 0)?;
-                self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
-
-                self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
-                match &layer.gate_proj {
-                    Some(gate) => {
-                        Self::project(&self.gpu, gate, &s.normed, &mut s.gate, self.hidden, d, 0)?;
-                        Self::project(&self.gpu, &layer.up_proj, &s.normed, &mut s.up, self.hidden, d, 0)?;
-                        self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
-                    }
-                    None => bail!("the GPU path currently implements swiglu only"),
-                }
-                Self::project(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out, d, self.hidden, 0)?;
-                self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+                _ => self.queue_token()?,
             }
 
             self.cache_len += 1;
         }
-
-        let s = &mut self.scratch;
-        self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
-        // lm_head is tied to tok_emb, so the embedding table is the projection.
-        Self::project(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits, cfg.vocab_size, d, 0)?;
 
         self.gpu.to_host(&self.scratch.logits)
     }

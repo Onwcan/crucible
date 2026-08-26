@@ -15,6 +15,7 @@ use anyhow::Result;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
+use cudarc::driver::CudaGraph;
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
 
@@ -24,6 +25,19 @@ const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// Blackwell. Compiling for an older architecture still runs, via PTX JIT, but
 /// slower -- the exact failure this project checks for elsewhere.
 const ARCH: &str = "compute_120";
+
+/// Indices into the per-step parameter buffer that lives on the device.
+///
+/// A captured CUDA graph freezes kernel arguments, so anything that changes per
+/// token must be read from memory rather than passed by value. Slot 0 holds a
+/// permanent zero, so call sites needing a constant offset use the same code
+/// path instead of needing a second kernel variant.
+pub const PARAM_ZERO: usize = 0;
+pub const PARAM_TOKEN: usize = 1;
+pub const PARAM_POS: usize = 2;
+pub const PARAM_SEQ: usize = 3;
+pub const PARAM_SLOT: usize = 4;
+pub const PARAM_COUNT: usize = 5;
 
 /// Threads per block for reduction kernels.
 ///
@@ -59,7 +73,26 @@ pub struct Gpu {
 impl Gpu {
     pub fn new(ordinal: usize) -> Result<Self> {
         let ctx = cu(CudaContext::new(ordinal))?;
-        let stream = ctx.default_stream();
+
+        // SAFETY: cudarc records a CUDA event per buffer and inserts
+        // cuStreamWaitEvent on every kernel that touches it, to order work
+        // across streams. That is exactly what graph capture forbids: a
+        // captured launch waiting on an event recorded by uncaptured work
+        // fails with CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
+        //
+        // The engine uses a single stream and issues everything in program
+        // order, so the stream itself already provides the ordering those
+        // events exist to guarantee. Disabling the tracking is therefore safe
+        // here, and required for graphs to work at all.
+        //
+        // Must happen before any allocation: the flag is read when a buffer is
+        // created, so buffers allocated earlier would keep their events.
+        unsafe { ctx.disable_event_tracking() };
+
+        // A dedicated stream, not ctx.default_stream(). CUDA forbids capturing
+        // the legacy default stream, and capture fails on it with
+        // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED regardless of what is queued.
+        let stream = cu(ctx.new_stream())?;
 
         let opts = CompileOptions {
             arch: Some(ARCH),
@@ -120,7 +153,9 @@ impl Gpu {
         y: &mut CudaSlice<f32>,
         rows: usize,
         cols: usize,
-        y_offset: usize,
+        params: &CudaSlice<i32>,
+        y_base: usize,
+        y_idx: usize,
     ) -> Result<()> {
         let func = if cols % 4 == 0 { &self.gemv_vec4 } else { &self.gemv };
         let cfg = LaunchConfig {
@@ -128,9 +163,9 @@ impl Gpu {
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (r, c, o) = (rows as i32, cols as i32, y_offset as i32);
+        let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(x).arg(y).arg(&r).arg(&c).arg(&o);
+        b.arg(w).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -143,18 +178,20 @@ impl Gpu {
         sin: &CudaSlice<f32>,
         n_heads: usize,
         head_dim: usize,
-        pos: usize,
-        v_offset: usize,
+        params: &CudaSlice<i32>,
+        v_base: usize,
+        v_idx: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((n_heads * head_dim / 2) as u32);
-        let (nh, hd, p, o) = (
+        let (nh, hd, pi, base, idx) = (
             n_heads as i32,
             head_dim as i32,
-            pos as i32,
-            v_offset as i32,
+            PARAM_POS as i32,
+            v_base as i32,
+            v_idx as i32,
         );
         let mut b = self.stream.launch_builder(&self.rope);
-        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&p).arg(&o);
+        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(params).arg(&pi).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -164,13 +201,13 @@ impl Gpu {
         &self,
         table: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
-        token: usize,
+        params: &CudaSlice<i32>,
         d: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems(d as u32);
-        let (t, dd) = (token as i32, d as i32);
+        let (ti, dd) = (PARAM_TOKEN as i32, d as i32);
         let mut b = self.stream.launch_builder(&self.embed);
-        b.arg(table).arg(out).arg(&t).arg(&dd);
+        b.arg(table).arg(out).arg(params).arg(&ti).arg(&dd);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -189,7 +226,8 @@ impl Gpu {
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
-        seq_len: usize,
+        params: &CudaSlice<i32>,
+        max_seq: usize,
         cache_stride: usize,
         layer_base: usize,
     ) -> Result<()> {
@@ -197,21 +235,24 @@ impl Gpu {
         // offset is folded into the pointer by slicing rather than passed in.
         let k = k_cache.slice(layer_base..);
         let v = v_cache.slice(layer_base..);
+        // Shared memory is sized for the maximum context, not the current
+        // length: a captured graph fixes its allocation, and sizing to the
+        // current length would invalidate the graph as the sequence grows.
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, 1, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
-            shared_mem_bytes: (seq_len * std::mem::size_of::<f32>()) as u32,
+            shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
         };
-        let (nh, nkv, hd, sl, cs) = (
+        let (nh, nkv, hd, si, cs) = (
             n_head as i32,
             n_kv_head as i32,
             head_dim as i32,
-            seq_len as i32,
+            PARAM_SEQ as i32,
             cache_stride as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention);
         b.arg(q).arg(&k).arg(&v).arg(out)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(&sl).arg(&cs);
+            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -222,15 +263,75 @@ impl Gpu {
         table: &CudaSlice<i8>,
         scales: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
-        token: usize,
+        params: &CudaSlice<i32>,
         d: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems(d as u32);
-        let (t, dd) = (token as i32, d as i32);
+        let (ti, dd) = (PARAM_TOKEN as i32, d as i32);
         let mut b = self.stream.launch_builder(&self.embed_i8);
-        b.arg(table).arg(scales).arg(out).arg(&t).arg(&dd);
+        b.arg(table).arg(scales).arg(out).arg(params).arg(&ti).arg(&dd);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
+    }
+
+    /// Begin capturing kernel launches on this stream.
+    ///
+    /// The point is launch overhead. Decoding one token issues ~170 kernels,
+    /// each costing microseconds of driver work, and at this model size that
+    /// overhead dominates: a token takes ~2.3 ms while the arithmetic and
+    /// memory traffic together account for a fraction of it. A graph submits
+    /// the whole sequence as a single operation.
+    ///
+    /// Split into begin/end rather than taking a closure so the caller can
+    /// borrow itself mutably while queueing -- a closure capturing `&mut self`
+    /// cannot coexist with the `&self.gpu` borrow needed to call this.
+    ///
+    /// `Relaxed` mode so unrelated work elsewhere in the process is not caught
+    /// up in the capture. Nothing between begin and end may synchronise: a sync
+    /// during capture aborts it.
+    pub fn begin_capture(&self) -> Result<()> {
+        use cudarc::driver::sys::CUstreamCaptureMode;
+        cu(self
+            .stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED))
+    }
+
+    /// Finish capture and instantiate the graph for replay.
+    ///
+    /// Must be called even if queueing failed, or the stream stays in capture
+    /// mode and every later launch on it fails.
+    pub fn end_capture(&self) -> Result<CudaGraph> {
+        use cudarc::driver::sys::CUgraphInstantiate_flags;
+        let graph = cu(self.stream.end_capture(
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        ))?
+        .ok_or_else(|| anyhow::anyhow!("stream capture produced no graph"))?;
+        cu(graph.upload())?;
+        Ok(graph)
+    }
+
+    /// Replay a captured graph.
+    pub fn graph_launch(&self, graph: &CudaGraph) -> Result<()> {
+        cu(graph.launch())
+    }
+
+    /// Upload i32 parameters.
+    pub fn to_device_i32(&self, host: &[i32]) -> Result<CudaSlice<i32>> {
+        cu(self.stream.memcpy_stod(host))
+    }
+
+    /// Overwrite an existing device buffer in place.
+    ///
+    /// Used to update per-step parameters between graph replays: the graph
+    /// holds a pointer to this exact buffer, so it must be written, never
+    /// reallocated.
+    pub fn write_i32(&self, dev: &mut CudaSlice<i32>, host: &[i32]) -> Result<()> {
+        cu(self.stream.memcpy_htod(host, dev))
+    }
+
+    /// An all-zero parameter buffer, for call sites with no per-step values.
+    fn zero_params(&self) -> Result<CudaSlice<i32>> {
+        cu(self.stream.alloc_zeros::<i32>(PARAM_COUNT))
     }
 
     /// Upload int8 weights.
@@ -251,7 +352,9 @@ impl Gpu {
         y: &mut CudaSlice<f32>,
         rows: usize,
         cols: usize,
-        y_offset: usize,
+        params: &CudaSlice<i32>,
+        y_base: usize,
+        y_idx: usize,
     ) -> Result<()> {
         let func = if cols % 4 == 0 { &self.gemv_i8_vec4 } else { &self.gemv_i8 };
         let cfg = LaunchConfig {
@@ -259,9 +362,9 @@ impl Gpu {
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (r, c, o) = (rows as i32, cols as i32, y_offset as i32);
+        let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(&o);
+        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -283,9 +386,11 @@ impl Gpu {
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (rows_i, cols_i, zero) = (rows as i32, cols as i32, 0i32);
+        let (rows_i, cols_i, base, idx) =
+            (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
+        let zeros = self.zero_params()?;
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zero);
+        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -321,9 +426,18 @@ impl Gpu {
     ) -> Result<()> {
         let total = (n_heads * head_dim / 2) as u32;
         let cfg = LaunchConfig::for_num_elems(total);
-        let (nh, hd, p, zero) = (n_heads as i32, head_dim as i32, pos as i32, 0i32);
+        let mut host = vec![0i32; PARAM_COUNT];
+        host[PARAM_POS] = pos as i32;
+        let params = self.to_device_i32(&host)?;
+        let (nh, hd, pi, base, idx) = (
+            n_heads as i32,
+            head_dim as i32,
+            PARAM_POS as i32,
+            0i32,
+            PARAM_ZERO as i32,
+        );
         let mut b = self.stream.launch_builder(&self.rope);
-        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&p).arg(&zero);
+        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&params).arg(&pi).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -609,9 +723,11 @@ impl Gpu {
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (rows_i, cols_i, zero) = (rows as i32, cols as i32, 0i32);
+        let (rows_i, cols_i, base, idx) =
+            (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
+        let zeros = self.zero_params()?;
         let mut b = self.stream.launch_builder(&self.gemv);
-        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zero);
+        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
