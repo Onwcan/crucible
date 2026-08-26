@@ -18,11 +18,13 @@ pub mod gpu;
 pub mod gpu_model;
 pub mod model;
 pub mod ops;
+pub mod quant;
 pub mod tokenizer;
 pub mod weights;
 
 pub use cache::KvCache;
 pub use config::Config;
 pub use model::Model;
+pub use quant::QuantTensor;
 pub use tokenizer::Tokenizer;
 pub use weights::{Tensor, Weights};

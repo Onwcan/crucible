@@ -1,11 +1,12 @@
-# llm-lab
+# crucible
 
 Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **471 tok/s on GPU**, byte-identical to the CPU reference path
-> whose logits match PyTorch. Quantisation next.
+> generates at **431 tok/s on GPU** with int8 weights (4x smaller, +0.001%
+> cross-entropy), byte-identical output to the CPU reference path whose logits
+> match PyTorch. Decode is launch-bound; CUDA graphs next.
 
 ## Why Blackwell specifically
 
@@ -638,10 +639,53 @@ leave the GPU idle between small kernels.
 Two levers, in order of expected value:
 
 1. **Quantisation.** int8 weights cut bytes-per-token by 4×, raising the ceiling
-   to ~6,700 tok/s. This is the real lever, and the reason FP8 tensor cores are
-   nearly irrelevant here: decode is bandwidth-bound, not compute-bound.
+   to ~6,700 tok/s. *(Implemented — and it delivered 4× on memory but only
+   1.06× on speed. See the int8 section below: the ceiling rose, but the engine
+   was never near it.)*
 2. **CUDA graphs**, capturing the per-token launch sequence once and replaying
-   it, to remove per-launch overhead.
+   it, to remove per-launch overhead. *(This turned out to be the real
+   bottleneck, and should have come first.)*
+
+### int8 quantisation
+
+```bash
+./target/release/llm-engine gpu-eval export/120m --data data/fineweb-2b/val.bin     --tokens 1024 --quant f32,int8
+```
+
+Weight-only, symmetric, per-output-row scales. Activations stay f32 — they are
+a negligible share of the bytes moved during decode, so quantising them would
+cost accuracy for nothing. Per-row rather than per-tensor because one scale
+across a whole matrix is set by its largest outlier, crushing the resolution of
+every other row.
+
+Measured on 1024 held-out tokens:
+
+| | f32 | int8 |
+|---|---:|---:|
+| cross-entropy | 3.720299 | 3.720334 |
+| perplexity | 41.2767 | 41.2782 |
+| weights resident | 452 MB | **114 MB** |
+| decode | 405 tok/s | 431 tok/s |
+
+**Quality cost is +0.001% cross-entropy — free, within any reasonable
+tolerance. Memory drops 4×. But speed rises only 1.06×, not the 4× the
+bandwidth argument predicted.**
+
+That gap is the interesting part, and it corrects an earlier claim in this
+README. int8 moves 0.11 GB per token, which at 757 GB/s is 0.15 ms — yet a
+token takes 2.32 ms. Roughly **2.2 ms is fixed overhead**, about 13 µs across
+the ~170 kernel launches a token requires. Decode at this model size is
+**launch-bound, not bandwidth-bound**, so removing bytes barely moves the wall
+clock.
+
+The bandwidth ceiling reasoning was not wrong, it was premature: the ceiling did
+rise from ~1,674 to ~6,700 tok/s, but the engine sits at 431, nowhere near
+either. Quantisation cashes in only once per-token overhead is gone.
+
+**Revised priority.** CUDA graphs — capturing the per-token launch sequence once
+and replaying it — now comes before further quantisation work, because it is
+what makes quantisation pay. int8 is worth keeping regardless for the 4× memory
+reduction, which is what determines how large a model fits in 16 GB.
 
 ## Layout
 
@@ -668,6 +712,7 @@ engine/            # Rust inference engine
   src/cache.rs       # KV cache for incremental decode
   src/gpu.rs         # CUDA backend, NVRTC compilation, validation
   src/gpu_model.rs   # full forward pass on device
+  src/quant.rs       # int8 weight quantisation
   kernels/kernels.cu # gemv, rmsnorm, rope, softmax, silu
 scripts/
   bench_bandwidth.py # memory bandwidth and the decode ceiling it implies
@@ -707,11 +752,11 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] KV cache (11.4x at 30 tokens, ~55x at 150)
 - [x] CUDA kernels, validated against the CPU reference
 - [x] GPU forward pass end to end (49x over CPU, identical output)
-- [ ] INT8/INT4 quantisation — the real decode lever, since decode is bandwidth-bound
-- [ ] CUDA graphs to remove per-launch overhead
+- [x] int8 quantisation: 4x smaller weights, +0.001% cross-entropy
+- [ ] CUDA graphs to remove per-launch overhead — the actual bottleneck at 120M
 - [ ] Paged attention → continuous batching
 - [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
 
 ## License
 
-MIT
+Apache-2.0.

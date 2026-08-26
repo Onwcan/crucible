@@ -51,6 +51,9 @@ pub struct Gpu {
     softmax: CudaFunction,
     embed: CudaFunction,
     attention: CudaFunction,
+    gemv_i8: CudaFunction,
+    gemv_i8_vec4: CudaFunction,
+    embed_i8: CudaFunction,
 }
 
 impl Gpu {
@@ -77,6 +80,9 @@ impl Gpu {
             softmax: cu(module.load_function("softmax_f32"))?,
             embed: cu(module.load_function("embed_f32"))?,
             attention: cu(module.load_function("attention_decode_f32"))?,
+            gemv_i8: cu(module.load_function("gemv_i8_f32"))?,
+            gemv_i8_vec4: cu(module.load_function("gemv_i8_f32_vec4"))?,
+            embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
         })
@@ -206,6 +212,56 @@ impl Gpu {
         let mut b = self.stream.launch_builder(&self.attention);
         b.arg(q).arg(&k).arg(&v).arg(out)
             .arg(&nh).arg(&nkv).arg(&hd).arg(&sl).arg(&cs);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Embedding lookup from an int8 table.
+    pub fn embed_i8(
+        &self,
+        table: &CudaSlice<i8>,
+        scales: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        token: usize,
+        d: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems(d as u32);
+        let (t, dd) = (token as i32, d as i32);
+        let mut b = self.stream.launch_builder(&self.embed_i8);
+        b.arg(table).arg(scales).arg(out).arg(&t).arg(&dd);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Upload int8 weights.
+    pub fn to_device_i8(&self, host: &[i8]) -> Result<CudaSlice<i8>> {
+        cu(self.stream.memcpy_stod(host))
+    }
+
+    /// y[offset..] = (W_int8 · x) * row_scale.
+    ///
+    /// The scale is applied once per output row, after reduction, rather than
+    /// dequantising each weight before multiplying.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_i8_at(
+        &self,
+        w: &CudaSlice<i8>,
+        scales: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        y_offset: usize,
+    ) -> Result<()> {
+        let func = if cols % 4 == 0 { &self.gemv_i8_vec4 } else { &self.gemv_i8 };
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (r, c, o) = (rows as i32, cols as i32, y_offset as i32);
+        let mut b = self.stream.launch_builder(func);
+        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(&o);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }

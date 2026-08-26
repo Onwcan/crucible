@@ -54,6 +54,25 @@ enum Command {
         /// Decode this many tokens to measure throughput (0 to skip)
         #[arg(long, default_value_t = 64)]
         decode: usize,
+        /// Weight precision: f32 or int8
+        #[arg(long, default_value = "f32")]
+        quant: String,
+    },
+    /// Cross-entropy on held-out tokens, per precision.
+    ///
+    /// The honest way to price quantisation: speed is easy to measure and easy
+    /// to be pleased by, but it is only worth having if quality holds.
+    #[cfg(feature = "cuda")]
+    GpuEval {
+        model: PathBuf,
+        /// Path to val.bin (flat uint16 token ids)
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, default_value_t = 2048)]
+        tokens: usize,
+        /// Comma-separated precisions to compare
+        #[arg(long, default_value = "f32,int8")]
+        quant: String,
     },
     /// Encode text and print token ids, to compare against tiktoken.
     Tokenize {
@@ -92,9 +111,11 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuBench { rows, cols, iters } => llm_engine::gpu::bench(rows, cols, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuLogits { model, tokens, top, decode } => {
-            gpu_logits(model, &tokens, top, decode)
+        Command::GpuLogits { model, tokens, top, decode, quant } => {
+            gpu_logits(model, &tokens, top, decode, &quant)
         }
+        #[cfg(feature = "cuda")]
+        Command::GpuEval { model, data, tokens, quant } => gpu_eval(model, data, tokens, &quant),
         Command::Generate {
             model,
             tokenizer,
@@ -400,8 +421,11 @@ fn inspect(dir: PathBuf, verbose: bool) -> Result<()> {
 
 
 #[cfg(feature = "cuda")]
-fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize) -> Result<()> {
-    use llm_engine::gpu_model::GpuModel;
+fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}; expected f32 or int8"))?;
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
@@ -413,10 +437,12 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize) -> Result<(
         .context("parsing --tokens")?;
 
     let started = std::time::Instant::now();
-    let mut gpu_model = GpuModel::load(cfg.clone(), &weights, cfg.block_size)?;
-    println!("load        {:.0} ms, {:.0} MB on device",
+    let mut gpu_model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    println!("precision   {quant}");
+    println!("load        {:.0} ms, {:.0} MB weights + {:.0} MB cache",
              started.elapsed().as_secs_f64() * 1000.0,
-             gpu_model.device_bytes() as f64 / 1e6);
+             gpu_model.weight_bytes() as f64 / 1e6,
+             gpu_model.cache_bytes() as f64 / 1e6);
 
     // Prefill, timed after a warm-up pass so the measurement is not dominated
     // by first-launch costs (module load, allocator warm-up, clock ramp).
@@ -479,6 +505,82 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize) -> Result<(
         println!("decode      {decode} tokens in {secs:.2} s  ({:.1} tok/s, {:.2} ms/token)",
                  decode as f64 / secs,
                  secs * 1000.0 / decode as f64);
+    }
+
+    Ok(())
+}
+
+
+#[cfg(feature = "cuda")]
+fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+
+    // val.bin is a flat little-endian uint16 stream, the same format train.py
+    // memory-maps. These tokens were held out of training.
+    let raw = std::fs::read(&data)
+        .with_context(|| format!("reading {}", data.display()))?;
+    let all: Vec<usize> = raw
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .collect();
+
+    let limit = n_tokens.min(cfg.block_size).min(all.len() - 1);
+    let ids = &all[..limit + 1];
+    println!("data        {} ({} tokens evaluated)", data.display(), limit);
+    println!();
+
+    let mut results = Vec::new();
+
+    for name in quant.split(',') {
+        let name = name.trim();
+        let precision = Precision::parse(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown precision {name:?}"))?;
+
+        let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+
+        // Teacher forcing: feed the true token at every step and score the
+        // model's prediction of the next one. Feeding its own samples back
+        // would measure something else entirely.
+        let mut total_nll = 0.0f64;
+        let started = std::time::Instant::now();
+        let mut logits = model.forward(&[ids[0]])?;
+
+        for i in 1..=limit {
+            let target = ids[i];
+            // log softmax, max-subtracted for stability.
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f64 = logits.iter().map(|v| ((*v - max) as f64).exp()).sum();
+            total_nll += sum_exp.ln() - ((logits[target] - max) as f64);
+
+            if i < limit {
+                logits = model.forward(&[target])?;
+            }
+        }
+
+        let secs = started.elapsed().as_secs_f64();
+        let ce = total_nll / limit as f64;
+        results.push((name.to_string(), ce, model.weight_bytes(), limit as f64 / secs));
+
+        println!("{name:6}  cross-entropy {ce:.6}   perplexity {:.4}   weights {:.0} MB   {:.0} tok/s",
+                 ce.exp(), model.weight_bytes() as f64 / 1e6, limit as f64 / secs);
+    }
+
+    if results.len() > 1 {
+        let (base_name, base_ce, base_bytes, base_tps) = results[0].clone();
+        println!();
+        println!("relative to {base_name}:");
+        for (name, ce, bytes, tps) in results.iter().skip(1) {
+            println!("  {name:6}  cross-entropy {:+.6} ({:+.4}%)   weights {:.2}x   speed {:.2}x",
+                     ce - base_ce,
+                     (ce - base_ce) / base_ce * 100.0,
+                     *bytes as f64 / base_bytes as f64,
+                     tps / base_tps);
+        }
+        println!();
+        println!("Cross-entropy is the number that decides whether the speed is worth having.");
     }
 
     Ok(())

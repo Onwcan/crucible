@@ -324,3 +324,92 @@ extern "C" __global__ void attention_decode_f32(
         out[h * head_dim + d] = acc * ssum;
     }
 }
+
+// ---------------------------------------------------------------------------
+// int8 weight-only quantisation
+//
+// Decode is bandwidth-bound, so the win here is not arithmetic: it is reading
+// one byte per weight instead of four. Activations stay f32 because they are a
+// negligible fraction of the bytes moved and quantising them would cost
+// accuracy for nothing.
+//
+// Symmetric per-output-row scales: q[r][c] = round(w[r][c] / scale[r]), with
+// scale[r] = max|w[r][:]| / 127. Per-row rather than per-tensor because a
+// single scale across a whole matrix is set by its largest outlier, which
+// crushes the resolution of every other row.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void gemv_i8_f32(
+    const signed char* __restrict__ w,
+    const float* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int rows,
+    const int cols,
+    const int y_offset)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const signed char* w_row = w + (size_t)row * cols;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        acc += (float)w_row[i] * x[i];
+    }
+
+    acc = block_reduce_sum(acc);
+    // The row scale is applied once to the reduced value, not per term.
+    if (threadIdx.x == 0) y[y_offset + row] = acc * scales[row];
+}
+
+// Same, reading four weights per load.
+//
+// This matters more for int8 than it did for f32. The f32 kernel already
+// saturates memory bandwidth, so wider loads bought nothing; at one byte per
+// weight the kernel moves 4x less data and shifts toward being limited by
+// issue rate instead, where a 4-byte load beats four 1-byte loads.
+// Requires cols % 4 == 0.
+extern "C" __global__ void gemv_i8_f32_vec4(
+    const signed char* __restrict__ w,
+    const float* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int rows,
+    const int cols,
+    const int y_offset)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const char4* w_row = reinterpret_cast<const char4*>(w + (size_t)row * cols);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const int cols4 = cols / 4;
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
+        const char4 a = w_row[i];
+        const float4 b = x4[i];
+        acc += (float)a.x * b.x + (float)a.y * b.y
+             + (float)a.z * b.z + (float)a.w * b.w;
+    }
+
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0) y[y_offset + row] = acc * scales[row];
+}
+
+// Embedding lookup from an int8 table, applying that row's scale.
+//
+// tok_emb is tied to lm_head, so one quantised tensor serves both: the output
+// projection reads it as a matrix with per-row scales, and this reads a single
+// row and rescales it. Keeping a separate f32 copy for the lookup would add
+// 154 MB for the 120M model.
+extern "C" __global__ void embed_i8(
+    const signed char* __restrict__ table,
+    const float* __restrict__ scales,
+    float* __restrict__ out,
+    const int token,
+    const int d)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) out[i] = (float)table[(size_t)token * d + i] * scales[token];
+}

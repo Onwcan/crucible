@@ -16,20 +16,58 @@ use cudarc::driver::CudaSlice;
 use crate::config::Config;
 use crate::gpu::Gpu;
 use crate::ops::RopeTable;
+use crate::quant::QuantTensor;
 use crate::weights::Weights;
 
 const NORM_EPS: f32 = 1e-6;
 
+/// Weight precision for the large projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    F32,
+    /// int8 weights with per-row scales; activations stay f32.
+    Int8,
+}
+
+impl Precision {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f32" | "fp32" => Some(Self::F32),
+            "int8" | "i8" => Some(Self::Int8),
+            _ => None,
+        }
+    }
+}
+
+/// A projection matrix, in whichever precision the model was loaded at.
+///
+/// Norms and other small tensors stay f32 unconditionally: they are a rounding
+/// error in the byte budget, and quantising them would cost accuracy for
+/// nothing measurable.
+enum Proj {
+    F32(CudaSlice<f32>),
+    Int8 { data: CudaSlice<i8>, scales: CudaSlice<f32> },
+}
+
+impl Proj {
+    fn bytes(&self, rows: usize, cols: usize) -> usize {
+        match self {
+            Proj::F32(_) => rows * cols * 4,
+            Proj::Int8 { .. } => rows * cols + rows * 4,
+        }
+    }
+}
+
 struct GpuLayer {
     attn_norm: CudaSlice<f32>,
-    q_proj: CudaSlice<f32>,
-    k_proj: CudaSlice<f32>,
-    v_proj: CudaSlice<f32>,
-    o_proj: CudaSlice<f32>,
+    q_proj: Proj,
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
     mlp_norm: CudaSlice<f32>,
-    gate_proj: Option<CudaSlice<f32>>,
-    up_proj: CudaSlice<f32>,
-    down_proj: CudaSlice<f32>,
+    gate_proj: Option<Proj>,
+    up_proj: Proj,
+    down_proj: Proj,
 }
 
 /// Device-side scratch, allocated once. Decoding one token launches ~170
@@ -49,7 +87,8 @@ struct Scratch {
 pub struct GpuModel {
     pub gpu: Gpu,
     pub cfg: Config,
-    tok_emb: CudaSlice<f32>,
+    pub precision: Precision,
+    tok_emb: Proj,
     layers: Vec<GpuLayer>,
     final_norm: CudaSlice<f32>,
     rope_cos: CudaSlice<f32>,
@@ -66,6 +105,15 @@ pub struct GpuModel {
 
 impl GpuModel {
     pub fn load(cfg: Config, w: &Weights, capacity: usize) -> Result<Self> {
+        Self::load_with(cfg, w, capacity, Precision::F32)
+    }
+
+    pub fn load_with(
+        cfg: Config,
+        w: &Weights,
+        capacity: usize,
+        precision: Precision,
+    ) -> Result<Self> {
         if cfg.pos_encoding != "rope" {
             bail!("the GPU path currently implements rope only, not {}", cfg.pos_encoding);
         }
@@ -79,22 +127,37 @@ impl GpuModel {
         let gpu = Gpu::new(0)?;
         let capacity = capacity.min(cfg.block_size);
 
+        // Upload one projection at the requested precision.
+        let upload = |name: &str| -> Result<Proj> {
+            let t = w.get(name)?;
+            Ok(match precision {
+                Precision::F32 => Proj::F32(gpu.to_device(&t.data)?),
+                Precision::Int8 => {
+                    let q = QuantTensor::from_tensor(&t);
+                    Proj::Int8 {
+                        data: gpu.to_device_i8(&q.data)?,
+                        scales: gpu.to_device(&q.scales)?,
+                    }
+                }
+            })
+        };
+
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             let p = format!("blocks.{i}");
             layers.push(GpuLayer {
                 attn_norm: gpu.to_device(&w.get(&format!("{p}.attn_norm.weight"))?.data)?,
-                q_proj: gpu.to_device(&w.get(&format!("{p}.attn.q_proj.weight"))?.data)?,
-                k_proj: gpu.to_device(&w.get(&format!("{p}.attn.k_proj.weight"))?.data)?,
-                v_proj: gpu.to_device(&w.get(&format!("{p}.attn.v_proj.weight"))?.data)?,
-                o_proj: gpu.to_device(&w.get(&format!("{p}.attn.o_proj.weight"))?.data)?,
+                q_proj: upload(&format!("{p}.attn.q_proj.weight"))?,
+                k_proj: upload(&format!("{p}.attn.k_proj.weight"))?,
+                v_proj: upload(&format!("{p}.attn.v_proj.weight"))?,
+                o_proj: upload(&format!("{p}.attn.o_proj.weight"))?,
                 mlp_norm: gpu.to_device(&w.get(&format!("{p}.mlp_norm.weight"))?.data)?,
                 gate_proj: match cfg.activation.as_str() {
-                    "swiglu" => Some(gpu.to_device(&w.get(&format!("{p}.mlp.gate_proj.weight"))?.data)?),
+                    "swiglu" => Some(upload(&format!("{p}.mlp.gate_proj.weight"))?),
                     _ => None,
                 },
-                up_proj: gpu.to_device(&w.get(&format!("{p}.mlp.up_proj.weight"))?.data)?,
-                down_proj: gpu.to_device(&w.get(&format!("{p}.mlp.down_proj.weight"))?.data)?,
+                up_proj: upload(&format!("{p}.mlp.up_proj.weight"))?,
+                down_proj: upload(&format!("{p}.mlp.down_proj.weight"))?,
             });
         }
 
@@ -104,7 +167,8 @@ impl GpuModel {
         let kv_dim = cfg.n_kv_head * cfg.head_dim();
 
         Ok(Self {
-            tok_emb: gpu.to_device(&w.get("tok_emb.weight")?.data)?,
+            tok_emb: upload("tok_emb.weight")?,
+            precision,
             final_norm: gpu.to_device(&w.get("final_norm.weight")?.data)?,
             rope_cos: gpu.to_device(&table.cos)?,
             rope_sin: gpu.to_device(&table.sin)?,
@@ -130,6 +194,24 @@ impl GpuModel {
         })
     }
 
+    /// y[offset..] = W · x, dispatching on how the weights were stored.
+    fn project(
+        gpu: &Gpu,
+        w: &Proj,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        y_offset: usize,
+    ) -> Result<()> {
+        match w {
+            Proj::F32(data) => gpu.gemv_at(data, x, y, rows, cols, y_offset),
+            Proj::Int8 { data, scales } => {
+                gpu.gemv_i8_at(data, scales, x, y, rows, cols, y_offset)
+            }
+        }
+    }
+
     pub fn cache_len(&self) -> usize {
         self.cache_len
     }
@@ -140,13 +222,32 @@ impl GpuModel {
 
     /// Bytes of device memory held by weights and cache.
     pub fn device_bytes(&self) -> usize {
+        self.weight_bytes() + self.cache_bytes()
+    }
+
+    pub fn cache_bytes(&self) -> usize {
         let kv_dim = self.cfg.n_kv_head * self.cfg.head_dim();
-        let cache = 2 * self.cfg.n_layer * self.capacity * kv_dim * 4;
-        let weights = self.cfg.vocab_size * self.cfg.n_embd * 4
-            + self.cfg.n_layer
-                * (3 * self.cfg.n_embd * self.cfg.n_embd + 3 * self.hidden * self.cfg.n_embd)
-                * 4;
-        weights + cache
+        2 * self.cfg.n_layer * self.capacity * kv_dim * 4
+    }
+
+    /// Weight bytes actually resident, counted from how each tensor is stored
+    /// rather than assumed from the parameter count -- which is the whole point
+    /// of quantising, and would be invisible if this were hardcoded to f32.
+    pub fn weight_bytes(&self) -> usize {
+        let (d, hidden) = (self.cfg.n_embd, self.hidden);
+        let kv_dim = self.cfg.n_kv_head * self.cfg.head_dim();
+        let mut total = self.tok_emb.bytes(self.cfg.vocab_size, d);
+        for l in &self.layers {
+            total += l.q_proj.bytes(d, d)
+                + l.k_proj.bytes(kv_dim, d)
+                + l.v_proj.bytes(kv_dim, d)
+                + l.o_proj.bytes(d, d)
+                + l.up_proj.bytes(hidden, d)
+                + l.down_proj.bytes(d, hidden)
+                + l.gate_proj.as_ref().map_or(0, |g| g.bytes(hidden, d))
+                + 2 * d * 4; // the two norms stay f32
+        }
+        total
     }
 
     /// Append tokens to the cache and return logits for the final position.
@@ -178,7 +279,12 @@ impl GpuModel {
             let pos = self.cache_len;
             let s = &mut self.scratch;
 
-            self.gpu.embed(&self.tok_emb, &mut s.x, token, d)?;
+            match &self.tok_emb {
+                Proj::F32(t) => self.gpu.embed(t, &mut s.x, token, d)?,
+                Proj::Int8 { data, scales } => {
+                    self.gpu.embed_i8(data, scales, &mut s.x, token, d)?
+                }
+            }
 
             for (l, layer) in self.layers.iter().enumerate() {
                 // Offsets of this layer's cache region and this position's slot.
@@ -189,11 +295,11 @@ impl GpuModel {
 
                 // K and V are written straight into the cache: passing an
                 // output offset avoids a separate copy kernel per layer.
-                self.gpu.gemv_at(&layer.k_proj, &s.normed, &mut self.k_cache, kv_dim, d, slot)?;
-                self.gpu.gemv_at(&layer.v_proj, &s.normed, &mut self.v_cache, kv_dim, d, slot)?;
+                Self::project(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache, kv_dim, d, slot)?;
+                Self::project(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache, kv_dim, d, slot)?;
                 self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin, n_kv, hd, pos, slot)?;
 
-                self.gpu.gemv_at(&layer.q_proj, &s.normed, &mut s.q, d, d, 0)?;
+                Self::project(&self.gpu, &layer.q_proj, &s.normed, &mut s.q, d, d, 0)?;
                 self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin, n_head, hd, pos, 0)?;
 
                 self.gpu.attention_decode(
@@ -209,19 +315,19 @@ impl GpuModel {
                     layer_base,
                 )?;
 
-                self.gpu.gemv_at(&layer.o_proj, &s.attn, &mut s.proj, d, d, 0)?;
+                Self::project(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj, d, d, 0)?;
                 self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
 
                 self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
                 match &layer.gate_proj {
                     Some(gate) => {
-                        self.gpu.gemv_at(gate, &s.normed, &mut s.gate, self.hidden, d, 0)?;
-                        self.gpu.gemv_at(&layer.up_proj, &s.normed, &mut s.up, self.hidden, d, 0)?;
+                        Self::project(&self.gpu, gate, &s.normed, &mut s.gate, self.hidden, d, 0)?;
+                        Self::project(&self.gpu, &layer.up_proj, &s.normed, &mut s.up, self.hidden, d, 0)?;
                         self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
                     }
                     None => bail!("the GPU path currently implements swiglu only"),
                 }
-                self.gpu.gemv_at(&layer.down_proj, &s.gate, &mut s.mlp_out, d, self.hidden, 0)?;
+                Self::project(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out, d, self.hidden, 0)?;
                 self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
             }
 
@@ -231,7 +337,7 @@ impl GpuModel {
         let s = &mut self.scratch;
         self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
         // lm_head is tied to tok_emb, so the embedding table is the projection.
-        self.gpu.gemv_at(&self.tok_emb, &s.normed, &mut s.logits, cfg.vocab_size, d, 0)?;
+        Self::project(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits, cfg.vocab_size, d, 0)?;
 
         self.gpu.to_host(&self.scratch.logits)
     }

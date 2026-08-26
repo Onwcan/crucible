@@ -3,6 +3,8 @@ name = "llm-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Inference engine for models trained by the Python half of this repo"
+license = "Apache-2.0"
+repository = "https://github.com/Onwcan/crucible"
 
 [dependencies]
 # Zero-copy checkpoint access: safetensors gives byte ranges into a memory
