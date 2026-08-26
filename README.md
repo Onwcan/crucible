@@ -891,22 +891,55 @@ Current stage breakdown (`gpu-profile`, position ~256):
 | logits_copy | 0.060 | 5.5% |
 | o_proj | 0.031 | 2.8% |
 
-### Next: attention is occupancy-bound, not bandwidth-bound
+### Split-position attention: implemented, exact, and it did not help
 
-Attention now dominates at 38.8%, and the reason is not kernel quality. At
-position 256 it reads roughly 4.7 MB of KV cache per token, which at 757 GB/s
-should take about 6 us. It takes 427.
-
-The kernel launches **one block per head -- 12 blocks**, or 3072 threads, on a
-GPU with dozens of SMs. Most of the machine is idle. Coalescing the reads (an
-earlier fix) helped, but no amount of per-thread tuning fixes a grid that cannot
+Attention dominated at 38.8%, and not because of kernel quality. At position 256
+it reads roughly 4.7 MB of KV cache per token, which at 757 GB/s should take
+about 6 us; it took 427. The kernel launches **one block per head -- 12 blocks**
+on a GPU with dozens of SMs, so most of the machine sat idle. Coalescing the
+reads (an earlier fix) helped, but no per-thread tuning fixes a grid that cannot
 fill the device.
 
-The fix is to parallelise over positions as well as heads: split the sequence
-into chunks, have each block compute a partial softmax over its chunk, and
-combine the partials in a second pass -- the flash-decoding approach. That is
-the next piece of work, and it is worth more than anything left in the other
-stages combined.
+So the sequence was split across blocks too: grid `(n_head, n_chunks)`, each
+block reducing one chunk into a partial softmax, with a second kernel rescaling
+by `exp(m_chunk - m_global)` and merging -- flash-decoding. `n_chunks` is fixed
+at capacity rather than current length, because a captured CUDA graph freezes
+grid dimensions.
+
+It is exact: cross-entropy is identical to the single-block path to six
+decimals. It is also not faster.
+
+| decode tok/s, int8 + graph | 256 tokens | 900 tokens |
+|---|---:|---:|
+| single block per head | **1484** | **1424** |
+| split positions | 1305 | 1389 |
+
+Median of three. Splitting costs a second kernel dispatch per layer, 12 more per
+token, which at this size is about what the extra parallelism saves. Clearly
+worse at short context, a wash at long.
+
+Kept behind `CRUCIBLE_ATTN=split` rather than deleted: the trade should invert
+with more heads, a larger `head_dim`, or context well beyond 1024, where
+attention work grows while the extra dispatch does not. It is off by default
+because on *this* model it loses.
+
+### A limit of the profiler, found the hard way
+
+The profiler said attention had halved -- 0.427 to 0.206 ms adjusted -- while
+end-to-end decode did not move. Both cannot be true.
+
+The profiler subtracts one launch-plus-sync overhead per timed block. The split
+path runs **two** kernels inside that one block, so it was credited with one
+subtraction where it should have had two, and looked better than it was. The
+comparison it was built for -- ranking stages within one configuration -- is
+still valid. Comparing configurations whose stages contain different numbers of
+kernels is not something it can do.
+
+This is the third time a measurement here has produced a confident wrong answer:
+first the sync overhead attributed to whoever called most often, then the
+idle-stream probe that contradicted its own arithmetic, now this. The pattern is
+consistent -- the tool is fine for what it was built for and silently wrong just
+outside it, and only an end-to-end number catches the difference.
 
 ## Layout
 
@@ -977,7 +1010,7 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] CUDA graphs: 1.39x (f32) / 1.60x (int8), and int8's own gain rose 1.05x -> 1.21x
 - [x] Profiler with sync-overhead correction; coalesced attention; warp-per-row int8 GEMV
 - [x] Kernel fusion: SwiGLU in one kernel, residual folded into the projections
-- [ ] Split-position attention (flash-decoding) — the kernel fills 12 blocks of a many-SM GPU
+- [x] Split-position attention (flash-decoding) — exact, but slower here; kept opt-in
 - [ ] Paged attention → continuous batching
 - [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
 

@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use cudarc::driver::{CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{Gpu, Proj2, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{attn_chunks, Gpu, Proj2, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::quant::QuantTensor;
 use crate::weights::Weights;
@@ -107,6 +107,12 @@ struct Scratch {
     up: CudaSlice<f32>,
     mlp_out: CudaSlice<f32>,
     logits: CudaSlice<f32>,
+
+    /// Per-chunk partial softmax state for split attention: one local max, one
+    /// local sum, and one unnormalised value vector per (head, chunk).
+    partial_o: CudaSlice<f32>,
+    partial_m: CudaSlice<f32>,
+    partial_l: CudaSlice<f32>,
 }
 
 pub struct GpuModel {
@@ -135,6 +141,26 @@ pub struct GpuModel {
     /// Captured decode graph, if graph mode is enabled and warm.
     graph: Option<CudaGraph>,
     use_graph: bool,
+
+    /// Split-position attention, versus one block per head.
+    ///
+    /// Off by default: it was implemented to fix what profiling identified as
+    /// the largest stage, it is numerically exact, and it did not help.
+    ///
+    ///   decode tok/s, int8 + graph, median of three
+    ///                  256 tokens   900 tokens
+    ///   single              1484         1424
+    ///   split               1305         1389
+    ///
+    /// Splitting gives the grid n_head*n_chunks blocks instead of n_head, but
+    /// costs a second kernel dispatch per layer -- 12 more per token -- and at
+    /// this size that costs about what the extra parallelism saves. It is
+    /// clearly worse at short context and a wash at long.
+    ///
+    /// Kept because the trade should invert with more heads, a larger head_dim,
+    /// or a context well beyond 1024, where attention work grows but the extra
+    /// dispatch does not. Set CRUCIBLE_ATTN=split to measure it.
+    split_attention: bool,
 }
 
 impl GpuModel {
@@ -216,6 +242,9 @@ impl GpuModel {
                 up: gpu.alloc(hidden)?,
                 mlp_out: gpu.alloc(d)?,
                 logits: gpu.alloc(cfg.vocab_size)?,
+                partial_o: gpu.alloc(cfg.n_head * attn_chunks(capacity) * cfg.head_dim())?,
+                partial_m: gpu.alloc(cfg.n_head * attn_chunks(capacity))?,
+                partial_l: gpu.alloc(cfg.n_head * attn_chunks(capacity))?,
             },
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
@@ -223,6 +252,7 @@ impl GpuModel {
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
             use_graph: false,
+            split_attention: std::env::var("CRUCIBLE_ATTN").as_deref() == Ok("split"),
             layers,
             capacity,
             cache_len: 0,
@@ -330,9 +360,20 @@ impl GpuModel {
             self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
                              n_head, hd, &self.params, 0, PARAM_ZERO)?;
 
-            self.gpu.attention_decode(&s.q, &self.k_cache, &self.v_cache, &mut s.attn,
-                                      n_head, n_kv, hd, &self.params,
-                                      self.capacity, kv_dim, layer_base)?;
+            if self.split_attention {
+                self.gpu.attention_split(
+                    &s.q, &self.k_cache, &self.v_cache,
+                    &mut s.partial_o, &mut s.partial_m, &mut s.partial_l,
+                    &mut s.attn, n_head, n_kv, hd, &self.params,
+                    self.capacity, kv_dim, layer_base,
+                )?;
+            } else {
+                self.gpu.attention_decode(
+                    &s.q, &self.k_cache, &self.v_cache, &mut s.attn,
+                    n_head, n_kv, hd, &self.params,
+                    self.capacity, kv_dim, layer_base,
+                )?;
+            }
 
             // Fused residual: the projection accumulates straight into the
             // stream, removing a kernel. Only the warp-per-row path supports
@@ -508,9 +549,12 @@ impl GpuModel {
                                      n_head, hd, &self.params, 0, PARAM_ZERO)?;
                 });
                 timed!(4, {
-                    self.gpu.attention_decode(&s.q, &self.k_cache, &self.v_cache, &mut s.attn,
-                                              n_head, n_kv, hd, &self.params,
-                                              self.capacity, kv_dim, layer_base)?;
+                    self.gpu.attention_split(
+                        &s.q, &self.k_cache, &self.v_cache,
+                        &mut s.partial_o, &mut s.partial_m, &mut s.partial_l,
+                        &mut s.attn, n_head, n_kv, hd, &self.params,
+                        self.capacity, kv_dim, layer_base,
+                    )?;
                 });
                 timed!(5, {
                     if int8 {

@@ -26,6 +26,24 @@ const KERNELS: &str = include_str!("../kernels/kernels.cu");
 /// slower -- the exact failure this project checks for elsewhere.
 const ARCH: &str = "compute_120";
 
+/// Positions handled by one attention block.
+///
+/// Sets how many blocks the attention grid has: `n_head * ceil(capacity/CHUNK)`
+/// instead of `n_head`. At capacity 1024 this turns 12 blocks into 96, which is
+/// the point -- the single-block-per-head kernel left most of the GPU idle.
+///
+/// Smaller chunks mean more parallelism but more partials to combine, and more
+/// shared memory per block. 128 was chosen by measurement, not derivation.
+pub const ATTN_CHUNK: usize = 128;
+
+/// Chunks needed to cover `capacity` positions.
+///
+/// Derived from capacity rather than the current sequence length, because a
+/// captured CUDA graph freezes grid dimensions.
+pub fn attn_chunks(capacity: usize) -> usize {
+    capacity.div_ceil(ATTN_CHUNK)
+}
+
 /// A projection's device buffers, borrowed so a fused kernel can take two.
 pub enum Proj2<'a> {
     F32(&'a CudaSlice<f32>),
@@ -77,6 +95,8 @@ pub struct Gpu {
     gemv_warp: CudaFunction,
     mlp_swiglu_i8: CudaFunction,
     mlp_swiglu_f32: CudaFunction,
+    attention_partial: CudaFunction,
+    attention_combine: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -129,6 +149,8 @@ impl Gpu {
             gemv_warp: cu(module.load_function("gemv_f32_warp"))?,
             mlp_swiglu_i8: cu(module.load_function("mlp_swiglu_i8_warp"))?,
             mlp_swiglu_f32: cu(module.load_function("mlp_swiglu_f32"))?,
+            attention_partial: cu(module.load_function("attention_partial_f32"))?,
+            attention_combine: cu(module.load_function("attention_combine_f32"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -450,6 +472,70 @@ impl Gpu {
         let mut b = self.stream.launch_builder(func);
         b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
         unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Attention over the KV cache, split across position chunks.
+    ///
+    /// Two kernels: each block reduces one chunk into a partial softmax, then a
+    /// combine pass rescales and merges them. Exact, not approximate -- the
+    /// rescaling by `exp(m_chunk - m_global)` is what makes splitting a softmax
+    /// sound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_split(
+        &self,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaSlice<f32>,
+        v_cache: &CudaSlice<f32>,
+        partial_o: &mut CudaSlice<f32>,
+        partial_m: &mut CudaSlice<f32>,
+        partial_l: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        params: &CudaSlice<i32>,
+        capacity: usize,
+        cache_stride: usize,
+        layer_base: usize,
+    ) -> Result<()> {
+        let n_chunks = attn_chunks(capacity);
+        let k = k_cache.slice(layer_base..);
+        let v = v_cache.slice(layer_base..);
+
+        // scores[chunk] followed by one partial vector per warp.
+        let shared = (ATTN_CHUNK + (REDUCE_THREADS as usize / 32) * head_dim)
+            * std::mem::size_of::<f32>();
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, n_chunks as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let (nh, nkv, hd, si, cs, ch) = (
+            n_head as i32,
+            n_kv_head as i32,
+            head_dim as i32,
+            PARAM_SEQ as i32,
+            cache_stride as i32,
+            ATTN_CHUNK as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.attention_partial);
+        // Reborrow: the partials are written here and read by the combine
+        // below, so the mutable references must survive both launches.
+        b.arg(q).arg(&k).arg(&v).arg(&mut *partial_o).arg(&mut *partial_m).arg(&mut *partial_l)
+            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs).arg(&ch);
+        unsafe { cu(b.launch(cfg))? };
+
+        let combine_cfg = LaunchConfig {
+            grid_dim: (n_head as u32, 1, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let nc = n_chunks as i32;
+        let mut b = self.stream.launch_builder(&self.attention_combine);
+        b.arg(&*partial_o).arg(&*partial_m).arg(&*partial_l).arg(out)
+            .arg(&nh).arg(&hd).arg(&nc);
+        unsafe { cu(b.launch(combine_cfg))? };
         Ok(())
     }
 

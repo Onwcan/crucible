@@ -661,3 +661,184 @@ extern "C" __global__ void mlp_swiglu_f32(
         out[row] = (g / (1.0f + __expf(-g))) * u;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Split-position attention (flash-decoding)
+//
+// The single-block-per-head kernel above is correct and coalesced, and still
+// took 38.8% of decode. The reason is not the kernel body: it launches one
+// block per head, so 12 blocks, on a GPU with dozens of SMs. At position 256 it
+// reads ~4.7 MB of KV cache per token, which at 757 GB/s should take ~6 us; it
+// took 427. Most of the machine was idle.
+//
+// This splits the sequence too: grid is (n_head, n_chunks), each block reduces
+// one chunk of positions into a partial softmax, and a second kernel combines
+// the partials. Standard online-softmax algebra -- each chunk records its local
+// max m, the sum of exp(score - m), and the unnormalised weighted value sum, and
+// the combine rescales each by exp(m - global_max).
+//
+// n_chunks is fixed at CAPACITY, not at the current sequence length: a captured
+// CUDA graph freezes grid dimensions, so a length-dependent grid would make the
+// graph invalid as the sequence grows. Chunks past the end write a neutral
+// contribution (m = -inf, l = 0) and exit.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void attention_partial_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ partial_o,   // [n_head][n_chunks][head_dim]
+    float* __restrict__ partial_m,   // [n_head][n_chunks]
+    float* __restrict__ partial_l,   // [n_head][n_chunks]
+    const int n_head,
+    const int n_kv_head,
+    const int head_dim,
+    const int* __restrict__ params,
+    const int seq_idx,
+    const int cache_stride,
+    const int chunk_size)
+{
+    extern __shared__ float shared[];
+
+    const int h = blockIdx.x;
+    const int chunk = blockIdx.y;
+    if (h >= n_head) return;
+
+    const int n_chunks = gridDim.y;
+    const int slot = h * n_chunks + chunk;
+    const int seq_len = params[seq_idx];
+    const int start = chunk * chunk_size;
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+
+    // Past the end of the sequence: contribute nothing. exp(-inf - M) is 0 in
+    // the combine, so these vanish without a special case there.
+    if (start >= seq_len) {
+        if (threadIdx.x == 0) {
+            partial_m[slot] = NEG_INF;
+            partial_l[slot] = 0.0f;
+        }
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial_o[(size_t)slot * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+
+    const int end = min(start + chunk_size, seq_len);
+    const int len = end - start;
+
+    const int n_rep = n_head / n_kv_head;
+    const int kv_h = h / n_rep;
+    const float* qh = q + h * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    float* scores = shared;                    // [chunk_size]
+    float* partials = shared + chunk_size;     // [n_warps][head_dim]
+
+    // Scores: one warp per position, lanes striding the key so reads coalesce.
+    for (int j = warp_id; j < len; j += n_warps) {
+        const float* kh = k_cache + (size_t)(start + j) * cache_stride + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += WARP_SIZE) dot += qh[d] * kh[d];
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    // Local max over this chunk only.
+    __shared__ float smax;
+    {
+        float m = NEG_INF;
+        for (int j = threadIdx.x; j < len; j += blockDim.x) m = fmaxf(m, scores[j]);
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+        __shared__ float warp_max[WARP_SIZE];
+        if (lane == 0) warp_max[warp_id] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float best = NEG_INF;
+            for (int i = 0; i < n_warps; ++i) best = fmaxf(best, warp_max[i]);
+            smax = best;
+        }
+        __syncthreads();
+    }
+
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < len; j += blockDim.x) {
+        const float e = __expf(scores[j] - smax);
+        scores[j] = e;
+        local += e;
+    }
+    local = block_reduce_sum(local);
+
+    if (threadIdx.x == 0) {
+        partial_m[slot] = smax;
+        partial_l[slot] = local;   // unnormalised: the combine divides once
+    }
+
+    // Unnormalised weighted value sum for this chunk.
+    for (int d = lane; d < head_dim; d += WARP_SIZE) {
+        float acc = 0.0f;
+        for (int j = warp_id; j < len; j += n_warps) {
+            acc += scores[j] * v_cache[(size_t)(start + j) * cache_stride
+                                       + kv_h * head_dim + d];
+        }
+        partials[warp_id * head_dim + d] = acc;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int w = 0; w < n_warps; ++w) acc += partials[w * head_dim + d];
+        partial_o[(size_t)slot * head_dim + d] = acc;
+    }
+}
+
+// Combine per-chunk partial softmaxes into the final attention output.
+//
+// One block per head. Rescales each chunk by exp(m_chunk - m_global), which is
+// what makes splitting the softmax exact rather than approximate.
+extern "C" __global__ void attention_combine_f32(
+    const float* __restrict__ partial_o,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    float* __restrict__ out,
+    const int n_head,
+    const int head_dim,
+    const int n_chunks)
+{
+    const int h = blockIdx.x;
+    if (h >= n_head) return;
+
+    __shared__ float m_global;
+    __shared__ float l_global;
+
+    if (threadIdx.x == 0) {
+        float m = NEG_INF;
+        for (int c = 0; c < n_chunks; ++c) {
+            m = fmaxf(m, partial_m[h * n_chunks + c]);
+        }
+        m_global = m;
+
+        float l = 0.0f;
+        for (int c = 0; c < n_chunks; ++c) {
+            l += partial_l[h * n_chunks + c] * __expf(partial_m[h * n_chunks + c] - m);
+        }
+        l_global = l;
+    }
+    __syncthreads();
+
+    const float inv_l = 1.0f / l_global;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int c = 0; c < n_chunks; ++c) {
+            const int slot = h * n_chunks + c;
+            const float w = __expf(partial_m[slot] - m_global);
+            acc += partial_o[(size_t)slot * head_dim + d] * w;
+        }
+        out[h * head_dim + d] = acc * inv_l;
+    }
+}
