@@ -67,6 +67,8 @@ pub struct Gpu {
     attention: CudaFunction,
     gemv_i8: CudaFunction,
     gemv_i8_vec4: CudaFunction,
+    gemv_i8_warp: CudaFunction,
+    gemv_warp: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -115,6 +117,8 @@ impl Gpu {
             attention: cu(module.load_function("attention_decode_f32"))?,
             gemv_i8: cu(module.load_function("gemv_i8_f32"))?,
             gemv_i8_vec4: cu(module.load_function("gemv_i8_f32_vec4"))?,
+            gemv_i8_warp: cu(module.load_function("gemv_i8_f32_warp"))?,
+            gemv_warp: cu(module.load_function("gemv_f32_warp"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -157,7 +161,13 @@ impl Gpu {
         y_base: usize,
         y_idx: usize,
     ) -> Result<()> {
-        let func = if cols % 4 == 0 { &self.gemv_vec4 } else { &self.gemv };
+        // Block per row. A warp-per-row variant exists and is used for int8,
+        // but at f32 it measured 737/736/864 tok/s against 825 for this path --
+        // a possible regression sitting inside its own 17% spread, so unproven
+        // in either direction and not adopted. An f32 row carries four times
+        // the bytes of an int8 one, so the block is far less starved.
+        let vec4 = cols % 4 == 0;
+        let func = if vec4 { &self.gemv_vec4 } else { &self.gemv };
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
@@ -241,7 +251,9 @@ impl Gpu {
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, 1, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
-            shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
+            // scores[max_seq] followed by one partial vector per warp.
+            shared_mem_bytes: ((max_seq + (REDUCE_THREADS as usize / 32) * head_dim)
+                * std::mem::size_of::<f32>()) as u32,
         };
         let (nh, nkv, hd, si, cs) = (
             n_head as i32,
@@ -251,8 +263,9 @@ impl Gpu {
             cache_stride as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention);
+        let ms = max_seq as i32;
         b.arg(q).arg(&k).arg(&v).arg(out)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs);
+            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs).arg(&ms);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -356,11 +369,35 @@ impl Gpu {
         y_base: usize,
         y_idx: usize,
     ) -> Result<()> {
-        let func = if cols % 4 == 0 { &self.gemv_i8_vec4 } else { &self.gemv_i8 };
-        let cfg = LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (REDUCE_THREADS, 1, 1),
-            shared_mem_bytes: 0,
+        // One warp per row when a block would be starved. At int8 a 768-column
+        // row is 192 char4 loads against 256 threads: a quarter of the block
+        // idle, one load per active thread, then a full eight-warp reduction to
+        // combine them. Warp-per-row measured 1170-1299 tok/s against 852 for
+        // block-per-row, a 1.42x gain well outside the spread.
+        //
+        // The same switch did not help f32, where each row carries four times
+        // the bytes and the block is not starved -- see gemv_at.
+        let vec4 = cols % 4 == 0;
+        let warp_per_row = vec4 && (cols / 4) < REDUCE_THREADS as usize;
+        let (func, cfg) = if warp_per_row {
+            let warps = (REDUCE_THREADS / 32) as usize;
+            (
+                &self.gemv_i8_warp,
+                LaunchConfig {
+                    grid_dim: (rows.div_ceil(warps) as u32, 1, 1),
+                    block_dim: (REDUCE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else {
+            (
+                if vec4 { &self.gemv_i8_vec4 } else { &self.gemv_i8 },
+                LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (REDUCE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
         };
         let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
         let mut b = self.stream.launch_builder(func);

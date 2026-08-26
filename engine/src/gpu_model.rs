@@ -70,6 +70,24 @@ struct GpuLayer {
     down_proj: Proj,
 }
 
+/// One stage of a profiled decode step.
+pub struct Stage {
+    pub name: String,
+    /// Timed blocks per token, which is how much sync overhead it absorbs.
+    pub calls: usize,
+    /// Measured time including the sync at the end of each block.
+    pub raw: f64,
+    /// With sync overhead removed. This is the number worth acting on.
+    pub adjusted: f64,
+}
+
+pub struct ProfileReport {
+    pub stages: Vec<Stage>,
+    /// Estimated per-block launch + sync overhead, taken from the cheapest
+    /// kernel-launching stage.
+    pub sync_cost: f64,
+}
+
 /// Device-side scratch, allocated once. Decoding one token launches ~170
 /// kernels; allocating inside that loop would be pure overhead.
 struct Scratch {
@@ -361,6 +379,175 @@ impl GpuModel {
                 + 2 * d * 4; // the two norms stay f32
         }
         total
+    }
+
+    /// Time each stage of one decode step.
+    ///
+    /// Nsight Systems reports no CUDA kernel data under WSL2 virtualisation, so
+    /// attribution is done here instead: the stream is synchronised between
+    /// stages and each is timed on the host.
+    ///
+    /// The syncs serialise work that normally overlaps, so absolute totals come
+    /// out higher than real decode. The proportions are what this is for --
+    /// which stage to attack, not how fast the engine is.
+    pub fn profile_step(&mut self, token: usize, iters: usize) -> Result<ProfileReport> {
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+
+        // Each timed block ends with a stream sync, and a sync is not free. The
+        // stages called most often would otherwise absorb the most overhead and
+        // look expensive purely for being frequent -- which is how a
+        // 768-element rmsnorm first appeared to cost more than a 50304x768
+        // matmul.
+        //
+        // The overhead is estimated from the cheapest stage rather than by
+        // timing syncs on an idle stream. That probe gave 70.8 us, which cannot
+        // be right: 111 blocks would then cost 7.9 ms against a 3.9 ms measured
+        // total. Syncing an idle stream is simply not the same operation as
+        // syncing after queued work. `embed` copies one 768-element row and is
+        // the least work any block does, so its per-call time is a defensible
+        // floor for launch + sync.
+        // Timed blocks per token, used to remove that overhead.
+        let n_layer = cfg.n_layer;
+        let calls: Vec<(String, usize)> = vec![
+            ("embed".into(), 1),
+            ("rmsnorm".into(), 2 * n_layer),
+            ("qkv_proj".into(), n_layer),
+            ("rope".into(), n_layer),
+            ("attention".into(), n_layer),
+            ("o_proj".into(), n_layer),
+            ("mlp".into(), n_layer),
+            ("residual".into(), 2 * n_layer),
+            ("lm_head".into(), 1),
+            ("logits_copy".into(), 1),
+        ];
+        let mut totals: Vec<(String, f64)> =
+            calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
+
+        for _ in 0..iters {
+            let pos = self.cache_len;
+            if pos + 1 > self.capacity {
+                bail!("cache full during profiling");
+            }
+            self.set_params(token, pos)?;
+            self.gpu.sync()?;
+
+            macro_rules! timed {
+                ($slot:expr, $body:block) => {{
+                    let t0 = std::time::Instant::now();
+                    $body
+                    self.gpu.sync()?;
+                    totals[$slot].1 += t0.elapsed().as_secs_f64();
+                }};
+            }
+
+            timed!(0, {
+                let s = &mut self.scratch;
+                match &self.tok_emb {
+                    Proj::F32(t) => self.gpu.embed(t, &mut s.x, &self.params, d)?,
+                    Proj::Int8 { data, scales } => {
+                        self.gpu.embed_i8(data, scales, &mut s.x, &self.params, d)?
+                    }
+                }
+            });
+
+            for (l, layer) in self.layers.iter().enumerate() {
+                let layer_base = l * self.capacity * kv_dim;
+                let s = &mut self.scratch;
+
+                timed!(1, {
+                    self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
+                });
+                timed!(2, {
+                    Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
+                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                    Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
+                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT)?;
+                    Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
+                                      d, d, &self.params, 0, PARAM_ZERO)?;
+                });
+                timed!(3, {
+                    self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
+                                     n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+                    self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
+                                     n_head, hd, &self.params, 0, PARAM_ZERO)?;
+                });
+                timed!(4, {
+                    self.gpu.attention_decode(&s.q, &self.k_cache, &self.v_cache, &mut s.attn,
+                                              n_head, n_kv, hd, &self.params,
+                                              self.capacity, kv_dim, layer_base)?;
+                });
+                timed!(5, {
+                    Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
+                                      d, d, &self.params, 0, PARAM_ZERO)?;
+                });
+                timed!(7, {
+                    self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
+                });
+                timed!(1, {
+                    self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
+                });
+                timed!(6, {
+                    match &layer.gate_proj {
+                        Some(gate) => {
+                            Self::project_dyn(&self.gpu, gate, &s.normed, &mut s.gate,
+                                              self.hidden, d, &self.params, 0, PARAM_ZERO)?;
+                            Self::project_dyn(&self.gpu, &layer.up_proj, &s.normed, &mut s.up,
+                                              self.hidden, d, &self.params, 0, PARAM_ZERO)?;
+                            self.gpu.silu_mul(&mut s.gate, &s.up, self.hidden)?;
+                        }
+                        None => bail!("swiglu only"),
+                    }
+                    Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
+                                      d, self.hidden, &self.params, 0, PARAM_ZERO)?;
+                });
+                timed!(7, {
+                    self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
+                });
+            }
+
+            timed!(8, {
+                let s = &mut self.scratch;
+                self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
+                Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
+                                  cfg.vocab_size, d, &self.params, 0, PARAM_ZERO)?;
+            });
+
+            let t0 = std::time::Instant::now();
+            let _ = self.gpu.to_host(&self.scratch.logits)?;
+            totals[9].1 += t0.elapsed().as_secs_f64();
+
+            self.cache_len += 1;
+        }
+
+        let per_call: Vec<f64> = totals
+            .iter()
+            .enumerate()
+            .map(|(i, (_, raw))| raw / iters as f64 / calls[i].1 as f64)
+            .collect();
+
+        // Cheapest kernel-launching stage sets the floor. logits_copy is a
+        // blocking transfer rather than a launch, so it is excluded.
+        let sync_cost = totals
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| name != "logits_copy")
+            .map(|(i, _)| per_call[i])
+            .fold(f64::INFINITY, f64::min);
+
+        let mut stages = Vec::new();
+        for (i, (name, raw)) in totals.into_iter().enumerate() {
+            let n = calls[i].1;
+            let overhead = if name == "logits_copy" { 0.0 } else { sync_cost };
+            stages.push(Stage {
+                name,
+                calls: n,
+                raw: raw / iters as f64,
+                adjusted: ((per_call[i] - overhead) * n as f64).max(0.0),
+            });
+        }
+        Ok(ProfileReport { stages, sync_cost })
     }
 
     /// Append tokens to the cache and return logits for the final position.

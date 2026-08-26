@@ -4,9 +4,9 @@ Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **852 tok/s on GPU** (int8 weights + CUDA graph replay, 88x the
-> CPU reference), byte-identical output to the CPU path whose logits match
-> PyTorch.
+> generates at **~1149 tok/s on GPU** (int8 + CUDA graphs + coalesced kernels,
+> 119x the CPU reference), with cross-entropy unchanged and output matching the
+> CPU path whose logits match PyTorch.
 
 ## Why Blackwell specifically
 
@@ -753,16 +753,92 @@ So roughly **1.0 ms per token is still unaccounted for**, and decode sits at
 about 13% of the bandwidth ceiling.
 
 Launch overhead is no longer the main suspect -- graphs removed most of it. The
-remaining candidates, untested:
+candidates were:
 
-- **The attention kernel's inner loop is uncoalesced.** Each thread walks one
-  cached position's key vector sequentially, so threads in a warp read addresses
-  `head_dim` apart rather than adjacent. At 12 layers x 12 heads that is the
-  most-executed loop in the model.
-- **Logits transfer.** 50,304 floats copied device-to-host every token, 201 KB,
-  when only the argmax or a top-k slice is needed.
-- **Small-matrix inefficiency.** A 768x768 GEMV launches 768 blocks doing very
-  little each.
+- **The attention kernel's inner loop is uncoalesced.** *(Confirmed by profiling
+  and fixed -- see below. It was the largest stage at 32%.)*
+- **Small-matrix inefficiency.** *(Confirmed and partly fixed: warp-per-row GEMV
+  for int8.)*
+- **Logits transfer.** *(Measured at 4.6% of decode -- real but minor, and still
+  unaddressed.)*
+
+### Profiling, and getting the profiler right
+
+```bash
+./target/release/llm-engine gpu-profile export/120m --quant int8 --warm 256
+```
+
+Nsight Systems reports no CUDA kernel data under WSL2 virtualisation, so
+attribution is done in-engine: the stream is synchronised between stages and
+each is timed on the host.
+
+The first version of that produced a nonsense ranking. A 768-element `rmsnorm`
+appeared to cost more than a 50304x768 matmul, because `rmsnorm` runs 24 times
+per token and `lm_head` once, so it absorbed 24 syncs to the other's one. **The
+profiler was measuring itself.**
+
+The correction needs a per-block overhead estimate. Timing syncs on an idle
+stream gave 70.8 us, which cannot be right: 111 blocks would then cost 7.9 ms
+against a 3.9 ms measured total. Syncing an idle stream is simply a different
+operation from syncing after queued work. The estimate now comes from the
+cheapest stage that still launches a kernel -- `embed`, one 768-element row copy
+-- giving ~21 us and an adjusted total of 1.37 ms against 0.87 ms of real
+decode, which is close enough for ranking.
+
+| stage | adjusted ms | share |
+|---|---:|---:|
+| mlp | 0.390 | 28.5% |
+| attention | 0.362 | 26.4% |
+| lm_head | 0.169 | 12.3% |
+| qkv_proj | 0.168 | 12.2% |
+| rope | 0.117 | 8.5% |
+| logits_copy | 0.062 | 4.6% |
+| rmsnorm | 0.060 | 4.4% |
+| o_proj | 0.035 | 2.6% |
+| residual | 0.006 | 0.4% |
+
+### Two kernel fixes the profile found
+
+**Attention: uncoalesced reads.** The original scoring loop gave each *thread* a
+cached position and walked that key vector sequentially, so neighbouring threads
+read addresses `cache_stride` floats apart -- 768 bytes here -- and every lane
+issued its own memory transaction. Rewritten to one *warp* per position with
+lanes striding across the key, reads become contiguous and coalesce. The value
+accumulation was already coalesced but left three quarters of each block idle at
+`head_dim` 64; each warp now sums a slice of positions into its own partial
+vector in shared memory.
+
+Attention fell from 0.531 to 0.362 ms, and decode went 852 to 1021 tok/s.
+
+**GEMV: starved blocks.** A block per output row suits a long row and wastes a
+short one. `gate_proj` is 2048x768, which as int8 with `char4` loads is 192
+elements against 256 threads: a quarter of the block idle, one load per active
+thread, then a full eight-warp block reduction to combine them. One warp per row
+removes the idle threads and replaces the block reduction with shuffles alone.
+
+int8 measured 1170-1299 tok/s against 852, a 1.42x gain well outside the spread.
+**The same change did not help f32** -- 737/736/864 against 825, a possible
+regression sitting inside its own 17% spread. Unproven in either direction, so
+f32 keeps block-per-row and the switch is applied only where it was measured to
+help. An f32 row carries four times the bytes, so its block is far less starved.
+
+### Where decode stands
+
+| path | tok/s | ms/token |
+|---|---:|---:|
+| CPU reference (scalar) | 9.7 | 103 |
+| GPU eager, f32 | 509 | 1.96 |
+| GPU graph, f32 | 825 | 1.21 |
+| GPU graph, int8 | **~1149** | **0.87** |
+
+**119x the CPU reference**, with cross-entropy unchanged at every step
+(3.720334 for int8, before and after both kernel rewrites).
+
+Still only ~17% of the bandwidth ceiling: 0.114 GB of int8 weights at 0.87 ms is
+131 GB/s against 757 measured. The MLP is now the largest stage and its three
+projections are most of the model's weights, so 28.5% of time for ~76% of the
+bytes is not obviously wrong -- the next real gain likely needs fusing the
+per-layer sequence rather than tuning individual kernels further.
 
 ## Layout
 
@@ -831,6 +907,7 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] GPU forward pass end to end (49x over CPU, identical output)
 - [x] int8 quantisation: 4x smaller weights, +0.001% cross-entropy
 - [x] CUDA graphs: 1.39x (f32) / 1.60x (int8), and int8's own gain rose 1.05x -> 1.21x
+- [x] Profiler with sync-overhead correction; coalesced attention; warp-per-row int8 GEMV
 - [ ] Paged attention → continuous batching
 - [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
 

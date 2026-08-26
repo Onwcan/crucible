@@ -289,7 +289,8 @@ extern "C" __global__ void attention_decode_f32(
     const int head_dim,
     const int* __restrict__ params,
     const int seq_idx,                  // positions 0..seq_len-1, current included
-    const int cache_stride)             // n_kv_head * head_dim
+    const int cache_stride,             // n_kv_head * head_dim
+    const int max_seq)                  // scores capacity, so partials can follow
 {
     extern __shared__ float scores[];
 
@@ -305,11 +306,25 @@ extern "C" __global__ void attention_decode_f32(
     const float* qh = q + h * head_dim;
     const float scale = rsqrtf((float)head_dim);
 
-    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+    // One warp per cached position, lanes striding across the key vector.
+    //
+    // The obvious version gives each THREAD a position and walks that key
+    // sequentially -- but then neighbouring threads read addresses
+    // cache_stride floats apart (768 bytes here), so every lane issues its own
+    // memory transaction and the warp touches 32 scattered lines instead of a
+    // few contiguous ones. Profiling put attention at 32% of decode, the
+    // largest single stage, with this loop the cause. Lane-strided reads are
+    // contiguous and coalesce.
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+
+    for (int j = warp_id; j < seq_len; j += n_warps) {
         const float* kh = k_cache + (size_t)j * cache_stride + kv_h * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        scores[j] = dot * scale;
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += WARP_SIZE) partial += qh[d] * kh[d];
+        const float dot = warp_reduce_sum(partial);
+        if (lane == 0) scores[j] = dot * scale;
     }
     __syncthreads();
 
@@ -323,12 +338,9 @@ extern "C" __global__ void attention_decode_f32(
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
             m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
         __shared__ float warp_max[WARP_SIZE];
-        const int lane = threadIdx.x % WARP_SIZE;
-        const int warp = threadIdx.x / WARP_SIZE;
-        if (lane == 0) warp_max[warp] = m;
+        if (lane == 0) warp_max[warp_id] = m;
         __syncthreads();
         if (threadIdx.x == 0) {
-            const int n_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
             float best = NEG_INF;
             for (int i = 0; i < n_warps; ++i) best = fmaxf(best, warp_max[i]);
             smax = best;
@@ -346,13 +358,26 @@ extern "C" __global__ void attention_decode_f32(
     if (threadIdx.x == 0) ssum = 1.0f / local;
     __syncthreads();
 
-    // Weighted sum of values. One thread per output element, each walking the
-    // cache; the reciprocal is applied once at the end rather than per term.
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    // Weighted sum of values.
+    //
+    // Reads here were already coalesced -- consecutive threads take consecutive
+    // d -- but with head_dim 64 and 256 threads per block, three quarters of
+    // the block sat idle. Each warp now sums a slice of the positions into its
+    // own partial vector in shared memory, and the partials are combined at the
+    // end. The reciprocal is applied once rather than per term.
+    float* partials = scores + max_seq;   // [n_warps][head_dim]
+    for (int d = lane; d < head_dim; d += WARP_SIZE) {
         float acc = 0.0f;
-        for (int j = 0; j < seq_len; ++j) {
+        for (int j = warp_id; j < seq_len; j += n_warps) {
             acc += scores[j] * v_cache[(size_t)j * cache_stride + kv_h * head_dim + d];
         }
+        partials[warp_id * head_dim + d] = acc;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int w = 0; w < n_warps; ++w) acc += partials[w * head_dim + d];
         out[h * head_dim + d] = acc * ssum;
     }
 }
@@ -450,4 +475,83 @@ extern "C" __global__ void embed_i8(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int token = params[token_idx];
     if (i < d) out[i] = (float)table[(size_t)token * d + i] * scales[token];
+}
+
+// ---------------------------------------------------------------------------
+// Warp-per-row GEMV
+//
+// The block-per-row kernels above give every output row a whole block, which
+// suits a long row and wastes a short one. gate_proj is 2048x768: as int8 with
+// char4 loads that is 192 elements against 256 threads, so a quarter of the
+// block is idle, each active thread issues exactly one load, and a full
+// eight-warp block reduction runs to combine them. Profiling put the MLP at
+// 28.5% of decode with this the cause.
+//
+// Here each WARP owns a row. Lanes stride across it and reduce with __shfl
+// alone -- no shared memory, no __syncthreads, and no idle warps, since one
+// block covers blockDim.x/32 rows at once.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void gemv_i8_f32_warp(
+    const signed char* __restrict__ w,
+    const float* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int rows,
+    const int cols,
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows) return;
+
+    const char4* w_row = reinterpret_cast<const char4*>(w + (size_t)row * cols);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const int cols4 = cols / 4;
+
+    float acc = 0.0f;
+    for (int i = lane; i < cols4; i += WARP_SIZE) {
+        const char4 a = w_row[i];
+        const float4 b = x4[i];
+        acc += (float)a.x * b.x + (float)a.y * b.y
+             + (float)a.z * b.z + (float)a.w * b.w;
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[y_base + params[y_idx] + row] = acc * scales[row];
+}
+
+extern "C" __global__ void gemv_f32_warp(
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int rows,
+    const int cols,
+    const int* __restrict__ params,
+    const int y_base,
+    const int y_idx)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows) return;
+
+    const float4* w_row = reinterpret_cast<const float4*>(w + (size_t)row * cols);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const int cols4 = cols / 4;
+
+    float acc = 0.0f;
+    for (int i = lane; i < cols4; i += WARP_SIZE) {
+        const float4 a = w_row[i];
+        const float4 b = x4[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[y_base + params[y_idx] + row] = acc;
 }

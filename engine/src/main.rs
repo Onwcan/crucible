@@ -61,6 +61,19 @@ enum Command {
         #[arg(long)]
         graph: bool,
     },
+    /// Per-stage timing breakdown for one decode step.
+    #[cfg(feature = "cuda")]
+    GpuProfile {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value_t = 100)]
+        iters: usize,
+        /// Cache positions to fill before profiling, so attention sees a
+        /// realistic sequence length rather than an empty cache.
+        #[arg(long, default_value_t = 256)]
+        warm: usize,
+    },
     /// Cross-entropy on held-out tokens, per precision.
     ///
     /// The honest way to price quantisation: speed is easy to measure and easy
@@ -123,6 +136,9 @@ fn main() -> Result<()> {
         Command::GpuLogits { model, tokens, top, decode, quant, graph } => {
             gpu_logits(model, &tokens, top, decode, &quant, graph)
         }
+        #[cfg(feature = "cuda")]
+        #[cfg(feature = "cuda")]
+        Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
         #[cfg(feature = "cuda")]
         Command::GpuEval { model, data, tokens, quant, graph } => {
             gpu_eval(model, data, tokens, &quant, graph)
@@ -603,5 +619,51 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
         println!("Cross-entropy is the number that decides whether the speed is worth having.");
     }
 
+    Ok(())
+}
+
+
+#[cfg(feature = "cuda")]
+fn gpu_profile(dir: PathBuf, quant: &str, iters: usize, warm: usize) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+
+    // Fill the cache first: attention cost grows with sequence length, so
+    // profiling against an empty cache would understate it.
+    for i in 0..warm.min(cfg.block_size - iters - 1) {
+        model.forward(&[(i % cfg.vocab_size).max(1)])?;
+    }
+
+    let report = model.profile_step(464, iters)?;
+    let raw_total: f64 = report.stages.iter().map(|s| s.raw).sum();
+    let adj_total: f64 = report.stages.iter().map(|s| s.adjusted).sum();
+
+    println!("precision {quant}, {iters} steps at position ~{warm}");
+    println!("launch+sync overhead ~{:.1} us/block (from the cheapest stage); subtracted",
+             report.sync_cost * 1e6);
+    println!();
+    println!("{:<14} {:>6} {:>10} {:>10} {:>8}",
+             "stage", "calls", "raw ms", "adjusted", "share");
+    println!("{}", "-".repeat(52));
+
+    let mut sorted: Vec<&llm_engine::gpu_model::Stage> = report.stages.iter().collect();
+    sorted.sort_by(|a, b| b.adjusted.partial_cmp(&a.adjusted).unwrap());
+    for st in &sorted {
+        println!("{:<14} {:>6} {:>10.3} {:>10.3} {:>7.1}%",
+                 st.name, st.calls, st.raw * 1000.0, st.adjusted * 1000.0,
+                 st.adjusted / adj_total * 100.0);
+    }
+    println!("{}", "-".repeat(52));
+    println!("{:<14} {:>6} {:>10.3} {:>10.3}", "total", "", raw_total * 1000.0, adj_total * 1000.0);
+    println!();
+    println!("Raw includes one stream sync per timed block, so frequently-called");
+    println!("stages absorb the most overhead. Adjusted removes it. Act on the");
+    println!("adjusted column.");
     Ok(())
 }
