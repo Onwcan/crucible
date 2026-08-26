@@ -4,9 +4,9 @@ Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **~1320 tok/s on GPU** (int8 + CUDA graphs + fused kernels, 137x
-> the CPU reference), with cross-entropy unchanged and output matching the CPU
-> path whose logits match PyTorch.
+> generates at **~1460 tok/s on GPU** (int8 + CUDA graphs + fused kernels),
+> **1.7x llama.cpp** at batch 1 with token-identical greedy output, and 137x its
+> own CPU reference path.
 
 ## Why Blackwell specifically
 
@@ -35,8 +35,10 @@ bash scripts/setup_wsl.sh
 
 All GPU work happens inside WSL2. This is a deliberate choice, not convenience:
 
-- **vLLM does not officially support Windows**, and the project's final
-  benchmark compares this engine against vLLM on identical hardware.
+- **Triton** and the CUDA toolchain are first-class here. (An earlier version
+  of this list also cited vLLM's lack of Windows support; that reason was
+  withdrawn once vLLM turned out not to run under WSL2 either — see the
+  comparison section.)
 - **Triton** — which `torch.compile` uses to generate fused kernels — is
   first-class on Linux and unreliable on Windows.
 - CUDA C++ on Windows requires the **MSVC** toolchain; on Linux `gcc` suffices.
@@ -941,6 +943,93 @@ idle-stream probe that contradicted its own arithmetic, now this. The pattern is
 consistent -- the tool is fine for what it was built for and silently wrong just
 outside it, and only an end-to-end number catches the difference.
 
+## Against llama.cpp and vLLM
+
+```bash
+python scripts/export_hf.py runs/120m-main --out export/120m-hf --verify
+python llama.cpp/convert_hf_to_gguf.py export/120m-hf --outfile export/120m-f32.gguf --outtype f32
+llama-quantize export/120m-f32.gguf export/120m-q8_0.gguf Q8_0
+python scripts/bench_compare.py --tokens 256 --trials 7
+```
+
+Every other number in this README compares crucible against an earlier version
+of itself, which answers "did that change help" and not "is this any good".
+
+| engine | tok/s | spread | weights |
+|---|---:|---:|---:|
+| **crucible** | **1463.6** | 5.8% | int8, per-row scales, 114 MB |
+| llama.cpp (b925e117, CUDA) | 862.1 | 15.6% | Q8_0, 122 MB |
+| vLLM 0.28.0 | — | — | cannot run here, see below |
+
+256 tokens, batch 1, greedy, 7 interleaved rounds, 151 W enforced. crucible led
+in all seven with no overlap.
+
+### The comparison is valid because the outputs are identical
+
+Greedy decoding, same prompt, both engines:
+
+> The capital of France is the capital of the United Kingdom.
+> The capital of the United Kingdom is the capital of the United Kingdom.
+> The capital of the United
+
+Token for token, from two independent implementations using different
+quantisation schemes — block-wise Q8_0 against per-row int8. That is far
+stronger evidence that the same model is being measured than any logit
+tolerance would be. The HF export feeding the GGUF is separately logit-verified
+against the reference implementation (`export_hf.py --verify`).
+
+llama.cpp's own trace reports `graphs reused = 26`, so it is using CUDA graphs
+as well; neither side has a structural advantage there.
+
+### What this result is not
+
+crucible implements **one** architecture, batch 1, greedy, one quantisation
+scheme, one context length. llama.cpp supports dozens of architectures, CPU and
+GPU backends, many quantisation formats, a server, batching and full sampling —
+and is tuned for models above 7B, where a 120M model at batch 1 is nowhere near
+its design point. A 1.7x margin on this workload says the specialised path is
+faster on the case it was specialised for. It says nothing about the projects.
+
+### Three ways this benchmark was wrong before it was right
+
+Each favoured crucible, and each was caught before publication.
+
+**The `-ngl` default.** `llama-bench` does not put all layers on the GPU by
+default: 583.7 tok/s. With `-ngl 99`, the same build does 846.5. Publishing the
+default would have overstated the margin by 45%.
+
+**Block ordering.** Running all of crucible's trials and then all of
+llama.cpp's gave llama.cpp 614.6 tok/s at 20% spread against 846.5 standalone —
+the second engine inherits a hot GPU. This is the same confound already fixed
+for kernel comparisons and not applied here until it bit. The harness now
+interleaves, one trial per engine per round, and llama.cpp's number moved back
+to 862.
+
+**An unverified model.** Until the greedy outputs were compared, there was no
+evidence llama.cpp was computing the same thing. A subtly broken GGUF could
+have been fast for entirely uninteresting reasons.
+
+### vLLM cannot run under WSL2
+
+`RuntimeError: UVA is not available`. WSL2's GPU paravirtualisation does not
+expose Unified Virtual Addressing, which vLLM's memory management requires. It
+is a platform limitation, not a configuration problem: native Linux would work,
+WSL2 and Windows will not.
+
+This also corrects a justification given earlier in this README. The choice of
+WSL2 was defended partly on the grounds that "vLLM does not officially support
+Windows" — but vLLM does not run under WSL2 either, so that argument never held.
+The other reasons stand: Triton is first-class on Linux, and CUDA C++ needs MSVC
+on Windows where gcc suffices here.
+
+### A CUDA 13.3 note
+
+Building llama.cpp needs nvcc, which could not compile *any* `.cu` file on this
+machine: CUDA 13.0's headers conflict with glibc 2.43 over `rsqrt`. **CUDA 13.3
+fixes it** — `cuda-nvcc-13-3` compiles cleanly and llama.cpp builds with native
+`sm_120a`. crucible stays on NVRTC regardless, since runtime compilation also
+removes the build-time toolkit dependency.
+
 ## Layout
 
 ```
@@ -970,6 +1059,8 @@ engine/            # Rust inference engine
   kernels/kernels.cu # gemv, rmsnorm, rope, softmax, silu
 scripts/
   bench_bandwidth.py # memory bandwidth and the decode ceiling it implies
+  export_hf.py       # checkpoint -> HuggingFace Llama, logit-verified
+  bench_compare.py   # interleaved comparison against llama.cpp / vLLM
 runs/              # per-run log.csv + best.pt checkpoint
 figures/           # ablation plots
 ```
@@ -1012,7 +1103,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Kernel fusion: SwiGLU in one kernel, residual folded into the projections
 - [x] Split-position attention (flash-decoding) — exact, but slower here; kept opt-in
 - [ ] Paged attention → continuous batching
-- [ ] Throughput comparison against llama.cpp and vLLM on identical hardware
+- [x] Throughput comparison against llama.cpp (1.7x at batch 1, identical output)
+- [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux
 
 ## License
 
