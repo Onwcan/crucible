@@ -1,0 +1,28 @@
+//! Inference engine for models trained by the Python half of this repository.
+//!
+//! Built in stages, each validated before the next begins:
+//!   1. checkpoint loading                (this stage)
+//!   2. CPU forward pass, numerics pinned against PyTorch
+//!   3. KV cache
+//!   4. GPU kernels, then paged attention and continuous batching
+//!
+//! The CPU path is not a throwaway. It stays as the reference implementation
+//! that GPU kernels are validated against, which is the only practical way to
+//! tell a wrong kernel from a merely slow one.
+
+pub mod cache;
+pub mod config;
+#[cfg(feature = "cuda")]
+pub mod gpu;
+#[cfg(feature = "cuda")]
+pub mod gpu_model;
+pub mod model;
+pub mod ops;
+pub mod tokenizer;
+pub mod weights;
+
+pub use cache::KvCache;
+pub use config::Config;
+pub use model::Model;
+pub use tokenizer::Tokenizer;
+pub use weights::{Tensor, Weights};

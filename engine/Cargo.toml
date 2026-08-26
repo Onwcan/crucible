@@ -1,0 +1,41 @@
+[package]
+name = "llm-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Inference engine for models trained by the Python half of this repo"
+
+[dependencies]
+# Zero-copy checkpoint access: safetensors gives byte ranges into a memory
+# mapped file, so loading a multi-GB model costs no deserialisation pass.
+safetensors = "0.4"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = { version = "2", features = ["num-traits"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# The GPT-2 pre-tokenizer pattern uses a negative lookahead, which the standard
+# regex crate does not support.
+fancy-regex = "0.13"
+
+# CUDA via the driver API. Kernels are compiled at runtime with NVRTC rather
+# than offline with nvcc: CUDA 13's headers conflict with glibc 2.43 on Ubuntu
+# 26.04 (both declare rsqrt, with incompatible exception specs), and NVRTC never
+# includes host headers so the conflict cannot arise. It also means the engine
+# builds without the CUDA toolkit present.
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading"], default-features = false, optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Kernel work needs a profile with symbols; a stripped release build tells you
+# nothing useful under a profiler.
+[profile.profiling]
+inherits = "release"
+debug = true

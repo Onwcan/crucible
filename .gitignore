@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+
+# Tokenised shards: large and fully regenerable via data/prepare.py.
+# Note the glob rather than `data/` -- ignoring the directory would also
+# exclude data/prepare.py itself.
+data/**/*.bin
+
+# Checkpoints are large; the CSV logs under runs/ ARE the results and are
+# committed deliberately so ablation numbers are reproducible from the repo.
+runs/**/*.pt
+checkpoints/
+*.safetensors
+
+# Tooling
+wandb/
+.env
+.DS_Store
+
+# Rust build output
+engine/target/
