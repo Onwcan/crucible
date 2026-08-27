@@ -97,6 +97,15 @@ pub struct Gpu {
     mlp_swiglu_f32: CudaFunction,
     attention_partial: CudaFunction,
     attention_combine: CudaFunction,
+    gemm_i8: CudaFunction,
+    gemm_f32: CudaFunction,
+    rmsnorm_batch: CudaFunction,
+    rope_batch: CudaFunction,
+    swiglu_batch: CudaFunction,
+    embed_batch_f32: CudaFunction,
+    embed_batch_i8: CudaFunction,
+    cache_store: CudaFunction,
+    attention_prefill: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -151,6 +160,15 @@ impl Gpu {
             mlp_swiglu_f32: cu(module.load_function("mlp_swiglu_f32"))?,
             attention_partial: cu(module.load_function("attention_partial_f32"))?,
             attention_combine: cu(module.load_function("attention_combine_f32"))?,
+            gemm_i8: cu(module.load_function("gemm_i8_f32"))?,
+            gemm_f32: cu(module.load_function("gemm_f32"))?,
+            rmsnorm_batch: cu(module.load_function("rmsnorm_batch_f32"))?,
+            rope_batch: cu(module.load_function("rope_batch_f32"))?,
+            swiglu_batch: cu(module.load_function("swiglu_batch_f32"))?,
+            embed_batch_f32: cu(module.load_function("embed_batch_f32"))?,
+            embed_batch_i8: cu(module.load_function("embed_batch_i8"))?,
+            cache_store: cu(module.load_function("cache_store_f32"))?,
+            attention_prefill: cu(module.load_function("attention_prefill_f32"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -369,6 +387,17 @@ impl Gpu {
         cu(graph.launch())
     }
 
+    /// Copy n floats from a device view into another device buffer.
+    pub fn copy_rows(
+        &self,
+        src: &cudarc::driver::CudaView<f32>,
+        dst: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<()> {
+        let mut view = dst.slice_mut(0..n);
+        cu(self.stream.memcpy_dtod(src, &mut view))
+    }
+
     /// Upload i32 parameters.
     pub fn to_device_i32(&self, host: &[i32]) -> Result<CudaSlice<i32>> {
         cu(self.stream.memcpy_stod(host))
@@ -471,6 +500,198 @@ impl Gpu {
         let zeros = self.zero_params()?;
         let mut b = self.stream.launch_builder(func);
         b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// C[M,N] = A[M,K] * W[N,K]^T, the prefill counterpart to `gemv_at`.
+    ///
+    /// The weight layout is identical to the GEMV path, so nothing is repacked
+    /// between prefill and decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm(
+        &self,
+        w: &Proj2,
+        a: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        const TILE: u32 = 16;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(TILE),
+                (m as u32).div_ceil(TILE),
+                1,
+            ),
+            block_dim: (TILE, TILE, 1),
+            shared_mem_bytes: 0,
+        };
+        let (mi, ni, ki, acc) = (m as i32, n as i32, k as i32, i32::from(accumulate));
+        match w {
+            Proj2::Int8(data, scales) => {
+                let mut b = self.stream.launch_builder(&self.gemm_i8);
+                b.arg(*data).arg(*scales).arg(a).arg(c)
+                    .arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                unsafe { cu(b.launch(cfg))? };
+            }
+            Proj2::F32(data) => {
+                let mut b = self.stream.launch_builder(&self.gemm_f32);
+                b.arg(*data).arg(a).arg(c).arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                unsafe { cu(b.launch(cfg))? };
+            }
+        }
+        Ok(())
+    }
+
+    /// RMSNorm over every row of a prompt: one launch instead of one per token.
+    pub fn rmsnorm_batch(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        n: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (r, ni) = (rows as i32, n as i32);
+        let mut b = self.stream.launch_builder(&self.rmsnorm_batch);
+        b.arg(x).arg(weight).arg(out).arg(&r).arg(&ni).arg(&eps);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Rotary embedding across every position of a prompt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batch(
+        &self,
+        v: &mut CudaSlice<f32>,
+        cos: &CudaSlice<f32>,
+        sin: &CudaSlice<f32>,
+        rows: usize,
+        n_heads: usize,
+        head_dim: usize,
+        row_stride: usize,
+        pos_offset: usize,
+    ) -> Result<()> {
+        let total = (rows * n_heads * head_dim / 2) as u32;
+        let cfg = LaunchConfig::for_num_elems(total);
+        let (r, nh, hd, rs, po) = (
+            rows as i32,
+            n_heads as i32,
+            head_dim as i32,
+            row_stride as i32,
+            pos_offset as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.rope_batch);
+        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(&po);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    pub fn swiglu_batch(
+        &self,
+        gate: &mut CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems(n as u32);
+        let ni = n as i32;
+        let mut b = self.stream.launch_builder(&self.swiglu_batch);
+        b.arg(gate).arg(up).arg(&ni);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    pub fn embed_batch(
+        &self,
+        table: &Proj2,
+        tokens: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        d: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * d) as u32);
+        let (r, di) = (rows as i32, d as i32);
+        match table {
+            Proj2::F32(data) => {
+                let mut b = self.stream.launch_builder(&self.embed_batch_f32);
+                b.arg(*data).arg(tokens).arg(out).arg(&r).arg(&di);
+                unsafe { cu(b.launch(cfg))? };
+            }
+            Proj2::Int8(data, scales) => {
+                let mut b = self.stream.launch_builder(&self.embed_batch_i8);
+                b.arg(*data).arg(*scales).arg(tokens).arg(out).arg(&r).arg(&di);
+                unsafe { cu(b.launch(cfg))? };
+            }
+        }
+        Ok(())
+    }
+
+    /// Place freshly computed K or V rows into a layer's cache region.
+    pub fn cache_store(
+        &self,
+        src: &CudaSlice<f32>,
+        cache: &mut CudaSlice<f32>,
+        rows: usize,
+        kv_dim: usize,
+        layer_base: usize,
+        pos_offset: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
+        let (r, kd, lb, po) = (
+            rows as i32,
+            kv_dim as i32,
+            layer_base as i32,
+            pos_offset as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.cache_store);
+        b.arg(src).arg(cache).arg(&r).arg(&kd).arg(&lb).arg(&po);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Causal attention over an entire prompt: one block per (head, position).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill(
+        &self,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaSlice<f32>,
+        v_cache: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        max_seq: usize,
+        cache_stride: usize,
+        layer_base: usize,
+        pos_offset: usize,
+    ) -> Result<()> {
+        let k = k_cache.slice(layer_base..);
+        let v = v_cache.slice(layer_base..);
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, rows as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
+        };
+        let (nh, nkv, hd, cs, po) = (
+            n_head as i32,
+            n_kv_head as i32,
+            head_dim as i32,
+            cache_stride as i32,
+            pos_offset as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.attention_prefill);
+        b.arg(q).arg(&k).arg(&v).arg(out)
+            .arg(&nh).arg(&nkv).arg(&hd).arg(&cs).arg(&po);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }

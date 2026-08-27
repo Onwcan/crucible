@@ -115,6 +115,29 @@ struct Scratch {
     partial_l: CudaSlice<f32>,
 }
 
+/// Buffers for processing a whole prompt at once.
+///
+/// Held separately from the decode scratch because they scale with prompt
+/// length rather than being single vectors, and because decode never touches
+/// them. At a 1024-token capacity this is ~30 MB against 471 MB of weights and
+/// cache -- cheap for removing two orders of magnitude of launch overhead.
+///
+/// Note there is no [T, vocab] buffer: only the final position's logits are
+/// ever needed, so the vocabulary projection stays a GEMV over one row. A full
+/// [1024, 50304] result would be 206 MB on its own.
+struct PrefillScratch {
+    tokens: CudaSlice<i32>,
+    x: CudaSlice<f32>,
+    normed: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    kv: CudaSlice<f32>,
+    attn: CudaSlice<f32>,
+    proj: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    last: CudaSlice<f32>,
+}
+
 pub struct GpuModel {
     pub gpu: Gpu,
     pub cfg: Config,
@@ -142,6 +165,8 @@ pub struct GpuModel {
     graph: Option<CudaGraph>,
     use_graph: bool,
 
+    prefill_scratch: PrefillScratch,
+
     /// Split-position attention, versus one block per head.
     ///
     /// Off by default: it was implemented to fix what profiling identified as
@@ -161,6 +186,10 @@ pub struct GpuModel {
     /// or a context well beyond 1024, where attention work grows but the extra
     /// dispatch does not. Set CRUCIBLE_ATTN=split to measure it.
     split_attention: bool,
+
+    /// Batched prefill. On by default; CRUCIBLE_PREFILL=serial forces the
+    /// token-at-a-time path, which is what the two are compared against.
+    use_batched_prefill: bool,
 }
 
 impl GpuModel {
@@ -246,6 +275,18 @@ impl GpuModel {
                 partial_m: gpu.alloc(cfg.n_head * attn_chunks(capacity))?,
                 partial_l: gpu.alloc(cfg.n_head * attn_chunks(capacity))?,
             },
+            prefill_scratch: PrefillScratch {
+                tokens: gpu.to_device_i32(&vec![0i32; capacity])?,
+                x: gpu.alloc(capacity * d)?,
+                normed: gpu.alloc(capacity * d)?,
+                q: gpu.alloc(capacity * d)?,
+                kv: gpu.alloc(capacity * kv_dim)?,
+                attn: gpu.alloc(capacity * d)?,
+                proj: gpu.alloc(capacity * d)?,
+                gate: gpu.alloc(capacity * hidden)?,
+                up: gpu.alloc(capacity * hidden)?,
+                last: gpu.alloc(d)?,
+            },
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
@@ -253,6 +294,7 @@ impl GpuModel {
             graph: None,
             use_graph: false,
             split_attention: std::env::var("CRUCIBLE_ATTN").as_deref() == Ok("split"),
+            use_batched_prefill: std::env::var("CRUCIBLE_PREFILL").as_deref() != Ok("serial"),
             layers,
             capacity,
             cache_len: 0,
@@ -644,6 +686,92 @@ impl GpuModel {
         Ok(ProfileReport { stages, sync_cost })
     }
 
+    /// Process a whole prompt in one pass and return the final position's logits.
+    ///
+    /// Decode and prefill are different problems. Decode has one token in
+    /// flight, so every matmul is a matrix-vector product and the work is
+    /// bandwidth-bound. Prefill has no sequential dependency between prompt
+    /// tokens, so the same weights serve every row: matrix-matrix, compute-
+    /// bound, and vastly more efficient per token.
+    ///
+    /// Running a prompt through the decode path costs ~150 launches per token --
+    /// about 77,000 for 512 tokens, measured at 888 tok/s against llama.cpp's
+    /// 92,071. This path costs ~14 launches per layer for the entire prompt
+    /// regardless of its length.
+    fn prefill(&mut self, tokens: &[usize]) -> Result<Vec<f32>> {
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+        let t = tokens.len();
+        let pos_offset = self.cache_len;
+
+        let ids: Vec<i32> = tokens.iter().map(|v| *v as i32).collect();
+        self.gpu.write_i32(&mut self.prefill_scratch.tokens, &ids)?;
+
+        {
+            let p = &mut self.prefill_scratch;
+            self.gpu.embed_batch(&self.tok_emb.view(), &p.tokens, &mut p.x, t, d)?;
+        }
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            let layer_base = l * self.capacity * kv_dim;
+            let p = &mut self.prefill_scratch;
+
+            self.gpu.rmsnorm_batch(&p.x, &layer.attn_norm, &mut p.normed, t, d, NORM_EPS)?;
+
+            // K and V go through a dense [T, kv_dim] buffer and are then placed
+            // into the cache, so prefill and decode share one cache layout.
+            self.gpu.gemm(&layer.k_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
+            self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
+                                t, n_kv, hd, kv_dim, pos_offset)?;
+            self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
+
+            self.gpu.gemm(&layer.v_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
+            self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
+
+            self.gpu.gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
+            self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
+                                t, n_head, hd, d, pos_offset)?;
+
+            self.gpu.attention_prefill(&p.q, &self.k_cache, &self.v_cache, &mut p.attn,
+                                       t, n_head, n_kv, hd, self.capacity,
+                                       kv_dim, layer_base, pos_offset)?;
+
+            self.gpu.gemm(&layer.o_proj.view(), &p.attn, &mut p.proj, t, d, d, false)?;
+            self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
+
+            self.gpu.rmsnorm_batch(&p.x, &layer.mlp_norm, &mut p.normed, t, d, NORM_EPS)?;
+            match &layer.gate_proj {
+                Some(gate) => {
+                    self.gpu.gemm(&gate.view(), &p.normed, &mut p.gate, t, self.hidden, d, false)?;
+                    self.gpu.gemm(&layer.up_proj.view(), &p.normed, &mut p.up,
+                                  t, self.hidden, d, false)?;
+                    self.gpu.swiglu_batch(&mut p.gate, &p.up, t * self.hidden)?;
+                }
+                None => bail!("the GPU path currently implements swiglu only"),
+            }
+            self.gpu.gemm(&layer.down_proj.view(), &p.gate, &mut p.proj,
+                          t, d, self.hidden, false)?;
+            self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
+        }
+
+        // Only the last position's logits are needed, so this stays a GEMV over
+        // one row rather than a [T, vocab] matrix.
+        {
+            let p = &self.prefill_scratch;
+            let last_row = p.x.slice((t - 1) * d..t * d);
+            self.gpu.copy_rows(&last_row, &mut self.scratch.normed, d)?;
+        }
+        self.gpu.rmsnorm(&self.scratch.normed.clone(), &self.final_norm,
+                         &mut self.scratch.x, d, NORM_EPS)?;
+        Self::project_dyn(&self.gpu, &self.tok_emb, &self.scratch.x,
+                          &mut self.scratch.logits, cfg.vocab_size, d,
+                          &self.params, 0, PARAM_ZERO, false)?;
+
+        self.cache_len += t;
+        self.gpu.to_host(&self.scratch.logits)
+    }
+
     /// Append tokens to the cache and return logits for the final position.
     ///
     /// Kernels are queued without synchronising between them: the stream
@@ -669,6 +797,12 @@ impl GpuModel {
             if t >= self.cfg.vocab_size {
                 bail!("token id {t} outside vocabulary {}", self.cfg.vocab_size);
             }
+        }
+
+        // More than one token means a prompt: process it as a matrix rather
+        // than looping the single-token path.
+        if tokens.len() > 1 && self.use_batched_prefill {
+            return self.prefill(tokens);
         }
 
         for &token in tokens {

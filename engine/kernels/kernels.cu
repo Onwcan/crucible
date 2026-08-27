@@ -842,3 +842,320 @@ extern "C" __global__ void attention_combine_f32(
         out[h * head_dim + d] = acc * inv_l;
     }
 }
+
+// ===========================================================================
+// Batched prefill
+//
+// Decode and prefill are different problems. Decode has one token in flight, so
+// every matmul is a matrix-VECTOR product: no reuse, bandwidth-bound, and the
+// kernels above are built for it.
+//
+// Prefill has the whole prompt at once and no sequential dependency between its
+// tokens, so the same weights serve every row. That makes it matrix-MATRIX:
+// compute-bound, with arithmetic intensity that grows with prompt length.
+//
+// Running prefill through the decode path -- one token at a time -- costs a
+// 512-token prompt ~77,000 kernel launches and measured 888 tok/s against
+// llama.cpp's 92,071. That is the entire reason these kernels exist.
+// ===========================================================================
+
+#define TILE 16
+
+// C[M,N] = A[M,K] * W[N,K]^T, with a per-output-row scale on W.
+//
+// W is stored row-major as [N, K], the same layout the GEMV kernels use, so no
+// repacking is needed between prefill and decode.
+//
+// Both operands are staged through shared memory. The B tile is loaded with
+// threadIdx.x indexing K -- not N -- so consecutive lanes read consecutive
+// addresses within a weight row; indexing N there would stride by K per lane
+// and lose coalescing entirely.
+extern "C" __global__ void gemm_i8_f32(
+    const signed char* __restrict__ w,
+    const float* __restrict__ scales,
+    const float* __restrict__ a,
+    float* __restrict__ c,
+    const int M,
+    const int N,
+    const int K,
+    const int accumulate)
+{
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    const int row = blockIdx.y * TILE + threadIdx.y;   // token
+    const int col = blockIdx.x * TILE + threadIdx.x;   // output channel
+
+    float acc = 0.0f;
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        const int ak = t * TILE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && ak < K) ? a[(size_t)row * K + ak] : 0.0f;
+
+        // Transposed store: Bs[k][n], loaded coalesced along k.
+        const int bn = blockIdx.x * TILE + threadIdx.y;
+        const int bk = t * TILE + threadIdx.x;
+        Bs[threadIdx.x][threadIdx.y] =
+            (bn < N && bk < K) ? (float)w[(size_t)bn * K + bk] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        const size_t o = (size_t)row * N + col;
+        const float v = acc * scales[col];
+        c[o] = accumulate ? c[o] + v : v;
+    }
+}
+
+extern "C" __global__ void gemm_f32(
+    const float* __restrict__ w,
+    const float* __restrict__ a,
+    float* __restrict__ c,
+    const int M,
+    const int N,
+    const int K,
+    const int accumulate)
+{
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    const int row = blockIdx.y * TILE + threadIdx.y;
+    const int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        const int ak = t * TILE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && ak < K) ? a[(size_t)row * K + ak] : 0.0f;
+
+        const int bn = blockIdx.x * TILE + threadIdx.y;
+        const int bk = t * TILE + threadIdx.x;
+        Bs[threadIdx.x][threadIdx.y] =
+            (bn < N && bk < K) ? w[(size_t)bn * K + bk] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        const size_t o = (size_t)row * N + col;
+        c[o] = accumulate ? c[o] + acc : acc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row-wise operations over a whole prompt
+//
+// One block per token row, so a T-token prompt costs one launch instead of T.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void rmsnorm_batch_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    const int rows,
+    const int n,
+    const float eps)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float* xr = x + (size_t)row * n;
+    float* outr = out + (size_t)row * n;
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        acc += v * v;
+    }
+    acc = block_reduce_sum(acc);
+
+    __shared__ float scale;
+    if (threadIdx.x == 0) scale = rsqrtf(acc / (float)n + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        outr[i] = xr[i] * scale * weight[i];
+    }
+}
+
+// Rotary embedding over every position of the prompt at once.
+//
+// `pos_offset` lets a prompt be prefilled into a cache that already holds
+// earlier tokens.
+extern "C" __global__ void rope_batch_f32(
+    float* __restrict__ v,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int rows,
+    const int n_heads,
+    const int head_dim,
+    const int row_stride,
+    const int pos_offset)
+{
+    const int half = head_dim / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per_row = n_heads * half;
+    if (idx >= rows * per_row) return;
+
+    const int row = idx / per_row;
+    const int rem = idx % per_row;
+    const int head = rem / half;
+    const int i = rem % half;
+
+    const int pos = pos_offset + row;
+    const float c = cos_table[pos * half + i];
+    const float sn = sin_table[pos * half + i];
+
+    float* h = v + (size_t)row * row_stride + head * head_dim;
+    const float lo = h[i];
+    const float hi = h[i + half];
+    h[i] = lo * c - hi * sn;
+    h[i + half] = lo * sn + hi * c;
+}
+
+extern "C" __global__ void swiglu_batch_f32(
+    float* __restrict__ gate,
+    const float* __restrict__ up,
+    const int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    gate[i] = (g / (1.0f + __expf(-g))) * up[i];
+}
+
+extern "C" __global__ void embed_batch_f32(
+    const float* __restrict__ table,
+    const int* __restrict__ tokens,
+    float* __restrict__ out,
+    const int rows,
+    const int d)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * d) return;
+    out[i] = table[(size_t)tokens[i / d] * d + (i % d)];
+}
+
+extern "C" __global__ void embed_batch_i8(
+    const signed char* __restrict__ table,
+    const float* __restrict__ scales,
+    const int* __restrict__ tokens,
+    float* __restrict__ out,
+    const int rows,
+    const int d)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * d) return;
+    const int tok = tokens[i / d];
+    out[i] = (float)table[(size_t)tok * d + (i % d)] * scales[tok];
+}
+
+// Copy computed K/V rows into the layer's cache region.
+//
+// Prefill produces K and V as dense [T, kv_dim] matrices; the cache is indexed
+// by absolute position, so this places them at the right offset.
+extern "C" __global__ void cache_store_f32(
+    const float* __restrict__ src,
+    float* __restrict__ cache,
+    const int rows,
+    const int kv_dim,
+    const int layer_base,
+    const int pos_offset)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * kv_dim) return;
+    const int row = i / kv_dim;
+    const int col = i % kv_dim;
+    cache[layer_base + (size_t)(pos_offset + row) * kv_dim + col] = src[i];
+}
+
+// Causal attention over a whole prompt.
+//
+// One block per (query position, head). Each block attends over positions
+// 0..=query, reading K and V from the cache the projections just filled, so
+// prefill and decode share one cache layout.
+extern "C" __global__ void attention_prefill_f32(
+    const float* __restrict__ q,        // [T, n_head * head_dim]
+    const float* __restrict__ k_cache,  // layer region, [capacity][kv_dim]
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,            // [T, n_head * head_dim]
+    const int n_head,
+    const int n_kv_head,
+    const int head_dim,
+    const int cache_stride,
+    const int pos_offset)
+{
+    extern __shared__ float scores[];
+
+    const int h = blockIdx.x;
+    const int row = blockIdx.y;
+    if (h >= n_head) return;
+
+    const int seq_len = pos_offset + row + 1;   // causal: 0..=this position
+    const int n_rep = n_head / n_kv_head;
+    const int kv_h = h / n_rep;
+    const float* qh = q + (size_t)row * n_head * head_dim + h * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+
+    for (int j = warp_id; j < seq_len; j += n_warps) {
+        const float* kh = k_cache + (size_t)j * cache_stride + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += WARP_SIZE) dot += qh[d] * kh[d];
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float smax;
+    __shared__ float ssum;
+    {
+        float m = NEG_INF;
+        for (int j = threadIdx.x; j < seq_len; j += blockDim.x) m = fmaxf(m, scores[j]);
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+        __shared__ float warp_max[WARP_SIZE];
+        if (lane == 0) warp_max[warp_id] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float best = NEG_INF;
+            for (int i = 0; i < n_warps; ++i) best = fmaxf(best, warp_max[i]);
+            smax = best;
+        }
+        __syncthreads();
+    }
+
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float e = __expf(scores[j] - smax);
+        scores[j] = e;
+        local += e;
+    }
+    local = block_reduce_sum(local);
+    if (threadIdx.x == 0) ssum = 1.0f / local;
+    __syncthreads();
+
+    float* dst = out + (size_t)row * n_head * head_dim + h * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            acc += scores[j] * v_cache[(size_t)j * cache_stride + kv_h * head_dim + d];
+        }
+        dst[d] = acc * ssum;
+    }
+}

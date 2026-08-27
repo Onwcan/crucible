@@ -4,9 +4,9 @@ Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
-> generates at **~1460 tok/s on GPU** (int8 + CUDA graphs + fused kernels),
-> **1.7x llama.cpp** at batch 1 with token-identical greedy output, and 137x its
-> own CPU reference path.
+> decodes at **~1460 tok/s** (1.7x llama.cpp at batch 1, token-identical greedy
+> output) and prefills at **~15,200 tok/s**. Remaining gap to llama.cpp is
+> prefill, at 7.2x, and it is a tensor-core gap.
 
 ## Why Blackwell specifically
 
@@ -387,6 +387,27 @@ them announce themselves, and none would be caught by reading samples.
 Current CPU throughput: 445 ms to load, 261 ms for a 4-token forward pass —
 single-threaded scalar code, and the baseline every optimisation is measured
 against.
+
+### Prefill and decode are different problems
+
+The engine has two paths, and the reason is arithmetic rather than tidiness.
+
+**Decode** has one token in flight. Every matmul is a matrix-vector product, no
+weight is reused, and the work is bandwidth-bound — which is why int8 and CUDA
+graphs are what move it.
+
+**Prefill** has the whole prompt at once with no sequential dependency between
+its tokens, so one weight matrix serves every row. That is matrix-matrix:
+compute-bound, and it wants tiling and tensor cores instead.
+
+Using the decode path for prefill, as this engine did at first, applies
+bandwidth-bound tooling to a compute-bound problem and pays ~150 kernel launches
+per prompt token. `GpuModel::forward` now routes any multi-token input to
+`prefill`; `CRUCIBLE_PREFILL=serial` forces the old path, which is how the two
+were compared.
+
+Both paths write into one KV cache layout, so a prompt can be prefilled and then
+extended token by token with no conversion between them.
 
 ### Tokenizer
 
@@ -955,14 +976,40 @@ python scripts/bench_compare.py --tokens 256 --trials 7
 Every other number in this README compares crucible against an earlier version
 of itself, which answers "did that change help" and not "is this any good".
 
+**Decode** — 256 tokens, batch 1, greedy, 7 interleaved rounds, 151 W enforced:
+
 | engine | tok/s | spread | weights |
 |---|---:|---:|---:|
 | **crucible** | **1463.6** | 5.8% | int8, per-row scales, 114 MB |
 | llama.cpp (b925e117, CUDA) | 862.1 | 15.6% | Q8_0, 122 MB |
 | vLLM 0.28.0 | — | — | cannot run here, see below |
 
-256 tokens, batch 1, greedy, 7 interleaved rounds, 151 W enforced. crucible led
-in all seven with no overlap.
+crucible led in all seven rounds with no overlap.
+
+**Prefill** — 512-token prompt:
+
+| engine | tok/s | |
+|---|---:|---|
+| llama.cpp | 109,459 ± 21% | |
+| **crucible** (batched) | **15,221** | 7.2x slower |
+| crucible (token at a time) | 888 | 123x slower |
+
+The middle row is the point. crucible originally processed prompts **one token
+at a time**, so 512 tokens cost ~77,000 kernel launches, each a matrix-*vector*
+product — and prefill came out *slower* than decode, which is backwards and was
+the tell. Prompt tokens have no sequential dependency on each other, so the
+whole prompt can go through as a matrix-*matrix* multiply: compute-bound, with
+arithmetic intensity that grows with prompt length.
+
+Batching it is **17x faster** and costs ~14 launches per layer for the entire
+prompt instead of ~150 per token. Logits agree with the serial path to 5e-6
+relative, and generated text is unchanged.
+
+**The remaining 7.2x is understood.** crucible's prefill sustains ~3.4 TFLOP/s,
+which is 20% of this GPU's measured FP32 peak and 4.5% of its BF16 tensor-core
+peak. The GEMM is a plain 16x16 tiled f32 kernel; llama.cpp dispatches to cuBLAS
+and uses tensor cores. Closing that means a tensor-core GEMM, which is the next
+piece of work rather than a mystery.
 
 ### The comparison is valid because the outputs are identical
 
@@ -987,8 +1034,10 @@ crucible implements **one** architecture, batch 1, greedy, one quantisation
 scheme, one context length. llama.cpp supports dozens of architectures, CPU and
 GPU backends, many quantisation formats, a server, batching and full sampling —
 and is tuned for models above 7B, where a 120M model at batch 1 is nowhere near
-its design point. A 1.7x margin on this workload says the specialised path is
-faster on the case it was specialised for. It says nothing about the projects.
+its design point. A 1.7x decode margin on this workload says the specialised path is
+faster on the case it was specialised for; the remaining 7.2x prefill deficit
+says where tensor cores still earn their keep. It says nothing about the
+projects.
 
 ### Three ways this benchmark was wrong before it was right
 
@@ -1103,7 +1152,9 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Kernel fusion: SwiGLU in one kernel, residual folded into the projections
 - [x] Split-position attention (flash-decoding) — exact, but slower here; kept opt-in
 - [ ] Paged attention → continuous batching
-- [x] Throughput comparison against llama.cpp (1.7x at batch 1, identical output)
+- [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
+- [x] Batched prefill — 17x faster, prompt processed as a matrix
+- [ ] Tensor-core GEMM — prefill runs at 4.5% of BF16 peak, the remaining 7.2x
 - [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux
 
 ## License

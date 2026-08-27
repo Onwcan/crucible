@@ -60,6 +60,13 @@ enum Command {
         /// Replay decode from a captured CUDA graph
         #[arg(long)]
         graph: bool,
+        /// Prefill this many synthetic tokens and report prompt throughput.
+        ///
+        /// Passing a long token list on the command line is impractical, and
+        /// prefill throughput is the number that reveals whether the prompt is
+        /// processed in parallel or one token at a time.
+        #[arg(long, default_value_t = 0)]
+        prefill: usize,
     },
     /// Per-stage timing breakdown for one decode step.
     #[cfg(feature = "cuda")]
@@ -133,8 +140,8 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuBench { rows, cols, iters } => llm_engine::gpu::bench(rows, cols, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuLogits { model, tokens, top, decode, quant, graph } => {
-            gpu_logits(model, &tokens, top, decode, &quant, graph)
+        Command::GpuLogits { model, tokens, top, decode, quant, graph, prefill } => {
+            gpu_logits(model, &tokens, top, decode, &quant, graph, prefill)
         }
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
@@ -454,7 +461,7 @@ fn inspect(dir: PathBuf, verbose: bool) -> Result<()> {
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str, graph: bool) -> Result<()> {
+fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str, graph: bool, prefill: usize) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let precision = Precision::parse(quant)
@@ -463,11 +470,17 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
 
-    let ids: Vec<usize> = tokens
-        .split(',')
-        .map(|s| s.trim().parse::<usize>())
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing --tokens")?;
+    let ids: Vec<usize> = if prefill > 0 {
+        // Varied ids rather than a repeated token, so nothing can be skipped
+        // by a cache or short-circuited by identical embeddings.
+        (0..prefill).map(|i| 1000 + (i * 7) % 20000).collect()
+    } else {
+        tokens
+            .split(',')
+            .map(|s| s.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing --tokens")?
+    };
 
     let started = std::time::Instant::now();
     let mut gpu_model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
@@ -501,7 +514,8 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
         .fold(0.0f64, f64::max);
 
     let sum: f64 = gpu_out.iter().map(|v| *v as f64).sum();
-    println!("prefill     {} tokens in {prefill_ms:.1} ms", ids.len());
+    println!("prefill     {} tokens in {prefill_ms:.1} ms  ({:.0} tok/s)",
+             ids.len(), ids.len() as f64 / (prefill_ms / 1000.0));
     println!();
     println!("logits: sum {sum:.4}, min {:.6}, max {:.6}",
              gpu_out.iter().copied().fold(f32::INFINITY, f32::min),
