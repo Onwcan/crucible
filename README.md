@@ -5,8 +5,9 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
 > **Status:** 120M model trained (1.44B tokens, val loss 3.28). Rust engine
 > decodes at **~1460 tok/s** (1.7x llama.cpp at batch 1, token-identical greedy
-> output) and prefills at **~15,200 tok/s**. Remaining gap to llama.cpp is
-> prefill, at 7.2x, and it is a tensor-core gap.
+> output) and prefills at **~39,700 tok/s** at seq 512 on a hand-written
+> tensor-core GEMM — 2.4x the scalar kernel it replaced. Remaining gap to
+> llama.cpp on prefill is 2.8x, down from 7.2x.
 
 ## Why Blackwell specifically
 
@@ -534,9 +535,39 @@ rather than assuming they agree:
 | softmax | 3.7e-7 |
 | silu_mul | 1.8e-7 |
 | rope | 9.6e-7 |
+| gemm (scalar, f32 / int8) | 3.3e-7 / 3.3e-7 |
+| gemm (tensor core, f32 / int8) | 6.4e-5 / 3.4e-5 |
 
 Exact equality is not the bar — the GPU reduces in a different order and
 `use_fast_math` trades accuracy for speed. Rounding-level agreement is.
+
+The tensor-core rows are held to a looser bound than the scalar ones because
+they convert activations to half, but a looser bound is not no bound: half
+carries 11 mantissa bits, so with K=768 accumulating in f32 the error must stay
+under 2^-11 ≈ 4.9e-4. Measured at 6.4e-5, comfortably inside. Anything above
+1e-2 would mean the tiling or the fragment layout is wrong, not that half is
+imprecise.
+
+### Two ways this test passed for the wrong reason
+
+The generators feeding `gpu-validate` are not arbitrary, and both properties
+were learned by getting them wrong.
+
+The first version used `(i % 89 - 44) / 128` — small integers over a power of
+two. half represents those *exactly*, so the tensor-core path and the scalar
+path agreed bit-for-bit and the test reported `0.000e0`. A kernel that dropped
+precision catastrophically would have passed identically. Test data has to be
+mantissa-dense before a precision test means anything.
+
+The fix after that used raw `sin`/`cos`, which is mantissa-dense but signed. A
+768-term dot product of random signs cancels down to near zero, and relative
+error against a near-zero result is meaningless — it reported ~2.0, which is
+what a sign flip on noise looks like, not a broken kernel. Shifting both
+operands positive keeps the mantissas full while making the sum accumulate
+monotonically.
+
+Both failures produced a confident-looking number. The first said the kernel was
+perfect, the second said it was broken, and the kernel was the same kernel.
 
 ### Why decode is bandwidth-bound
 
@@ -964,6 +995,95 @@ idle-stream probe that contradicted its own arithmetic, now this. The pattern is
 consistent -- the tool is fine for what it was built for and silently wrong just
 outside it, and only an end-to-end number catches the difference.
 
+### Tensor-core GEMM
+
+Prefill multiplies a `[seq, n_embd]` activation block by every weight matrix, so
+unlike decode it is compute-bound rather than waiting on memory. The scalar
+16x16 tiled kernel sustained ~3.4 TFLOP/s — 4.5% of this GPU's BF16 tensor-core
+peak — which was the entire remaining gap to llama.cpp.
+
+Replacing it with a `wmma` kernel, at a 156 W enforced limit, 5 interleaved
+trials per point:
+
+| seq | scalar tiled | tensor core | speedup |
+|---:|---:|---:|---:|
+| 128 | 15,684 | 20,325 | 1.30x |
+| 256 | 17,203 | 32,763 | 1.90x |
+| 512 | 16,858 | **39,731** | 2.36x |
+| 1024 | 15,016 | 30,779 | 2.05x |
+
+Throughput falls off past 512 on both paths because attention is O(n^2): its
+share of the work grows with sequence length while the GEMM's shrinks.
+
+Two design choices carry the int8 path. Weights stay int8 in global memory and
+convert to half **in shared memory** — keeping a half copy of the model would
+cost 226 MB and give back most of what quantisation bought, and int8 -> half is
+exact, so that conversion loses nothing. Activations are f32 and convert to half
+on load, which does lose mantissa bits; that one is a real numerical change and
+is priced below rather than assumed away.
+
+### Bigger tiles are not better tiles
+
+The obvious next move was a larger block tile. A 64x64 tile produces four times
+the output per block for twice the loads — ~64 FLOP per element loaded against
+~25 — so it should win. Measured against the 16x64 tile:
+
+| seq | 16x64 | 64x64 |
+|---:|---:|---:|
+| 128 | 20,325 | 9,950 |
+| 256 | 32,763 | 18,749 |
+| 512 | 39,731 | 30,033 |
+| 1024 | 30,779 | **32,170** |
+
+It loses everywhere except 1024, by 2x at the short end. The intensity argument
+is correct and was not the binding constraint: M is the sequence length, so a
+64-row tile at seq=128 with `n_embd=768` launches `ceil(128/64) * ceil(768/64)`
+= 24 blocks on a 60-SM GPU. The 16-row tile launches 96. Arithmetic intensity
+only starts paying once there is enough work to fill the machine, which is why
+the big tile wins at 1024 and only there.
+
+Both tiles are generated from one templated device function so they cannot drift
+apart, and the 16x64 one is the default: it wins outright below 1024 and gives up
+4.5% above it.
+
+`CRUCIBLE_GEMM=wmma-auto` selects per launch, using the big tile only when a
+launch would still produce at least two blocks per SM. That should beat both
+fixed tiles, because the projections in a single forward pass have very
+different N — 768, 2048, and 50304 for the lm_head — and want different tiles.
+It is opt-in rather than default because that is an argument and not a
+measurement: **the benchmark comparing it against both fixed tiles has not been
+run.** `scripts/bench_prefill.py` is what would settle it.
+
+### What the speedup costs in accuracy
+
+The tensor-core path converts activations to half, so it is a different
+computation and not just a faster one. Two measurements, because neither is
+inferable from the other.
+
+`gpu-validate` bounds the kernel error against the CPU reference: 6.4e-5 (f32)
+and 3.4e-5 (int8), against 3.3e-7 for the scalar path. half carries 11 mantissa
+bits, so with K=768 and an f32 accumulator the error has to stay under 2^-11 ≈
+4.9e-4 — measured well inside that, which makes it rounding rather than a
+structural defect.
+
+That bounds the kernel but says nothing about the model, and the existing
+`gpu-eval` could not help: it fed one token per call, making every matmul a
+matrix-*vector* product, so it never executed the GEMM at all and could not have
+detected a prefill regression. `gpu-eval --prefill-ctx N` scores each position
+from a fresh prefill of the preceding N tokens, which puts the batched GEMM on
+the path that produces the number. Over 511 windows at ctx=256:
+
+| | scalar tiled | tensor core | delta |
+|---|---:|---:|---:|
+| f32 cross-entropy | 3.089870 | 3.089860 | -1.0e-5 |
+| int8 cross-entropy | 3.090417 | 3.090399 | -1.8e-5 |
+
+The GEMM change moves cross-entropy by ~1e-5, thirty times less than int8
+quantisation's own cost of +5.4e-4, and slightly downward — which is noise, not
+an improvement. Ragged sequence lengths (7, 17, 100, 333) agree to within half
+rounding, and `--prefill 1` is bit-identical because M=1 routes through GEMV,
+confirming decode is untouched.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -1005,11 +1125,17 @@ Batching it is **17x faster** and costs ~14 launches per layer for the entire
 prompt instead of ~150 per token. Logits agree with the serial path to 5e-6
 relative, and generated text is unchanged.
 
-**The remaining 7.2x is understood.** crucible's prefill sustains ~3.4 TFLOP/s,
-which is 20% of this GPU's measured FP32 peak and 4.5% of its BF16 tensor-core
-peak. The GEMM is a plain 16x16 tiled f32 kernel; llama.cpp dispatches to cuBLAS
-and uses tensor cores. Closing that means a tensor-core GEMM, which is the next
-piece of work rather than a mystery.
+**The prefill gap is now 2.8x, down from 7.2x.** That 7.2x was a tensor-core
+gap: crucible's prefill sustained ~3.4 TFLOP/s, 4.5% of this GPU's BF16
+tensor-core peak, on a plain 16x16 tiled f32 kernel, while llama.cpp dispatches
+to cuBLAS. A hand-written `wmma` GEMM raised prefill to ~39,700 tok/s at seq
+512, roughly 8 TFLOP/s or ~11% of that peak.
+
+What remains is still a kernel-quality gap rather than a mystery. cuBLAS does
+things this kernel does not: double-buffered shared-memory loads that overlap
+the next tile's fetch with the current tile's math, `ldmatrix` for fragment
+loads, and per-shape tuned tiles. ~11% of peak is a working tensor-core kernel,
+not a tuned one.
 
 ### The comparison is valid because the outputs are identical
 
@@ -1092,6 +1218,7 @@ scripts/
   setup_wsl.sh     # one-shot environment bootstrap
   verify_gpu.py    # device checks, FP8 probe, quick throughput baseline
   bench.py         # repeated-trial harness: median, IQR, thermal state
+  bench_prefill.py # GEMM variants: scalar vs tensor-core tiles, interleaved
 tests/
   test_attention.py  # GQA path equivalence, causality, param parity
 export.py          # checkpoint -> safetensors for the Rust engine
@@ -1154,7 +1281,9 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [ ] Paged attention → continuous batching
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix
-- [ ] Tensor-core GEMM — prefill runs at 4.5% of BF16 peak, the remaining 7.2x
+- [x] Tensor-core GEMM — prefill 2.4x faster, llama.cpp gap 7.2x -> 2.8x
+- [ ] Tune the tensor-core GEMM — double buffering, `ldmatrix`; ~11% of BF16 peak
+- [ ] Measure `wmma-auto` against both fixed tiles — implemented, unmeasured
 - [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux
 
 ## License

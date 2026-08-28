@@ -96,6 +96,14 @@ enum Command {
         /// Comma-separated precisions to compare
         #[arg(long, default_value = "f32,int8")]
         quant: String,
+        /// Score through the prefill path using a context of this many tokens.
+        ///
+        /// Default 0 scores token-at-a-time, which routes every matmul through
+        /// GEMV and never touches the GEMM. With a context set, each scored
+        /// position is predicted from a fresh prefill of the preceding tokens,
+        /// so the batched GEMM is what produces the number.
+        #[arg(long, default_value_t = 0)]
+        prefill_ctx: usize,
         /// Replay decode from a captured CUDA graph
         #[arg(long)]
         graph: bool,
@@ -147,8 +155,8 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
         #[cfg(feature = "cuda")]
-        Command::GpuEval { model, data, tokens, quant, graph } => {
-            gpu_eval(model, data, tokens, &quant, graph)
+        Command::GpuEval { model, data, tokens, quant, graph, prefill_ctx } => {
+            gpu_eval(model, data, tokens, &quant, graph, prefill_ctx)
         }
         Command::Generate {
             model,
@@ -561,7 +569,8 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
 
 
 #[cfg(feature = "cuda")]
-fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool) -> Result<()> {
+fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool,
+            prefill_ctx: usize) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let cfg = Config::from_file(dir.join("config.json"))?;
@@ -576,7 +585,11 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
         .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
         .collect();
 
-    let limit = n_tokens.min(cfg.block_size).min(all.len() - 1);
+    let limit = if prefill_ctx > 0 {
+        n_tokens.min(all.len().saturating_sub(1))
+    } else {
+        n_tokens.min(cfg.block_size).min(all.len() - 1)
+    };
     let ids = &all[..limit + 1];
     println!("data        {} ({} tokens evaluated)", data.display(), limit);
     println!();
@@ -595,27 +608,47 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
         // model's prediction of the next one. Feeding its own samples back
         // would measure something else entirely.
         let mut total_nll = 0.0f64;
+        let mut scored = 0usize;
         let started = std::time::Instant::now();
-        let mut logits = model.forward(&[ids[0]])?;
 
-        for i in 1..=limit {
-            let target = ids[i];
-            // log softmax, max-subtracted for stability.
+        // log softmax, max-subtracted for stability.
+        fn nll_of(logits: &[f32], target: usize) -> f64 {
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let sum_exp: f64 = logits.iter().map(|v| ((*v - max) as f64).exp()).sum();
-            total_nll += sum_exp.ln() - ((logits[target] - max) as f64);
+            sum_exp.ln() - ((logits[target] - max) as f64)
+        }
 
-            if i < limit {
-                logits = model.forward(&[target])?;
+        if prefill_ctx > 0 {
+            // Each scored position gets a fresh prefill of the preceding
+            // `prefill_ctx` tokens. Windows are disjoint so no position is
+            // counted twice, and the cache is reset between them so a window
+            // never inherits state from the previous one.
+            let ctx = prefill_ctx.min(cfg.block_size - 1);
+            let mut p = ctx;
+            while p < limit {
+                model.reset();
+                let logits = model.forward(&ids[p - ctx..p])?;
+                total_nll += nll_of(&logits, ids[p]);
+                scored += 1;
+                p += ctx;
+            }
+        } else {
+            let mut logits = model.forward(&[ids[0]])?;
+            for i in 1..=limit {
+                total_nll += nll_of(&logits, ids[i]);
+                scored += 1;
+                if i < limit {
+                    logits = model.forward(&[ids[i]])?;
+                }
             }
         }
 
         let secs = started.elapsed().as_secs_f64();
-        let ce = total_nll / limit as f64;
-        results.push((name.to_string(), ce, model.weight_bytes(), limit as f64 / secs));
+        let ce = total_nll / scored as f64;
+        results.push((name.to_string(), ce, model.weight_bytes(), scored as f64 / secs));
 
-        println!("{name:6}  cross-entropy {ce:.6}   perplexity {:.4}   weights {:.0} MB   {:.0} tok/s",
-                 ce.exp(), model.weight_bytes() as f64 / 1e6, limit as f64 / secs);
+        println!("{name:6}  cross-entropy {ce:.6}   perplexity {:.4}   weights {:.0} MB   {scored} positions in {secs:.1}s",
+                 ce.exp(), model.weight_bytes() as f64 / 1e6);
     }
 
     if results.len() > 1 {

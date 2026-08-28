@@ -1,3 +1,5 @@
+#include <cuda_fp16.h>
+#include <mma.h>
 // CUDA kernels for single-stream decoding.
 //
 // Decoding one token at a time means every matmul is a matrix-VECTOR product,
@@ -1158,4 +1160,186 @@ extern "C" __global__ void attention_prefill_f32(
         }
         dst[d] = acc * ssum;
     }
+}
+
+// ===========================================================================
+// Tensor-core GEMM for prefill
+//
+// The tiled GEMM above sustains ~3.4 TFLOP/s: 20% of this GPU's measured FP32
+// peak and 4.5% of its BF16 tensor-core peak. Prefill is compute-bound, so that
+// gap is the whole remaining distance to llama.cpp, which dispatches to cuBLAS.
+//
+// Two design choices worth stating:
+//
+// Weights stay int8 in memory and are converted to half *in shared memory*.
+// Keeping a half copy of the model would cost 226 MB and give back most of what
+// int8 quantisation bought. int8 -> half is exact (the whole int8 range is
+// representable), so this conversion loses nothing.
+//
+// Activations are f32 and convert to half on load, which does lose mantissa
+// bits. That is a real numerical change, not a free win, and the effect on
+// cross-entropy is measured rather than assumed.
+//
+// One block computes a 16 x 64 tile of C: four warps, each owning one 16x16
+// fragment, sharing the single A tile between them.
+// ===========================================================================
+
+// ===========================================================================
+// Tensor-core GEMM for prefill, in two tile sizes
+//
+// Both are the same algorithm with different block tiles, generated from one
+// template so they cannot drift apart. The choice between them is made per
+// launch in gpu.rs, because it is not a constant:
+//
+//   seq   16x64      64x64      (int8 prefill, tok/s, 5 interleaved trials)
+//   128   20325       9950
+//   256   32763      18749
+//   512   39731      30033
+//  1024   30779      32170
+//
+// The larger tile has strictly better arithmetic intensity -- it produces four
+// times the output per block while only doubling the loads, ~64 FLOP per
+// element loaded against ~25. That reasoning is correct and, below seq 1024,
+// irrelevant: M is the sequence length, so a 64-row tile at seq=128 with
+// n_embd=768 launches ceil(128/64) * ceil(768/64) = 24 blocks and leaves most
+// of the GPU idle. The 16-row tile launches 96. Intensity only starts paying
+// once there is enough work to fill the machine, which is why the big tile wins
+// at 1024 and loses by 2x at 128.
+//
+// Two design choices shared by both:
+//
+// Weights stay int8 in memory and convert to half *in shared memory*. Keeping a
+// half copy of the model would cost 226 MB and give back most of what int8
+// quantisation bought. int8 -> half is exact, so that conversion loses nothing.
+//
+// Activations are f32 and convert to half on load, which does lose mantissa
+// bits. That is a real numerical change, not a free win. Measured: it moves
+// held-out cross-entropy by ~1e-5, about thirty times less than int8
+// quantisation's own cost. See `gpu-eval --prefill-ctx`.
+// ===========================================================================
+
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+#define TK 32
+// Pad the shared leading dimension past the K step. Without it, column c of
+// every row lands in the same bank group and the fragment loads serialise.
+#define LD (TK + 8)
+
+// TM x TN block tile; warps laid out WR x WC, each owning (TM/WR) x (TN/WC).
+template <int TM, int TN, int WR, int WC>
+__device__ __forceinline__ void gemm_wmma_impl(
+    const signed char* __restrict__ w8,   // one of w8/wf is null
+    const float* __restrict__ wf,
+    const float* __restrict__ scales,     // [N], null when wf is used
+    const float* __restrict__ a,          // [M, K]
+    float* __restrict__ c,                // [M, N]
+    const int M, const int N, const int K, const int accumulate)
+{
+    using namespace nvcuda;
+
+    constexpr int FM = TM / (WR * WMMA_M);   // fragments per warp, row-wise
+    constexpr int FN = TN / (WC * WMMA_N);
+
+    __shared__ half As[TM * LD];
+    __shared__ half Bs[TN * LD];
+    __shared__ float Cs[WR * WC][WMMA_M * WMMA_N];
+
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int wrow = (warp / WC) * (FM * WMMA_M);   // warp origin in the tile
+    const int wcol = (warp % WC) * (FN * WMMA_N);
+    const int tile_m = blockIdx.y * TM;
+    const int tile_n = blockIdx.x * TN;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[FM][FN];
+    for (int i = 0; i < FM; ++i)
+        for (int j = 0; j < FN; ++j)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int kt = 0; kt < K; kt += TK) {
+        // Both tiles are loaded by the whole block. Consecutive threads take
+        // consecutive k, so the reads coalesce along the contiguous axis of
+        // both A [M, K] and W [N, K].
+        for (int i = threadIdx.x; i < TM * TK; i += blockDim.x) {
+            const int m = i / TK, k = i % TK;
+            const int gm = tile_m + m, gk = kt + k;
+            As[m * LD + k] = (gm < M && gk < K)
+                ? __float2half(a[(size_t)gm * K + gk]) : __float2half(0.0f);
+        }
+        for (int i = threadIdx.x; i < TN * TK; i += blockDim.x) {
+            const int n = i / TK, k = i % TK;
+            const int gn = tile_n + n, gk = kt + k;
+            const bool live = (gn < N && gk < K);
+            const size_t o = (size_t)gn * K + gk;
+            Bs[n * LD + k] = !live ? __float2half(0.0f)
+                : (w8 ? __short2half_rn((short)w8[o]) : __float2half(wf[o]));
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < TK; kk += WMMA_K) {
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> af[FM];
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> bf[FN];
+            for (int i = 0; i < FM; ++i)
+                wmma::load_matrix_sync(af[i], &As[(wrow + i * WMMA_M) * LD + kk], LD);
+            // col_major reads element (k, n) at n*ld + k, which is exactly how
+            // W's row-major [N, K] rows sit in Bs -- no transpose needed.
+            for (int j = 0; j < FN; ++j)
+                wmma::load_matrix_sync(bf[j], &Bs[(wcol + j * WMMA_N) * LD + kk], LD);
+            for (int i = 0; i < FM; ++i)
+                for (int j = 0; j < FN; ++j)
+                    wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    // Per-output-channel scale applied once, on the way out.
+    for (int i = 0; i < FM; ++i) {
+        for (int j = 0; j < FN; ++j) {
+            wmma::store_matrix_sync(Cs[warp], acc[i][j], WMMA_N, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < WMMA_M * WMMA_N; e += WARP_SIZE) {
+                const int gm = tile_m + wrow + i * WMMA_M + e / WMMA_N;
+                const int gn = tile_n + wcol + j * WMMA_N + e % WMMA_N;
+                if (gm < M && gn < N) {
+                    const size_t o = (size_t)gm * N + gn;
+                    const float v = scales ? Cs[warp][e] * scales[gn] : Cs[warp][e];
+                    c[o] = accumulate ? c[o] + v : v;
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+extern "C" __global__ void gemm_i8_wmma(
+    const signed char* __restrict__ w, const float* __restrict__ scales,
+    const float* __restrict__ a, float* __restrict__ c,
+    const int M, const int N, const int K, const int accumulate)
+{
+    gemm_wmma_impl<16, 64, 1, 4>(w, nullptr, scales, a, c, M, N, K, accumulate);
+}
+
+extern "C" __global__ void gemm_i8_wmma_big(
+    const signed char* __restrict__ w, const float* __restrict__ scales,
+    const float* __restrict__ a, float* __restrict__ c,
+    const int M, const int N, const int K, const int accumulate)
+{
+    gemm_wmma_impl<64, 64, 2, 2>(w, nullptr, scales, a, c, M, N, K, accumulate);
+}
+
+extern "C" __global__ void gemm_f32_wmma(
+    const float* __restrict__ w, const float* __restrict__ a,
+    float* __restrict__ c,
+    const int M, const int N, const int K, const int accumulate)
+{
+    gemm_wmma_impl<16, 64, 1, 4>(nullptr, w, nullptr, a, c, M, N, K, accumulate);
+}
+
+extern "C" __global__ void gemm_f32_wmma_big(
+    const float* __restrict__ w, const float* __restrict__ a,
+    float* __restrict__ c,
+    const int M, const int N, const int K, const int accumulate)
+{
+    gemm_wmma_impl<64, 64, 2, 2>(nullptr, w, nullptr, a, c, M, N, K, accumulate);
 }

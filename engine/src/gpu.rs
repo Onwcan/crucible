@@ -99,6 +99,26 @@ pub struct Gpu {
     attention_combine: CudaFunction,
     gemm_i8: CudaFunction,
     gemm_f32: CudaFunction,
+    gemm_i8_wmma: CudaFunction,
+    gemm_f32_wmma: CudaFunction,
+    gemm_i8_wmma_big: CudaFunction,
+    gemm_f32_wmma_big: CudaFunction,
+
+    /// Streaming multiprocessor count, read from the device.
+    ///
+    /// Used to decide which GEMM tile to launch. Hard-coding the threshold
+    /// would bake this laptop's GPU into the dispatch; the useful question is
+    /// "does this launch produce enough blocks to fill *this* machine", which
+    /// needs the actual count.
+    sm_count: usize,
+
+    /// Use tensor cores for prefill GEMMs.
+    ///
+    /// On by default; CRUCIBLE_GEMM=tiled selects the scalar tiled kernel,
+    /// which is what the tensor-core path is measured against. The two differ
+    /// numerically -- activations convert to half for the tensor-core path --
+    /// so the comparison is on cross-entropy as well as speed.
+    pub use_wmma: bool,
     rmsnorm_batch: CudaFunction,
     rope_batch: CudaFunction,
     swiglu_batch: CudaFunction,
@@ -133,9 +153,26 @@ impl Gpu {
         // CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED regardless of what is queued.
         let stream = cu(ctx.new_stream())?;
 
+        // NVRTC has no include path of its own, which is why the kernels avoid
+        // headers. Tensor-core code cannot: mma.h and cuda_fp16.h are required.
+        // These headers are documented as NVRTC-safe, and unlike nvcc they pull
+        // in no host headers -- so the CUDA 13.0 / glibc 2.43 rsqrt conflict
+        // that blocks nvcc does not apply here.
+        let include_paths: Vec<String> = [
+            "/usr/local/cuda/include",
+            "/usr/local/cuda-13/include",
+            "/usr/local/cuda-13.0/targets/x86_64-linux/include",
+            "/usr/local/cuda-13.3/targets/x86_64-linux/include",
+        ]
+        .iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .map(|p| p.to_string())
+        .collect();
+
         let opts = CompileOptions {
             arch: Some(ARCH),
             use_fast_math: Some(true),
+            include_paths,
             ..Default::default()
         };
         let ptx = compile_ptx_with_opts(KERNELS, opts)
@@ -162,6 +199,21 @@ impl Gpu {
             attention_combine: cu(module.load_function("attention_combine_f32"))?,
             gemm_i8: cu(module.load_function("gemm_i8_f32"))?,
             gemm_f32: cu(module.load_function("gemm_f32"))?,
+            gemm_i8_wmma: cu(module.load_function("gemm_i8_wmma"))?,
+            gemm_f32_wmma: cu(module.load_function("gemm_f32_wmma"))?,
+            gemm_i8_wmma_big: cu(module.load_function("gemm_i8_wmma_big"))?,
+            gemm_f32_wmma_big: cu(module.load_function("gemm_f32_wmma_big"))?,
+            sm_count: {
+                use cudarc::driver::sys::CUdevice_attribute_enum as Attr;
+                let dev = cu(unsafe { cudarc::driver::result::device::get(ordinal as i32) })?;
+                cu(unsafe {
+                    cudarc::driver::result::device::get_attribute(
+                        dev,
+                        Attr::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    )
+                })? as usize
+            },
+            use_wmma: std::env::var("CRUCIBLE_GEMM").as_deref() != Ok("tiled"),
             rmsnorm_batch: cu(module.load_function("rmsnorm_batch_f32"))?,
             rope_batch: cu(module.load_function("rope_batch_f32"))?,
             swiglu_batch: cu(module.load_function("swiglu_batch_f32"))?,
@@ -520,6 +572,66 @@ impl Gpu {
         accumulate: bool,
     ) -> Result<()> {
         const TILE: u32 = 16;
+        let (mi, ni, ki, acc) = (m as i32, n as i32, k as i32, i32::from(accumulate));
+
+        if self.use_wmma {
+            // Two tiles. The 64x64 one has better arithmetic intensity --
+            // four times the output per block for twice the loads -- but covers
+            // that output with four times fewer blocks, so on a short prompt it
+            // starves the GPU: at seq=128 with n_embd=768 it launches 24 blocks
+            // against the 16-row tile's 96, and measured 2x SLOWER. Intensity
+            // only pays once the machine is full.
+            //
+            // Measured (int8 prefill, tok/s, 5 interleaved trials):
+            //
+            //   seq    16x64    64x64
+            //   128     20325     9950
+            //   256     32763    18749
+            //   512     39731    30033
+            //  1024     30779    32170
+            //
+            // So 16x64 is the default: it wins outright below 1024 and gives up
+            // 4.5% above it.
+            //
+            // `wmma-auto` picks per launch on whether a launch would still fill
+            // the GPU -- at least two blocks per SM. It should do better than
+            // either fixed tile, because the projections in one forward pass
+            // have very different N (768, 2048, and 50304 for the lm_head) and
+            // want different tiles. It is opt-in rather than default because
+            // that is an argument, not a measurement: the benchmark comparing
+            // it against both fixed tiles has not been run. `bench_prefill.py`
+            // is what would settle it.
+            let big_blocks = (m.div_ceil(64)) * (n.div_ceil(64));
+            let use_big = match std::env::var("CRUCIBLE_GEMM").as_deref() {
+                Ok("wmma-big") => true,
+                Ok("wmma-auto") => big_blocks >= 2 * self.sm_count,
+                _ => false,
+            };
+
+            let block: u32 = if use_big { 64 } else { 16 };
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(64), (m as u32).div_ceil(block), 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            match w {
+                Proj2::Int8(data, scales) => {
+                    let f = if use_big { &self.gemm_i8_wmma_big } else { &self.gemm_i8_wmma };
+                    let mut b = self.stream.launch_builder(f);
+                    b.arg(*data).arg(*scales).arg(a).arg(c)
+                        .arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                    unsafe { cu(b.launch(cfg))? };
+                }
+                Proj2::F32(data) => {
+                    let f = if use_big { &self.gemm_f32_wmma_big } else { &self.gemm_f32_wmma };
+                    let mut b = self.stream.launch_builder(f);
+                    b.arg(*data).arg(a).arg(c).arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                    unsafe { cu(b.launch(cfg))? };
+                }
+            }
+            return Ok(());
+        }
+
         let cfg = LaunchConfig {
             grid_dim: (
                 (n as u32).div_ceil(TILE),
@@ -529,7 +641,6 @@ impl Gpu {
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
-        let (mi, ni, ki, acc) = (m as i32, n as i32, k as i32, i32::from(accumulate));
         match w {
             Proj2::Int8(data, scales) => {
                 let mut b = self.stream.launch_builder(&self.gemm_i8);
@@ -933,6 +1044,7 @@ pub fn validate() -> Result<()> {
 
     let gpu = Gpu::new(0)?;
     println!("device: {}", gpu.name()?);
+    println!("SMs: {}", gpu.sm_count);
     print_envelope();
     println!();
 
@@ -1000,6 +1112,91 @@ pub fn validate() -> Result<()> {
     gpu.rope(&mut d_v, &d_cos, &d_sin, n_heads, head_dim, pos)?;
     gpu.sync()?;
     println!("rope        max rel diff {:.3e}", max_rel_diff(&cpu_v, &gpu.to_host(&d_v)?));
+
+    // gemm, both paths, against the same CPU reference.
+    //
+    // The tensor-core path converts activations to half, so it is held to a
+    // looser tolerance than the scalar one -- but a looser tolerance is not no
+    // tolerance. half carries 11 mantissa bits, so with K=768 accumulating in
+    // f32 the error should land near 1e-3. Anything above 1e-2 means the tiling
+    // or the fragment layout is wrong, not that half is imprecise.
+    // Two properties this test data needs, both learned by getting them wrong.
+    //
+    // Mantissa-dense: an earlier version used (i % 89 - 44) / 128 -- small
+    // integers over a power of two, which half represents exactly. Both paths
+    // agreed bit-for-bit and the test reported 0.0 error, proving the tiling
+    // was right and saying nothing about the precision question it exists to
+    // answer.
+    //
+    // Single-sign: the fix after that used raw sin/cos, so a 768-term dot
+    // product summed random signs and cancelled to near zero. Per-element
+    // relative error against a near-zero result is meaningless -- it reported
+    // ~2.0, which is what a sign flip on noise looks like, not a broken kernel.
+    // Shifting both operands positive keeps the mantissas full while making the
+    // sum accumulate monotonically, so relative error means what it says.
+    let (gm, gn, gk) = (64usize, 512usize, 768usize);
+    let gw: Vec<f32> = (0..gn * gk).map(|i| ((i as f32) * 0.7391).sin() * 0.4 + 0.6).collect();
+    let ga: Vec<f32> = (0..gm * gk).map(|i| ((i as f32) * 1.2113).cos() * 0.3 + 0.5).collect();
+    let mut cpu_c = vec![0.0f32; gm * gn];
+    for row in 0..gm {
+        for col in 0..gn {
+            let mut acc = 0.0f32;
+            for kk in 0..gk {
+                acc += ga[row * gk + kk] * gw[col * gk + kk];
+            }
+            cpu_c[row * gn + col] = acc;
+        }
+    }
+
+    let d_gw = gpu.to_device(&gw)?;
+    let d_ga = gpu.to_device(&ga)?;
+    for (label, wmma) in [("gemm f32", false), ("gemm f32 tc", true)] {
+        let mut probe = Gpu::new(0)?;
+        probe.use_wmma = wmma;
+        let p_w = probe.to_device(&gw)?;
+        let p_a = probe.to_device(&ga)?;
+        let mut p_c = probe.alloc(gm * gn)?;
+        probe.gemm(&Proj2::F32(&p_w), &p_a, &mut p_c, gm, gn, gk, false)?;
+        probe.sync()?;
+        println!("{label:11} max rel diff {:.3e}", max_rel_diff(&cpu_c, &probe.to_host(&p_c)?));
+    }
+    let _ = (&d_gw, &d_ga);
+
+    // int8 path: quantise per output row exactly as quant.rs does, so the
+    // reference includes quantisation error and the comparison isolates the
+    // kernel.
+    let mut qw = vec![0i8; gn * gk];
+    let mut qs = vec![0.0f32; gn];
+    for col in 0..gn {
+        let row = &gw[col * gk..(col + 1) * gk];
+        let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        qs[col] = scale;
+        for (j, v) in row.iter().enumerate() {
+            qw[col * gk + j] = (v / scale).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    let mut cpu_q = vec![0.0f32; gm * gn];
+    for row in 0..gm {
+        for col in 0..gn {
+            let mut acc = 0.0f32;
+            for kk in 0..gk {
+                acc += ga[row * gk + kk] * qw[col * gk + kk] as f32;
+            }
+            cpu_q[row * gn + col] = acc * qs[col];
+        }
+    }
+    for (label, wmma) in [("gemm i8", false), ("gemm i8 tc", true)] {
+        let mut probe = Gpu::new(0)?;
+        probe.use_wmma = wmma;
+        let p_w = probe.to_device_i8(&qw)?;
+        let p_s = probe.to_device(&qs)?;
+        let p_a = probe.to_device(&ga)?;
+        let mut p_c = probe.alloc(gm * gn)?;
+        probe.gemm(&Proj2::Int8(&p_w, &p_s), &p_a, &mut p_c, gm, gn, gk, false)?;
+        probe.sync()?;
+        println!("{label:11} max rel diff {:.3e}", max_rel_diff(&cpu_q, &probe.to_host(&p_c)?));
+    }
 
     Ok(())
 }
