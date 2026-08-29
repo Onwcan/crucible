@@ -1002,15 +1002,19 @@ unlike decode it is compute-bound rather than waiting on memory. The scalar
 16x16 tiled kernel sustained ~3.4 TFLOP/s — 4.5% of this GPU's BF16 tensor-core
 peak — which was the entire remaining gap to llama.cpp.
 
-Replacing it with a `wmma` kernel, at a 156 W enforced limit, 5 interleaved
-trials per point:
+Replacing it with a `wmma` kernel:
 
 | seq | scalar tiled | tensor core | speedup |
 |---:|---:|---:|---:|
-| 128 | 15,684 | 20,325 | 1.30x |
-| 256 | 17,203 | 32,763 | 1.90x |
-| 512 | 16,858 | **39,731** | 2.36x |
-| 1024 | 15,016 | 30,779 | 2.05x |
+| 128 | 15,684 | 18,353 | 1.17x |
+| 256 | 17,203 | 28,560 | 1.66x |
+| 512 | 16,858 | **39,691** | 2.35x |
+| 1024 | 15,016 | 34,900 | 2.32x |
+
+The tensor-core column is the shipped default (9 interleaved trials, 170.91 W
+enforced / 3090 MHz). The scalar column is from an earlier 5-trial run at 156 W;
+it is paired here rather than re-measured because the scalar kernel reproduces
+across runs to within 0.3%, which the tensor-core paths do not.
 
 Throughput falls off past 512 on both paths because attention is O(n^2): its
 share of the work grows with sequence length while the GEMM's shrinks.
@@ -1022,37 +1026,47 @@ exact, so that conversion loses nothing. Activations are f32 and convert to half
 on load, which does lose mantissa bits; that one is a real numerical change and
 is priced below rather than assumed away.
 
-### Bigger tiles are not better tiles
+### Neither tile size wins everywhere
 
 The obvious next move was a larger block tile. A 64x64 tile produces four times
 the output per block for twice the loads — ~64 FLOP per element loaded against
-~25 — so it should win. Measured against the 16x64 tile:
+~25 — so it should win outright. It does not.
 
-| seq | 16x64 | 64x64 |
-|---:|---:|---:|
-| 128 | 20,325 | 9,950 |
-| 256 | 32,763 | 18,749 |
-| 512 | 39,731 | 30,033 |
-| 1024 | 30,779 | **32,170** |
+9 interleaved trials per point, 170.91 W enforced / 3090 MHz. `auto` picks per
+launch, described below:
 
-It loses everywhere except 1024, by 2x at the short end. The intensity argument
-is correct and was not the binding constraint: M is the sequence length, so a
-64-row tile at seq=128 with `n_embd=768` launches `ceil(128/64) * ceil(768/64)`
-= 24 blocks on a 60-SM GPU. The 16-row tile launches 96. Arithmetic intensity
-only starts paying once there is enough work to fill the machine, which is why
-the big tile wins at 1024 and only there.
+| seq | 16x64 | 64x64 | auto |
+|---:|---:|---:|---:|
+| 128 | **18,371** | 14,971 | 18,353 |
+| 256 | 26,983 | 25,408 | **28,560** |
+| 512 | 35,483 | 36,821 | **39,691** |
+| 1024 | 29,453 | 34,515 | **34,900** |
+
+The 64x64 tile gives up ~19% at seq 128 and takes ~17% at seq 1024. The
+intensity argument is correct and was not the binding constraint: M is the
+sequence length, so a 64-row tile at seq=128 with `n_embd=768` launches
+`ceil(128/64) * ceil(768/64)` = 24 blocks on a 60-SM GPU where the 16-row tile
+launches 96. Arithmetic intensity only starts paying once there is enough work
+to fill the machine.
 
 Both tiles are generated from one templated device function so they cannot drift
-apart, and the 16x64 one is the default: it wins outright below 1024 and gives up
-4.5% above it.
+apart. The default (`wmma-auto`) picks per launch, using the big tile only when
+a launch would still produce at least two blocks per SM — read from the device,
+not hard-coded. It beats both fixed tiles because the projections in a single
+forward pass have very different N — 768, 2048, and 50304 for the lm_head — and
+want different tiles: it ties the small tile at seq 128 and wins by 5.8%, 11.9%
+and 18.5% at 256/512/1024.
 
-`CRUCIBLE_GEMM=wmma-auto` selects per launch, using the big tile only when a
-launch would still produce at least two blocks per SM. That should beat both
-fixed tiles, because the projections in a single forward pass have very
-different N — 768, 2048, and 50304 for the lm_head — and want different tiles.
-It is opt-in rather than default because that is an argument and not a
-measurement: **the benchmark comparing it against both fixed tiles has not been
-run.** `scripts/bench_prefill.py` is what would settle it.
+`CRUCIBLE_GEMM=wmma-small` and `wmma-big` pin a fixed tile, for benchmarking and
+debugging; `tiled` selects the scalar kernel.
+
+Measurement notes, because a 2x claim was wrong here once already. An earlier
+5-trial run reported the 64x64 tile at 9,950 tok/s at seq 128 — a 2x deficit
+rather than the real ~19% — with a 9.9% spread that should have disqualified the
+median on the spot. Two later runs agree with each other and not with it. The
+9-trial numbers above were reproduced by an independent 5-trial run at a
+different power envelope (148.86 W) to within 1% on every median, which is the
+check that earlier number never got.
 
 ### What the speedup costs in accuracy
 
@@ -1083,6 +1097,14 @@ quantisation's own cost of +5.4e-4, and slightly downward — which is noise, no
 an improvement. Ragged sequence lengths (7, 17, 100, 333) agree to within half
 rounding, and `--prefill 1` is bit-identical because M=1 routes through GEMV,
 confirming decode is untouched.
+
+The per-launch tile choice adds nothing to this. Both tiles walk K in the same
+order with the same half conversion, so they are bit-identical, not merely
+close: `wmma-auto` reproduces the fixed small tile's logits exactly at every
+ragged length tested, and lands on the same cross-entropy to six decimals
+(3.090399). Selecting a tile is a speed decision with no accuracy component,
+which is why the numbers above did not need re-deriving when it became the
+default.
 
 ## Against llama.cpp and vLLM
 
@@ -1283,7 +1305,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Batched prefill — 17x faster, prompt processed as a matrix
 - [x] Tensor-core GEMM — prefill 2.4x faster, llama.cpp gap 7.2x -> 2.8x
 - [ ] Tune the tensor-core GEMM — double buffering, `ldmatrix`; ~11% of BF16 peak
-- [ ] Measure `wmma-auto` against both fixed tiles — implemented, unmeasured
+- [x] Per-launch tile dispatch — measured, now the default: ties at seq 128,
+      +5.8% / +11.9% / +18.5% at 256/512/1024, bit-identical output
 - [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux
 
 ## License

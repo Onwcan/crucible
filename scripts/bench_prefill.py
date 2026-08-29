@@ -84,22 +84,32 @@ def main() -> None:
     p.add_argument("--model", default="/home/onur/llm-lab/export/120m")
     p.add_argument("--seqs", default="128,256,512,1024")
     p.add_argument("--trials", type=int, default=5)
+    p.add_argument("--only", default=None,
+                   help="comma-separated variant labels, e.g. small,big,auto")
     args = p.parse_args()
+
+    variants = VARIANTS
+    if args.only:
+        wanted = {w.strip() for w in args.only.split(",")}
+        unknown = wanted - {n for n, _ in VARIANTS}
+        if unknown:
+            raise SystemExit(f"unknown variant(s): {sorted(unknown)}")
+        variants = [v for v in VARIANTS if v[0] in wanted]
 
     print(f"gpu     : {envelope()}")
     print(f"workload: int8 weights, prefill only, {args.trials} interleaved trials")
     print()
 
-    names = [n for n, _ in VARIANTS]
+    names = [n for n, _ in variants]
     header = (f"{'seq':>6}" + "".join(f"{n:>10}" for n in names)
-              + f"{'best':>8}{'spread':>8}")
+              + f"{'best':>8}")
     print(header)
     print("-" * len(header))
 
     for seq in [int(s) for s in args.seqs.split(",")]:
         samples: dict[str, list[float]] = {n: [] for n in names}
         for _ in range(args.trials):
-            for name, flag in VARIANTS:      # interleaved, not blocked
+            for name, flag in variants:      # interleaved, not blocked
                 v = run(args.binary, args.model, seq, flag)
                 if v is not None:
                     samples[name].append(v)
@@ -109,11 +119,14 @@ def main() -> None:
             continue
 
         med = {k: statistics.median(v) for k, v in samples.items()}
-        worst = max((max(v) - min(v)) / statistics.median(v) * 100
-                    for v in samples.values())
         best = max(med, key=med.get)
         print(f"{seq:>6}" + "".join(f"{med[n]:10.0f}" for n in names)
-              + f"{best:>8}{worst:7.1f}%")
+              + f"{best:>8}")
+        # Per-variant spread, not the max across variants: one unstable variant
+        # otherwise taints the whole row and hides which one it was.
+        spread = {n: (max(v) - min(v)) / med[n] * 100 for n, v in samples.items()}
+        print(f"{'':>6}" + "".join(f"{spread[n]:9.1f}%" for n in names)
+              + f"{'spread':>8}")
 
     print()
     print("Speed alone decides nothing: see gpu-validate for kernel error and")

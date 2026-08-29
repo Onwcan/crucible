@@ -575,37 +575,44 @@ impl Gpu {
         let (mi, ni, ki, acc) = (m as i32, n as i32, k as i32, i32::from(accumulate));
 
         if self.use_wmma {
-            // Two tiles. The 64x64 one has better arithmetic intensity --
-            // four times the output per block for twice the loads -- but covers
-            // that output with four times fewer blocks, so on a short prompt it
-            // starves the GPU: at seq=128 with n_embd=768 it launches 24 blocks
-            // against the 16-row tile's 96, and measured 2x SLOWER. Intensity
-            // only pays once the machine is full.
+            // Two tiles, chosen per launch.
             //
-            // Measured (int8 prefill, tok/s, 5 interleaved trials):
+            // The 64x64 tile has better arithmetic intensity -- four times the
+            // output per block for twice the loads -- but covers that output
+            // with four times fewer blocks, so on a short prompt it starves the
+            // GPU: at seq=128 with n_embd=768 it launches 24 blocks against the
+            // 16-row tile's 96. Intensity only pays once the machine is full.
             //
-            //   seq    16x64    64x64
-            //   128     20325     9950
-            //   256     32763    18749
-            //   512     39731    30033
-            //  1024     30779    32170
+            // Measured (int8 prefill, tok/s, 9 interleaved trials, 170.91 W
+            // enforced / 3090 MHz; an independent 5-trial run at 148.86 W
+            // reproduced every median to within 1%):
             //
-            // So 16x64 is the default: it wins outright below 1024 and gives up
-            // 4.5% above it.
+            //   seq    16x64    64x64     auto
+            //   128    18371    14971    18353
+            //   256    26983    25408    28560
+            //   512    35483    36821    39691
+            //  1024    29453    34515    34900
             //
-            // `wmma-auto` picks per launch on whether a launch would still fill
-            // the GPU -- at least two blocks per SM. It should do better than
-            // either fixed tile, because the projections in one forward pass
-            // have very different N (768, 2048, and 50304 for the lm_head) and
-            // want different tiles. It is opt-in rather than default because
-            // that is an argument, not a measurement: the benchmark comparing
-            // it against both fixed tiles has not been run. `bench_prefill.py`
-            // is what would settle it.
+            // Neither fixed tile wins everywhere: 64x64 gives up ~19% at seq
+            // 128 and takes ~17% at seq 1024.
+            //
+            // So the default picks per launch, on whether a launch would still
+            // fill the GPU -- at least two blocks per SM, measured from the
+            // device rather than hard-coded. That beats both fixed tiles
+            // because the projections in one forward pass have very different N
+            // (768, 2048, and 50304 for the lm_head) and want different tiles:
+            // auto ties the small tile at seq 128 and wins by 5.8%, 11.9% and
+            // 18.5% at 256/512/1024.
+            //
+            // The choice is numerically neutral. Both tiles walk K in the same
+            // order with the same half conversion, so they produce bit-identical
+            // logits; only speed changes. CRUCIBLE_GEMM=wmma-small / wmma-big
+            // pin a fixed tile for benchmarking and debugging.
             let big_blocks = (m.div_ceil(64)) * (n.div_ceil(64));
             let use_big = match std::env::var("CRUCIBLE_GEMM").as_deref() {
                 Ok("wmma-big") => true,
-                Ok("wmma-auto") => big_blocks >= 2 * self.sm_count,
-                _ => false,
+                Ok("wmma-small") => false,
+                _ => big_blocks >= 2 * self.sm_count,
             };
 
             let block: u32 = if use_big { 64 } else { 16 };
