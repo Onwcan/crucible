@@ -126,6 +126,11 @@ pub struct Gpu {
     embed_batch_i8: CudaFunction,
     cache_store: CudaFunction,
     attention_prefill: CudaFunction,
+    cache_store_paged: CudaFunction,
+    rope_rows: CudaFunction,
+    cache_store_rows_paged: CudaFunction,
+    attention_decode_paged: CudaFunction,
+    attention_prefill_paged: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -221,6 +226,11 @@ impl Gpu {
             embed_batch_i8: cu(module.load_function("embed_batch_i8"))?,
             cache_store: cu(module.load_function("cache_store_f32"))?,
             attention_prefill: cu(module.load_function("attention_prefill_f32"))?,
+            cache_store_paged: cu(module.load_function("cache_store_paged_f32"))?,
+            rope_rows: cu(module.load_function("rope_rows_f32"))?,
+            cache_store_rows_paged: cu(module.load_function("cache_store_rows_paged_f32"))?,
+            attention_decode_paged: cu(module.load_function("attention_decode_paged_f32"))?,
+            attention_prefill_paged: cu(module.load_function("attention_prefill_paged_f32"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -241,6 +251,16 @@ impl Gpu {
 
     pub fn to_host(&self, dev: &CudaSlice<f32>) -> Result<Vec<f32>> {
         cu(self.stream.memcpy_dtov(dev))
+    }
+
+    /// Copy back only the first `n` elements.
+    ///
+    /// The batched logits buffer is sized for `max_batch`, so a batch of one
+    /// would otherwise drag the whole 3.2 MB across PCIe every step to read
+    /// 200 KB of it.
+    pub fn to_host_n(&self, dev: &CudaSlice<f32>, n: usize) -> Result<Vec<f32>> {
+        let view = dev.slice(0..n);
+        cu(self.stream.memcpy_dtov(&view))
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -772,6 +792,174 @@ impl Gpu {
         );
         let mut b = self.stream.launch_builder(&self.cache_store);
         b.arg(src).arg(cache).arg(&r).arg(&kd).arg(&lb).arg(&po);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Scatter a dense `[rows, kv_dim]` block into the paged pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_store_paged(
+        &self,
+        src: &CudaSlice<f32>,
+        pool: &mut CudaSlice<f32>,
+        page_table: &CudaSlice<i32>,
+        rows: usize,
+        kv_dim: usize,
+        n_layer: usize,
+        layer: usize,
+        pos_offset: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
+        let (r, kd, nl, l, po) = (
+            rows as i32,
+            kv_dim as i32,
+            n_layer as i32,
+            layer as i32,
+            pos_offset as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.cache_store_paged);
+        b.arg(src).arg(pool).arg(page_table)
+            .arg(&r).arg(&kd).arg(&nl).arg(&l).arg(&po);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// RoPE with a per-row position, for a decode batch of mixed lengths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_rows(
+        &self,
+        v: &mut CudaSlice<f32>,
+        cos: &CudaSlice<f32>,
+        sin: &CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        rows: usize,
+        n_heads: usize,
+        head_dim: usize,
+        row_stride: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * n_heads * head_dim / 2) as u32);
+        let (r, nh, hd, rs) = (rows as i32, n_heads as i32, head_dim as i32, row_stride as i32);
+        let mut b = self.stream.launch_builder(&self.rope_rows);
+        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(positions);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Scatter one KV row per request into each request's own page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_store_rows_paged(
+        &self,
+        src: &CudaSlice<f32>,
+        pool: &mut CudaSlice<f32>,
+        page_tables: &CudaSlice<i32>,
+        positions: &CudaSlice<i32>,
+        rows: usize,
+        kv_dim: usize,
+        table_stride: usize,
+        n_layer: usize,
+        layer: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
+        let (r, kd, ts, nl, l) = (
+            rows as i32,
+            kv_dim as i32,
+            table_stride as i32,
+            n_layer as i32,
+            layer as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.cache_store_rows_paged);
+        b.arg(src).arg(pool).arg(page_tables).arg(positions)
+            .arg(&r).arg(&kd).arg(&ts).arg(&nl).arg(&l);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Batched single-token decode attention over paged KV.
+    ///
+    /// `batch` blocks in grid.y, one page table and one sequence length per
+    /// request. Batch 1 is the single-request case and takes the same path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_paged(
+        &self,
+        q: &CudaSlice<f32>,
+        k_pool: &CudaSlice<f32>,
+        v_pool: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        page_tables: &CudaSlice<i32>,
+        seq_lens: &CudaSlice<i32>,
+        batch: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        table_stride: usize,
+        n_layer: usize,
+        layer: usize,
+        kv_dim: usize,
+        max_seq: usize,
+    ) -> Result<()> {
+        // Shared memory is sized for the maximum context rather than the
+        // current length, for the same reason as the contiguous kernel: a
+        // captured graph fixes its allocation.
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, batch as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: ((max_seq + (REDUCE_THREADS as usize / 32) * head_dim)
+                * std::mem::size_of::<f32>()) as u32,
+        };
+        let (nh, nkv, hd, ts, nl, l, kd, ms) = (
+            n_head as i32,
+            n_kv_head as i32,
+            head_dim as i32,
+            table_stride as i32,
+            n_layer as i32,
+            layer as i32,
+            kv_dim as i32,
+            max_seq as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.attention_decode_paged);
+        b.arg(q).arg(k_pool).arg(v_pool).arg(out)
+            .arg(page_tables).arg(seq_lens)
+            .arg(&nh).arg(&nkv).arg(&hd).arg(&ts).arg(&nl).arg(&l).arg(&kd).arg(&ms);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Causal prefill attention over paged KV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_paged(
+        &self,
+        q: &CudaSlice<f32>,
+        k_pool: &CudaSlice<f32>,
+        v_pool: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        page_table: &CudaSlice<i32>,
+        rows: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        n_layer: usize,
+        layer: usize,
+        kv_dim: usize,
+        max_seq: usize,
+        pos_offset: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, rows as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
+        };
+        let (nh, nkv, hd, nl, l, kd, po) = (
+            n_head as i32,
+            n_kv_head as i32,
+            head_dim as i32,
+            n_layer as i32,
+            layer as i32,
+            kv_dim as i32,
+            pos_offset as i32,
+        );
+        let mut b = self.stream.launch_builder(&self.attention_prefill_paged);
+        b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(page_table)
+            .arg(&nh).arg(&nkv).arg(&hd).arg(&nl).arg(&l).arg(&kd).arg(&po);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }

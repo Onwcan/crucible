@@ -85,6 +85,67 @@ enum Command {
     ///
     /// The honest way to price quantisation: speed is easy to measure and easy
     /// to be pleased by, but it is only worth having if quality holds.
+    /// Check the paged KV cache against the contiguous one.
+    ///
+    /// Paging changes where keys and values live, not what is computed, so the
+    /// two paths must agree bit-for-bit. Anything less means a page is being
+    /// read at the wrong offset, and the symptom of that is fluent text with
+    /// quietly wrong attention -- the failure mode this repo has been bitten by
+    /// before and does not detect by reading output.
+    #[cfg(feature = "cuda")]
+    GpuPaged {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        /// Sequence lengths to check. Defaults straddle every page boundary
+        /// that matters at PAGE_TOKENS=16.
+        #[arg(long, default_value = "1,7,15,16,17,31,32,33,64,127,128,129,256,511,512,1023")]
+        lengths: String,
+        #[arg(long)]
+        graph: bool,
+    },
+    /// Check batched decode and the continuous-batching scheduler against
+    /// independent single-request execution.
+    ///
+    /// The only result that matters is that a request's output does not depend
+    /// on who it was batched with. Heterogeneous lengths are the point: padding
+    /// everything to the longest sequence would pass a same-length test and
+    /// still be wrong.
+    /// Concurrent-decode throughput against N independent single-request runs.
+    ///
+    /// Aggregate throughput and per-request throughput are different claims and
+    /// are reported separately: batching raises the first while lowering the
+    /// second, and calling that a latency improvement would be wrong.
+    #[cfg(feature = "cuda")]
+    GpuServeBench {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "1,2,4,8,16")]
+        batches: String,
+        /// Prompt lengths, cycled across requests so a batch is heterogeneous.
+        #[arg(long, default_value = "32,128,256,512")]
+        lengths: String,
+        #[arg(long, default_value_t = 64)]
+        steps: usize,
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
+    },
+    #[cfg(feature = "cuda")]
+    GpuBatch {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        /// Prompt lengths, one request each. Chosen to straddle page
+        /// boundaries at PAGE_TOKENS=16.
+        #[arg(long, default_value = "7,63,129,511")]
+        lengths: String,
+        /// Tokens to generate per request, counting the one prefill produces.
+        #[arg(long, default_value_t = 24)]
+        steps: usize,
+        #[arg(long, default_value_t = 8)]
+        max_batch: usize,
+    },
     #[cfg(feature = "cuda")]
     GpuEval {
         model: PathBuf,
@@ -154,6 +215,18 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        #[cfg(feature = "cuda")]
+        Command::GpuServeBench { model, quant, batches, lengths, steps, trials } => {
+            gpu_serve_bench(model, &quant, &batches, &lengths, steps, trials)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuBatch { model, quant, lengths, steps, max_batch } => {
+            gpu_batch(model, &quant, &lengths, steps, max_batch)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPaged { model, quant, lengths, graph } => {
+            gpu_paged(model, &quant, &lengths, graph)
+        }
         #[cfg(feature = "cuda")]
         Command::GpuEval { model, data, tokens, quant, graph, prefill_ctx } => {
             gpu_eval(model, data, tokens, &quant, graph, prefill_ctx)
@@ -567,6 +640,568 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
     Ok(())
 }
 
+
+/// Deterministic pseudo-random token ids, so a failure reproduces exactly.
+#[cfg(feature = "cuda")]
+fn probe_tokens(n: usize, vocab: usize) -> Vec<usize> {
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % vocab as u64) as usize
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_graph(graph);
+
+    // Enough pages for one full-context sequence, which is the parity case
+    // against the contiguous cache.
+    let n_pages = cfg.block_size.div_ceil(PAGE_TOKENS);
+    model.enable_paging(n_pages, 1)?;
+    model.set_paged(false);
+
+    println!("page size   {PAGE_TOKENS} tokens");
+    println!("pool        {n_pages} pages, {:.2} MB",
+             model.page_pool().total_bytes() as f64 / 1e6);
+    println!("graph       {graph}");
+    println!();
+
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v| *v > 0 && *v <= cfg.block_size)
+        .collect();
+
+    let mut worst_prefill = 0.0f64;
+    let mut worst_decode = 0.0f64;
+    let mut failures = 0usize;
+
+    println!("{:>6}  {:>6}  {:>14}  {:>14}  {:>7}",
+             "len", "pages", "prefill maxdiff", "decode maxdiff", "top-1");
+    println!("{}", "-".repeat(58));
+
+    for &len in &lens {
+        let toks = probe_tokens(len, cfg.vocab_size);
+
+        // Whole prompt at once: exercises cache_store and prefill attention.
+        model.set_paged(false);
+        model.reset();
+        let want_prefill = model.forward(&toks)?;
+        model.set_paged(true);
+        model.reset();
+        let got_prefill = model.forward(&toks)?;
+        let pages = model.seq_pages();
+        let d_prefill = max_abs_diff(&want_prefill, &got_prefill);
+
+        // One token at a time: exercises the decode projection writing into a
+        // page and the paged decode attention, including graph replay.
+        model.set_paged(false);
+        model.reset();
+        let mut want_decode = Vec::new();
+        for &t in &toks {
+            want_decode = model.forward(&[t])?;
+        }
+        model.set_paged(true);
+        model.reset();
+        let mut got_decode = Vec::new();
+        for &t in &toks {
+            got_decode = model.forward(&[t])?;
+        }
+        let d_decode = max_abs_diff(&want_decode, &got_decode);
+
+        let top_ok = argmax(&want_prefill) == argmax(&got_prefill)
+            && argmax(&want_decode) == argmax(&got_decode);
+        if d_prefill != 0.0 || d_decode != 0.0 || !top_ok {
+            failures += 1;
+        }
+        worst_prefill = worst_prefill.max(d_prefill);
+        worst_decode = worst_decode.max(d_decode);
+
+        println!("{len:>6}  {pages:>6}  {d_prefill:>14.3e}  {d_decode:>14.3e}  {:>7}",
+                 if top_ok { "ok" } else { "MISMATCH" });
+    }
+
+    model.set_paged(true);
+    model.reset();
+
+    println!();
+    println!("worst prefill difference {worst_prefill:.3e}");
+    println!("worst decode  difference {worst_decode:.3e}");
+    println!("pages free after reset: {} of {}",
+             model.page_pool().free_pages(), model.page_pool().n_pages());
+
+    if failures > 0 {
+        anyhow::bail!("{failures} length(s) disagreed with the contiguous cache");
+    }
+    // Bit-exact is the bar, not "close". Paging moves storage, not arithmetic:
+    // the same values are summed in the same order, so any nonzero difference
+    // means an offset is wrong somewhere.
+    if worst_prefill != 0.0 || worst_decode != 0.0 {
+        anyhow::bail!("paged path is not bit-identical to the contiguous path");
+    }
+    println!();
+    println!("Paged and contiguous agree bit-for-bit at every length.");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
+        .fold(0.0f64, f64::max)
+}
+
+#[cfg(feature = "cuda")]
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, x) in v.iter().enumerate() {
+        if *x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// GPU name and enforced power limit, recorded with every benchmark.
+///
+/// This machine's limit is user-switchable between ~55 W and ~175 W and an
+/// early measurement in this repo swung 168%% purely from that.
+#[cfg(feature = "cuda")]
+fn envelope() -> String {
+    std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,enforced.power.limit,clocks.max.sm",
+            "--format=csv,noheader",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_serve_bench(
+    dir: PathBuf,
+    quant: &str,
+    batches: &str,
+    lengths: &str,
+    steps: usize,
+    trials: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+    use std::time::Instant;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let sizes: Vec<usize> = batches
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let max_n = *sizes.iter().max().unwrap_or(&1);
+
+    println!("gpu          {}", envelope());
+    println!("page size    {PAGE_TOKENS} tokens");
+    println!("prompts      {lens:?} (cycled), {steps} decode steps, {trials} trials");
+    println!();
+
+    // --- baseline: today's engine, one request at a time -------------------
+    // Legacy contiguous cache with graph replay, which is the fastest
+    // single-request configuration the engine has.
+    // Three single-request baselines, so a regression can be attributed
+    // rather than just reported: graph replay and the GEMV decode path are
+    // separate advantages, and the batched runtime gives up both.
+    let mut legacy = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    let mut baseline = |model: &mut GpuModel, label: &str| -> Result<f64> {
+        let mut secs = Vec::new();
+        for _ in 0..trials {
+            model.reset();
+            let prompt = probe_tokens(lens[0], cfg.vocab_size);
+            let mut tok = argmax(&model.forward(&prompt)?);
+            let t0 = Instant::now();
+            for _ in 1..steps {
+                tok = argmax(&model.forward(&[tok])?);
+            }
+            secs.push(t0.elapsed().as_secs_f64());
+        }
+        secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t = secs[secs.len() / 2];
+        let tps = (steps - 1) as f64 / t;
+        println!("  {label:<44} {tps:>8.1} tok/s");
+        Ok(tps)
+    };
+
+    println!("single-request baselines");
+    legacy.set_paged(false);
+    legacy.enable_graph(true);
+    let single_tps = baseline(&mut legacy, "contiguous cache + CUDA graph (today's engine)")?;
+    legacy.enable_graph(false);
+    baseline(&mut legacy, "contiguous cache, eager")?;
+    legacy.enable_paging(cfg.block_size.div_ceil(PAGE_TOKENS), 1)?;
+    legacy.enable_graph(true);
+    baseline(&mut legacy, "paged cache + CUDA graph, single-request path")?;
+    drop(legacy);
+    println!();
+
+    // --- paged runtime at each batch size ---------------------------------
+    // One pool sized for the largest batch, reused across sizes so the memory
+    // configuration does not change underneath the comparison.
+    let per_req_pages: usize = lens
+        .iter()
+        .cycle()
+        .take(max_n)
+        .map(|l| (l + steps).div_ceil(PAGE_TOKENS) + 1)
+        .sum();
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(per_req_pages, max_n)?;
+    let total_pages = model.page_pool().n_pages();
+    let pool_bytes = model.page_pool().total_bytes();
+    let weight_bytes = model.weight_bytes();
+
+    println!("weights      {:.1} MB", weight_bytes as f64 / 1e6);
+    println!("page pool    {total_pages} pages, {:.2} MB, {} resident tokens",
+             pool_bytes as f64 / 1e6, total_pages * PAGE_TOKENS);
+    println!("bytes/page   {} ({} per token across all layers, K and V)",
+             model.page_pool().page_bytes() * 2,
+             model.page_pool().page_bytes() * 2 / PAGE_TOKENS);
+    println!();
+
+    let header = format!("{:>6}  {:>12}  {:>12}  {:>11}  {:>8}  {:>7}  {:>7}",
+                         "batch", "aggregate", "per-request", "step ms", "vs 1x", "pages", "wasted");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    let mut base_agg = 0.0f64;
+    let mut rt = Runtime::new(model)?;
+    for &n in &sizes {
+        let mut secs = Vec::new();
+        let mut pages_used = 0usize;
+        let mut wasted = 0usize;
+        for _ in 0..trials {
+            for i in 0..n {
+                rt.submit(Request {
+                    id: i as u64,
+                    prompt: probe_tokens(lens[i % lens.len()], cfg.vocab_size),
+                    max_new_tokens: steps,
+                });
+            }
+            // Admission (which prefills) is one step; time the decode steps
+            // only, so prompt processing is not counted as decode throughput.
+            rt.step()?;
+            let (p, w) = rt.residency();
+            pages_used = pages_used.max(p);
+            wasted = wasted.max(w);
+
+            let t0 = Instant::now();
+            let mut done = 0;
+            while !rt.is_idle() {
+                rt.step()?;
+                done += 1;
+                if done > steps * 4 + 16 {
+                    anyhow::bail!("runtime did not drain");
+                }
+            }
+            secs.push(t0.elapsed().as_secs_f64());
+            let _ = rt.completed();
+        }
+        secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t = secs[secs.len() / 2];
+        let decode_steps = (steps - 1) as f64;
+        let agg = n as f64 * decode_steps / t;
+        let per = decode_steps / t;
+        let step_ms = t / decode_steps * 1000.0;
+        if n == 1 {
+            base_agg = agg;
+        }
+        println!("{n:>6}  {agg:>10.0} t/s  {per:>10.0} t/s  {step_ms:>9.2}  {:>7.2}x  {pages_used:>7}  {wasted:>7}",
+                 if base_agg > 0.0 { agg / base_agg } else { 1.0 });
+    }
+
+    println!();
+    println!("Aggregate is total tokens per second across the batch; per-request is");
+    println!("what one client sees. Batching raises the first and lowers the second:");
+    println!("that is a throughput result, not a latency result.");
+    Ok(())
+}
+
+/// Gap between the top two logits: how close this step came to a tie.
+///
+/// A greedy decoder is only reproducible across two numerically different
+/// implementations when this gap exceeds their disagreement.
+#[cfg(feature = "cuda")]
+fn top_gap(v: &[f32]) -> f32 {
+    let (mut best, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &x in v {
+        if x > best {
+            second = best;
+            best = x;
+        } else if x > second {
+            second = x;
+        }
+    }
+    best - second
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_batch(
+    dir: PathBuf,
+    quant: &str,
+    lengths: &str,
+    steps: usize,
+    max_batch: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    if lens.is_empty() {
+        anyhow::bail!("no valid prompt lengths");
+    }
+
+    // Enough pages for every request at its full final length, plus slack.
+    let needed: usize = lens
+        .iter()
+        .map(|l| (l + steps).div_ceil(PAGE_TOKENS) + 1)
+        .sum();
+
+    let prompts: Vec<Vec<usize>> = lens
+        .iter()
+        .map(|l| probe_tokens(*l, cfg.vocab_size))
+        .collect();
+
+    // --- reference ---------------------------------------------------------
+    //
+    // Two references, because they answer different questions.
+    //
+    // `solo` runs each request alone through the *same* batched code path
+    // (a runtime with max_batch = 1). Any difference between that and a shared
+    // batch is contamination between requests, which is the property this test
+    // exists to check, and it must be exact.
+    //
+    // `fwd` runs each request through the single-request `forward` path. That
+    // one is not expected to agree bit-for-bit: its lm_head is a GEMV while the
+    // batched path uses a GEMM, and the two sum in different orders. Greedy
+    // argmax turns a ~1e-4 logit difference into a different token whenever the
+    // top two are that close, and one different token diverges the rest. It is
+    // reported rather than asserted, with the tie gap, so a rounding flip is
+    // not mistaken for a cache bug.
+    let mut solo: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        m.enable_paging(needed, 1)?;
+        let mut solo_rt = Runtime::new(m)?;
+        for (i, prompt) in prompts.iter().enumerate() {
+            solo_rt.submit(Request {
+                id: i as u64,
+                prompt: prompt.clone(),
+                max_new_tokens: steps,
+            });
+            solo_rt.run_to_completion(steps * 4 + 16)?;
+            let mut c = solo_rt.completed();
+            c.sort_by_key(|x| x.id);
+            solo.push(c.pop().expect("one completion per request").tokens);
+        }
+    }
+
+    let mut fwd: Vec<Vec<usize>> = Vec::new();
+    let mut fwd_gap: Vec<f32> = Vec::new();
+    {
+        let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        model.enable_paging(cfg.block_size.div_ceil(PAGE_TOKENS), 1)?;
+        for prompt in &prompts {
+            model.reset();
+            let mut out = Vec::new();
+            let mut worst_gap = f32::INFINITY;
+            let logits = model.forward(prompt)?;
+            let mut tok = argmax(&logits);
+            worst_gap = worst_gap.min(top_gap(&logits));
+            out.push(tok);
+            while out.len() < steps {
+                let logits = model.forward(&[tok])?;
+                tok = argmax(&logits);
+                worst_gap = worst_gap.min(top_gap(&logits));
+                out.push(tok);
+            }
+            fwd.push(out);
+            fwd_gap.push(worst_gap);
+        }
+    }
+    let reference = solo;
+
+    // --- batched: all requests resident together ---------------------------
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(needed, max_batch)?;
+    let total_pages = model.page_pool().n_pages();
+    let pool_mb = model.page_pool().total_bytes() as f64 / 1e6;
+    let mut rt = Runtime::new(model)?;
+
+    println!("page size    {PAGE_TOKENS} tokens");
+    println!("pool         {total_pages} pages, {pool_mb:.2} MB, {} tokens",
+             total_pages * PAGE_TOKENS);
+    println!("max batch    {max_batch}");
+    println!("requests     {:?} prompt tokens, {steps} generated each", lens);
+    println!();
+
+    for (i, prompt) in prompts.iter().enumerate() {
+        rt.submit(Request {
+            id: i as u64,
+            prompt: prompt.clone(),
+            max_new_tokens: steps,
+        });
+    }
+    let all_at_once = rt.run_to_completion(steps * 4 + 16)?;
+    let mut got = rt.completed();
+    got.sort_by_key(|c| c.id);
+
+    let mut failures = 0usize;
+    println!("{:>4}  {:>7}  {:>9}  {:>12}", "req", "prompt", "generated", "vs reference");
+    println!("{}", "-".repeat(40));
+    for c in &got {
+        let want = &reference[c.id as usize];
+        let ok = &c.tokens == want;
+        if !ok {
+            failures += 1;
+        }
+        println!("{:>4}  {:>7}  {:>9}  {:>12}",
+                 c.id, c.prompt_len, c.tokens.len(),
+                 if ok { "identical" } else { "MISMATCH" });
+        if !ok {
+            let first = want
+                .iter()
+                .zip(&c.tokens)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            println!("        diverged at step {first}: want {:?} got {:?}",
+                     &want[first..(first + 3).min(want.len())],
+                     &c.tokens[first..(first + 3).min(c.tokens.len())]);
+        }
+    }
+    println!();
+    println!("simultaneous admission: {} steps, all pages returned: {}",
+             all_at_once.len(),
+             rt.free_pages() == total_pages);
+
+    println!();
+    println!("against the single-request `forward` path (GEMV lm_head, so exact");
+    println!("agreement is not expected -- see the note in the source):");
+    println!("{:>4}  {:>12}  {:>18}", "req", "vs forward", "closest top-2 gap");
+    for (i, f) in fwd.iter().enumerate() {
+        let same = f == &reference[i];
+        println!("{:>4}  {:>12}  {:>18.3e}",
+                 i, if same { "identical" } else { "diverges" }, fwd_gap[i]);
+    }
+
+    // --- staggered: requests enter and leave at different times ------------
+    // The scheduler must not assume requests start together, and a request
+    // admitted after another has already retired must reuse its pages without
+    // seeing any of its KV.
+    println!();
+    println!("staggered admission");
+    let schedule: Vec<(usize, usize)> = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, _)| (i * 3, i))
+        .collect();
+    for (at, id) in &schedule {
+        println!("  t={at}: submit request {id}");
+    }
+
+    let mut pending = schedule.clone();
+    let mut t = 0usize;
+    let mut staggered: Vec<llm_engine::runtime::Completion> = Vec::new();
+    let mut peak_active = 0usize;
+    while t < steps * 8 {
+        while let Some(pos) = pending.iter().position(|(at, _)| *at == t) {
+            let (_, id) = pending.remove(pos);
+            rt.submit(Request {
+                id: id as u64,
+                prompt: prompts[id].clone(),
+                max_new_tokens: steps,
+            });
+        }
+        if rt.is_idle() && pending.is_empty() {
+            break;
+        }
+        let info = rt.step()?;
+        peak_active = peak_active.max(info.active_after);
+        staggered.extend(rt.completed());
+        t += 1;
+    }
+    staggered.sort_by_key(|c| c.id);
+
+    println!();
+    println!("{:>4}  {:>9}  {:>12}", "req", "generated", "vs reference");
+    println!("{}", "-".repeat(30));
+    for c in &staggered {
+        let want = &reference[c.id as usize];
+        let ok = &c.tokens == want;
+        if !ok {
+            failures += 1;
+        }
+        println!("{:>4}  {:>9}  {:>12}", c.id, c.tokens.len(),
+                 if ok { "identical" } else { "MISMATCH" });
+    }
+
+    let (pages, wasted) = rt.residency();
+    println!();
+    println!("peak active batch     {peak_active}");
+    println!("steps taken           {t}");
+    println!("pages held after      {pages} (wasted slots {wasted})");
+    println!("pages free after      {} of {}", rt.free_pages(), total_pages);
+
+    if staggered.len() != prompts.len() {
+        anyhow::bail!("staggered run produced {} completions, expected {}",
+                      staggered.len(), prompts.len());
+    }
+    if rt.free_pages() != total_pages {
+        anyhow::bail!("pages leaked: {} of {} free after every request finished",
+                      rt.free_pages(), total_pages);
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} request(s) differed from independent execution");
+    }
+
+    println!();
+    println!("Every request produced identical output batched and alone,");
+    println!("under both simultaneous and staggered admission.");
+    Ok(())
+}
 
 #[cfg(feature = "cuda")]
 fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool,

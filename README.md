@@ -7,7 +7,10 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > decodes at **~1460 tok/s** (1.7x llama.cpp at batch 1, token-identical greedy
 > output) and prefills at **~39,700 tok/s** at seq 512 on a hand-written
 > tensor-core GEMM — 2.4x the scalar kernel it replaced. Remaining gap to
-> llama.cpp on prefill is 2.8x, down from 7.2x.
+> llama.cpp on prefill is 2.8x, down from 7.2x. A paged KV cache and a
+> continuous-batching scheduler now keep multiple requests resident and decode
+> them together: 1,916 tok/s aggregate at batch 16 against 1,662 for one
+> graph-replayed stream.
 
 ## Why Blackwell specifically
 
@@ -1026,6 +1029,40 @@ exact, so that conversion loses nothing. Activations are f32 and convert to half
 on load, which does lose mantissa bits; that one is a real numerical change and
 is priced below rather than assumed away.
 
+### GEMM tuning is complete, and neither remaining technique helped
+
+Two techniques were on the roadmap. Both are now resolved, neither ships.
+
+**`ldmatrix` was already in use.** SASS for `gemm_i8_wmma` contains 4
+`LDSM.16.M88.4` alongside 4 `HMMA.16816.F32`, and the big tile 8 and 16 — counts
+that match the fragment math exactly. `wmma::load_matrix_sync` lowers to
+`ldmatrix` on sm_120 already, so writing it by hand with raw `mma.sync` PTX
+would emit the same instructions. This cost nothing to establish and would have
+cost days to "implement".
+
+**Double buffering was implemented and rejected.** Prefetching the next K tile
+into registers while the current tile's mma runs, then staging it into an
+alternate shared buffer. `cp.async` is not usable here because the int8 -> half
+conversion happens during staging and `cp.async` copies raw bytes.
+
+| seq | small prod | small dbuf | big prod | big dbuf |
+|---:|---:|---:|---:|---:|
+| 128 | 18,374 | **19,777** | 14,983 | 7,100 |
+| 256 | 28,572 | **31,217** | 27,022 | 13,596 |
+| 512 | **37,835** | 35,270 | 39,249 | 21,269 |
+| 1024 | 30,482 | **31,175** | 35,856 | 26,398 |
+
+Shared memory doubles by construction, which costs the small tile 8 -> 5
+blocks/SM and the big tile 6 -> 4. On the big tile that is fatal. On the small
+tile the result is genuinely mixed, and *reproducibly* so: through the
+production `wmma-auto` policy it gained 5.9% then 6.9% at seq 256 across two
+independent runs, and lost 8.3% then 8.7% at seq 512. Seq 512 is both a common
+prompt length and where this engine performs best, so a reproducible regression
+there is not a shippable trade.
+
+A sequence-length-dependent rule could capture the short-prompt gain, but that
+is a dispatch-heuristic change and belongs in its own measured experiment.
+
 ### Neither tile size wins everywhere
 
 The obvious next move was a larger block tile. A 64x64 tile produces four times
@@ -1105,6 +1142,132 @@ ragged length tested, and lands on the same cross-entropy to six decimals
 (3.090399). Selecting a tile is a speed decision with no accuracy component,
 which is why the numbers above did not need re-deriving when it became the
 default.
+
+## Paged KV cache and continuous batching
+
+A contiguous cache makes one decision at load time -- how many tokens a sequence
+may ever hold -- and charges every sequence that much. Serving several requests
+from it means reserving the maximum context each (mostly wasted) or recopying
+the cache whenever a request joins or leaves. Paging removes both.
+
+### Layout, and why it was nearly free
+
+Pages are fixed at 16 tokens and hold every layer:
+
+```text
+pool: [n_pages][n_layer][PAGE_TOKENS][kv_dim]
+offset(page, layer, slot) =
+    page * n_layer * PAGE_TOKENS * kv_dim   <- dynamic, from the page table
+  + layer * PAGE_TOKENS * kv_dim            <- host constant per launch
+  + slot * kv_dim
+```
+
+That split is the reason this was cheap. The layer term is exactly the
+`layer_base` argument the projection kernels already took, and the page term is
+exactly the per-step scalar they already read from device memory. So decode's
+K/V write and its RoPE needed **no kernel changes at all**, and CUDA graph
+capture stays valid, because the only value that varies per step still arrives
+through the parameter buffer rather than as a kernel argument. Only attention
+and the prefill scatter needed paged variants.
+
+16 tokens: power of two, so translation is a shift and a mask rather than a
+division in the attention inner loop. At `kv_dim = 192` floats a page is 12 KB
+of contiguous K per layer, far above the 128-byte transaction granularity, so
+the coalescing the attention kernel was tuned for is untouched. Internal
+fragmentation is bounded at 15 tokens per sequence at any context length.
+
+Attention reads the paged representation directly. Gathering pages into a
+contiguous buffer before attending would work and would defeat the purpose.
+
+### Correctness
+
+Paging moves storage, not arithmetic -- the same values are summed in the same
+order -- so the bar is bit-exact, not close. `gpu-paged` checks every length
+that straddles a page boundary, through both the prefill and the decode path,
+with and without graph replay:
+
+| len | 1 | 15 | 16 | 17 | 33 | 127 | 128 | 129 | 511 | 512 | 1023 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| max diff | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+All 64 pages return to the pool on reset.
+
+`gpu-batch` then checks that a request's output does not depend on who it is
+batched with, across prompts of 15/16/17/63/64/65/255/511 tokens under both
+simultaneous and staggered admission. Every request is identical batched and
+alone, and no pages leak.
+
+### A tie-break that looked like a cache bug
+
+The first version of that test compared batched output against the
+single-request `forward` path and reported two requests as mismatched. They were
+not. `forward` computes its lm_head with a GEMV; the batched path uses a GEMM,
+and the two sum in different orders for a ~1e-4 difference. Greedy argmax turns
+that into a different token whenever the top two logits are closer than that,
+and one different token diverges everything after it.
+
+The evidence is quantitative: the one request that diverged had a closest top-2
+logit gap of **6.9e-4**, against 1.8e-2 to 1.3e0 for every request that agreed.
+
+The fix was to the test, not the engine. Cross-request isolation is now checked
+against the *same* code path with `max_batch = 1`, where agreement must be
+exact, and the `forward` comparison is reported alongside the tie gap rather
+than asserted.
+
+### Scheduler
+
+`submit` / `step` / `completed`. Admission is first-come-first-served, bounded
+by batch slots and free pages; a request that cannot get pages stays pending, so
+the pool is backpressure rather than an error surface. Retirement is by
+`swap_remove`, which deliberately reorders slots -- every per-request quantity
+is rebuilt into the metadata arrays each step, so nothing may be tied to a slot
+index across steps, and this is what would catch it if something were.
+
+### Throughput
+
+Heterogeneous prompts (32/128/256/512 cycled), 64 decode steps, 3 trials,
+150.31 W enforced:
+
+| batch | aggregate | per-request | step ms | vs batch 1 | pages | wasted slots |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 152 t/s | 152 t/s | 6.56 | 1.00x | 3 | 15 |
+| 2 | 295 t/s | 147 t/s | 6.78 | 1.94x | 12 | 30 |
+| 4 | 549 t/s | 137 t/s | 7.28 | 3.60x | 62 | 60 |
+| 8 | 1,055 t/s | 132 t/s | 7.58 | 6.92x | 124 | 120 |
+| 16 | **1,916 t/s** | 120 t/s | 8.35 | 12.57x | 248 | 240 |
+
+Aggregate is total tokens per second; per-request is what one client sees.
+Batching raises the first and lowers the second. That is a throughput result and
+not a latency result, and it is worth being precise about which one is being
+claimed.
+
+### What limits the batched path
+
+Batch 1 through the batched runtime is 152 tok/s against 1,662 for the
+single-request path. That looks alarming and is not a paging cost:
+
+| single-request path | tok/s |
+|---|---:|
+| contiguous cache + CUDA graph (today's engine) | 1,662 |
+| contiguous cache, eager | 826 |
+| **paged cache + CUDA graph, single-request path** | **1,635** |
+
+Paging costs 1.6% at batch 1. The gap belongs to the batched *execution* path,
+which gives up two separate things: graph replay (worth 2.0x) and the GEMV
+decode kernels. Both eager paths launch ~170 kernels per step, yet the batched
+one is 5.4x slower, so it is not launch overhead -- it is the kernels. At M=1
+the tiled GEMM launches `(768/64, 1)` = 12 blocks on a 60-SM GPU, where GEMV
+parallelises across output rows.
+
+That is also why per-request throughput is nearly flat from batch 1 to 16 while
+aggregate scales 12.6x: the step is dominated by work that does not grow with
+the batch. A batched GEMV -- grid `(rows, batch)` -- is the obvious fix and is
+not attempted here; this task was architecture and correctness, and shipping an
+unmeasured kernel would be the wrong order.
+
+**The single-request path is unchanged.** Paging is opt-in via `enable_paging`;
+`generate`, `gpu-logits` and `gpu-eval` still use the contiguous cache and graph
+replay, and their numbers are identical to before.
 
 ## Against llama.cpp and vLLM
 
@@ -1251,6 +1414,8 @@ engine/            # Rust inference engine
   src/model.rs       # CPU forward pass
   src/tokenizer.rs   # GPT-2 BPE, pinned against tiktoken
   src/cache.rs       # KV cache for incremental decode
+  src/paged.rs       # page pool, per-sequence page tables, CPU-testable
+  src/runtime.rs     # continuous-batching scheduler
   src/gpu.rs         # CUDA backend, NVRTC compilation, validation
   src/gpu_model.rs   # full forward pass on device
   src/quant.rs       # int8 weight quantisation
@@ -1300,11 +1465,17 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Profiler with sync-overhead correction; coalesced attention; warp-per-row int8 GEMV
 - [x] Kernel fusion: SwiGLU in one kernel, residual folded into the projections
 - [x] Split-position attention (flash-decoding) — exact, but slower here; kept opt-in
-- [ ] Paged attention → continuous batching
+- [x] Paged KV cache — 16-token pages, bit-identical to the contiguous cache
+- [x] Batched decode over heterogeneous lengths, no padding to the longest
+- [x] Continuous-batching scheduler — admission, retirement, page reclaim
+- [ ] Batched decode uses GEMM at low M and is ~5x off the GEMV decode path;
+      a batched GEMV would fix it (see "What limits the batched path")
+- [ ] CUDA graphs for the batched path (single-request replay is unaffected)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix
 - [x] Tensor-core GEMM — prefill 2.4x faster, llama.cpp gap 7.2x -> 2.8x
-- [ ] Tune the tensor-core GEMM — double buffering, `ldmatrix`; ~11% of BF16 peak
+- [x] Tensor-core GEMM tuning closed — `ldmatrix` already emitted by `wmma`;
+      double buffering measured and rejected (below)
 - [x] Per-launch tile dispatch — measured, now the default: ties at seq 128,
       +5.8% / +11.9% / +18.5% at 256/512/1024, bit-identical output
 - [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux

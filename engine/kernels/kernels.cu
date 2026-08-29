@@ -1163,6 +1163,318 @@ extern "C" __global__ void attention_prefill_f32(
 }
 
 // ===========================================================================
+// Paged KV cache
+//
+// The contiguous cache above stores position j of a layer at a fixed linear
+// offset, which forces one sequence to own one contiguous span for its whole
+// possible lifetime. Paging replaces that with fixed-size physical pages and a
+// per-sequence table of page ids:
+//
+//   pool: [n_pages][n_layer][PAGE_TOKENS][kv_dim]
+//   offset(page, layer, slot) =
+//       ((page * n_layer + layer) * PAGE_TOKENS + slot) * kv_dim
+//
+// PAGE_TOKENS is a compile-time constant so translation is a shift and a mask
+// rather than a division in the attention inner loop. src/paged.rs asserts that
+// its own PAGE_TOKENS matches this value; the two must not drift.
+//
+// These kernels read the paged representation directly. Gathering pages into a
+// contiguous buffer before attention would work and would also defeat the
+// purpose -- the copy would cost more than the fragmentation it avoids.
+// ===========================================================================
+
+#define PAGE_TOKENS 16
+#define PAGE_SHIFT 4
+#define PAGE_MASK 15
+
+__device__ __forceinline__ size_t paged_offset(
+    const int page, const int slot, const int n_layer, const int layer, const int kv_dim)
+{
+    return ((size_t)(page * n_layer + layer) * PAGE_TOKENS + slot) * kv_dim;
+}
+
+// Scatter a dense [rows, kv_dim] block into the paged pool.
+//
+// Used by prefill, where K and V are produced contiguously for the whole prompt
+// and then placed. Decode does not need this: its projection writes straight
+// into the pool, because the destination splits into a per-launch layer
+// constant and one per-step scalar the kernel already reads from memory.
+extern "C" __global__ void cache_store_paged_f32(
+    const float* __restrict__ src,          // [rows][kv_dim]
+    float* __restrict__ pool,
+    const int* __restrict__ page_table,     // one sequence's table
+    const int rows,
+    const int kv_dim,
+    const int n_layer,
+    const int layer,
+    const int pos_offset)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * kv_dim) return;
+    const int row = i / kv_dim;
+    const int col = i % kv_dim;
+    const int pos = pos_offset + row;
+    const int page = page_table[pos >> PAGE_SHIFT];
+    const int slot = pos & PAGE_MASK;
+    pool[paged_offset(page, slot, n_layer, layer, kv_dim) + col] = src[i];
+}
+
+// RoPE where every row sits at its own position.
+//
+// rope_batch_f32 assumes rows are consecutive positions of one sequence, which
+// is true for prefill and false for a decode batch: request A may be at
+// position 7 while request B is at 511. Taking positions from an array is the
+// whole difference.
+extern "C" __global__ void rope_rows_f32(
+    float* __restrict__ v,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int rows,
+    const int n_heads,
+    const int head_dim,
+    const int row_stride,
+    const int* __restrict__ positions)
+{
+    const int half = head_dim / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per_row = n_heads * half;
+    if (idx >= rows * per_row) return;
+
+    const int row = idx / per_row;
+    const int rem = idx % per_row;
+    const int head = rem / half;
+    const int i = rem % half;
+
+    const int pos = positions[row];
+    const float c = cos_table[pos * half + i];
+    const float sn = sin_table[pos * half + i];
+
+    float* h = v + (size_t)row * row_stride + head * head_dim;
+    const float lo = h[i];
+    const float hi = h[i + half];
+    h[i] = lo * c - hi * sn;
+    h[i + half] = lo * sn + hi * c;
+}
+
+// Scatter one row per request into each request's own page.
+//
+// Each row carries its own page table and its own logical position, so a batch
+// writes into pages belonging to different sequences in one launch. This is the
+// decode counterpart of cache_store_paged_f32.
+extern "C" __global__ void cache_store_rows_paged_f32(
+    const float* __restrict__ src,          // [rows][kv_dim]
+    float* __restrict__ pool,
+    const int* __restrict__ page_tables,    // [rows][table_stride]
+    const int* __restrict__ positions,      // [rows]
+    const int rows,
+    const int kv_dim,
+    const int table_stride,
+    const int n_layer,
+    const int layer)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * kv_dim) return;
+    const int row = i / kv_dim;
+    const int col = i % kv_dim;
+    const int pos = positions[row];
+    const int page = page_tables[(size_t)row * table_stride + (pos >> PAGE_SHIFT)];
+    pool[paged_offset(page, pos & PAGE_MASK, n_layer, layer, kv_dim) + col] = src[i];
+}
+
+// Batched single-token decode attention over paged KV.
+//
+// grid is (n_head, batch): one block per (head, request). Each request brings
+// its own page table and its own sequence length, so a batch may mix a
+// 7-position request with a 511-position one without padding either to the
+// other. Nothing in the block reads outside its own request's pages.
+//
+// Batch size 1 is the single-request case, not a special path.
+extern "C" __global__ void attention_decode_paged_f32(
+    const float* __restrict__ q,            // [batch][n_head * head_dim]
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    float* __restrict__ out,                // [batch][n_head * head_dim]
+    const int* __restrict__ page_tables,    // [batch][table_stride]
+    const int* __restrict__ seq_lens,       // [batch]
+    const int n_head,
+    const int n_kv_head,
+    const int head_dim,
+    const int table_stride,
+    const int n_layer,
+    const int layer,
+    const int kv_dim,
+    const int max_seq)                      // scores capacity in shared memory
+{
+    extern __shared__ float scores[];
+
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    if (h >= n_head) return;
+
+    const int seq_len = seq_lens[b];
+    if (seq_len <= 0) return;                       // request not active
+
+    const int* table = page_tables + (size_t)b * table_stride;
+    const int n_rep = n_head / n_kv_head;
+    const int kv_h = h / n_rep;
+    const float* qh = q + (size_t)b * n_head * head_dim + h * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    // One warp per cached position, lanes striding across the key vector --
+    // the same access shape the contiguous kernel was tuned into, since slots
+    // inside a page are still contiguous.
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+
+    for (int j = warp_id; j < seq_len; j += n_warps) {
+        const int page = table[j >> PAGE_SHIFT];
+        const float* kh = k_pool
+            + paged_offset(page, j & PAGE_MASK, n_layer, layer, kv_dim)
+            + kv_h * head_dim;
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += WARP_SIZE) partial += qh[d] * kh[d];
+        const float dot = warp_reduce_sum(partial);
+        if (lane == 0) scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float smax;
+    __shared__ float ssum;
+    {
+        float m = NEG_INF;
+        for (int j = threadIdx.x; j < seq_len; j += blockDim.x) m = fmaxf(m, scores[j]);
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+        __shared__ float warp_max[WARP_SIZE];
+        if (lane == 0) warp_max[warp_id] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float best = NEG_INF;
+            for (int i = 0; i < n_warps; ++i) best = fmaxf(best, warp_max[i]);
+            smax = best;
+        }
+        __syncthreads();
+    }
+
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float e = __expf(scores[j] - smax);
+        scores[j] = e;
+        local += e;
+    }
+    local = block_reduce_sum(local);
+    if (threadIdx.x == 0) ssum = 1.0f / local;
+    __syncthreads();
+
+    float* partials = scores + max_seq;   // [n_warps][head_dim]
+    for (int d = lane; d < head_dim; d += WARP_SIZE) {
+        float acc = 0.0f;
+        for (int j = warp_id; j < seq_len; j += n_warps) {
+            const int page = table[j >> PAGE_SHIFT];
+            acc += scores[j] * v_pool[
+                paged_offset(page, j & PAGE_MASK, n_layer, layer, kv_dim)
+                + kv_h * head_dim + d];
+        }
+        partials[warp_id * head_dim + d] = acc;
+    }
+    __syncthreads();
+
+    float* dst = out + (size_t)b * n_head * head_dim + h * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int w = 0; w < n_warps; ++w) acc += partials[w * head_dim + d];
+        dst[d] = acc * ssum;
+    }
+}
+
+// Causal prefill attention over paged KV, one block per (head, prompt row).
+extern "C" __global__ void attention_prefill_paged_f32(
+    const float* __restrict__ q,            // [T, n_head * head_dim]
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    float* __restrict__ out,                // [T, n_head * head_dim]
+    const int* __restrict__ page_table,     // one sequence's table
+    const int n_head,
+    const int n_kv_head,
+    const int head_dim,
+    const int n_layer,
+    const int layer,
+    const int kv_dim,
+    const int pos_offset)
+{
+    extern __shared__ float scores[];
+
+    const int h = blockIdx.x;
+    const int row = blockIdx.y;
+    if (h >= n_head) return;
+
+    const int seq_len = pos_offset + row + 1;   // causal: 0..=this position
+    const int n_rep = n_head / n_kv_head;
+    const int kv_h = h / n_rep;
+    const float* qh = q + (size_t)row * n_head * head_dim + h * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+
+    for (int j = warp_id; j < seq_len; j += n_warps) {
+        const int page = page_table[j >> PAGE_SHIFT];
+        const float* kh = k_pool
+            + paged_offset(page, j & PAGE_MASK, n_layer, layer, kv_dim)
+            + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += WARP_SIZE) dot += qh[d] * kh[d];
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float smax;
+    __shared__ float ssum;
+    {
+        float m = NEG_INF;
+        for (int j = threadIdx.x; j < seq_len; j += blockDim.x) m = fmaxf(m, scores[j]);
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+        __shared__ float warp_max[WARP_SIZE];
+        if (lane == 0) warp_max[warp_id] = m;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float best = NEG_INF;
+            for (int i = 0; i < n_warps; ++i) best = fmaxf(best, warp_max[i]);
+            smax = best;
+        }
+        __syncthreads();
+    }
+
+    float local = 0.0f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float e = __expf(scores[j] - smax);
+        scores[j] = e;
+        local += e;
+    }
+    local = block_reduce_sum(local);
+    if (threadIdx.x == 0) ssum = 1.0f / local;
+    __syncthreads();
+
+    float* dst = out + (size_t)row * n_head * head_dim + h * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            const int page = page_table[j >> PAGE_SHIFT];
+            acc += scores[j] * v_pool[
+                paged_offset(page, j & PAGE_MASK, n_layer, layer, kv_dim)
+                + kv_h * head_dim + d];
+        }
+        dst[d] = acc * ssum;
+    }
+}
+
+// ===========================================================================
 // Tensor-core GEMM for prefill
 //
 // The tiled GEMM above sustains ~3.4 TFLOP/s: 20% of this GPU's measured FP32

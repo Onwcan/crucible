@@ -17,14 +17,18 @@ pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod gpu_model;
 pub mod model;
+pub mod paged;
 pub mod ops;
 pub mod quant;
+#[cfg(feature = "cuda")]
+pub mod runtime;
 pub mod tokenizer;
 pub mod weights;
 
 pub use cache::KvCache;
 pub use config::Config;
 pub use model::Model;
+pub use paged::{PagePool, SequencePages, PAGE_TOKENS};
 pub use quant::QuantTensor;
 pub use tokenizer::Tokenizer;
 pub use weights::{Tensor, Weights};

@@ -16,6 +16,7 @@ use cudarc::driver::{CudaGraph, CudaSlice};
 use crate::config::Config;
 use crate::gpu::{attn_chunks, Gpu, Proj2, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
+use crate::paged::{PagePool, SequencePages, PAGE_TOKENS};
 use crate::quant::QuantTensor;
 use crate::weights::Weights;
 
@@ -138,6 +139,26 @@ struct PrefillScratch {
     last: CudaSlice<f32>,
 }
 
+/// Buffers for one decode step across several requests.
+///
+/// Shaped `[max_batch][...]`, allocated once by `enable_paging`. Unlike the
+/// prefill scratch this one does carry a full `[batch, vocab]` logits buffer:
+/// every request needs its own row, and at batch 16 that is 3.2 MB rather than
+/// the 206 MB a full prompt would have cost.
+struct BatchScratch {
+    tokens: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    x: CudaSlice<f32>,
+    normed: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    kv: CudaSlice<f32>,
+    attn: CudaSlice<f32>,
+    proj: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+}
+
 pub struct GpuModel {
     pub gpu: Gpu,
     pub cfg: Config,
@@ -150,8 +171,32 @@ pub struct GpuModel {
     scratch: Scratch,
 
     /// `[layer][position][n_kv_head * head_dim]`, matching the CPU cache.
+    ///
+    /// The contiguous cache. Still the default, and still the reference the
+    /// paged path is validated against.
     k_cache: CudaSlice<f32>,
     v_cache: CudaSlice<f32>,
+
+    /// Paged KV: `[n_pages][n_layer][PAGE_TOKENS][kv_dim]`.
+    ///
+    /// Allocated lazily by `enable_paging`, because a model used only for
+    /// single-request decode should not pay for a second cache.
+    k_pool: CudaSlice<f32>,
+    v_pool: CudaSlice<f32>,
+    pool: PagePool,
+    /// Page tables for every batch slot, `[max_batch][table_stride]`.
+    page_tables: CudaSlice<i32>,
+    /// Logical length per batch slot. Zero means the slot is inactive, which
+    /// the attention kernel checks before touching any page.
+    seq_lens: CudaSlice<i32>,
+    host_tables: Vec<i32>,
+    host_lens: Vec<i32>,
+    table_stride: usize,
+    max_batch: usize,
+    /// The single-request sequence, when running paged through `forward`.
+    seq: SequencePages,
+    use_paged: bool,
+    batch: Option<BatchScratch>,
     capacity: usize,
     cache_len: usize,
     hidden: usize,
@@ -289,6 +334,20 @@ impl GpuModel {
             },
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
+            // Paging starts switched off and unallocated; `enable_paging`
+            // sizes the pool for the workload that actually needs it.
+            k_pool: gpu.alloc(1)?,
+            v_pool: gpu.alloc(1)?,
+            pool: PagePool::new(0, cfg.n_layer, kv_dim),
+            page_tables: gpu.to_device_i32(&[0i32])?,
+            seq_lens: gpu.to_device_i32(&[0i32])?,
+            host_tables: vec![0i32; 1],
+            host_lens: vec![0i32; 1],
+            table_stride: 1,
+            max_batch: 0,
+            seq: SequencePages::new(),
+            use_paged: false,
+            batch: None,
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
@@ -328,12 +387,237 @@ impl GpuModel {
         }
     }
 
+    /// Allocate the page pool and switch `forward` onto the paged path.
+    ///
+    /// `n_pages` is total capacity across all requests; `max_batch` is how many
+    /// requests may be resident at once. Sizing is explicit rather than derived
+    /// because it is the memory budget, and a runtime that quietly grows its
+    /// own cache is a runtime that fails at an unpredictable moment.
+    pub fn enable_paging(&mut self, n_pages: usize, max_batch: usize) -> Result<()> {
+        if max_batch == 0 {
+            bail!("max_batch must be at least 1");
+        }
+        // PAGE_TOKENS is duplicated as a compile-time constant in the kernels
+        // so translation is a shift rather than a division. If the two ever
+        // disagree every paged read silently lands in the wrong page.
+        if PAGE_TOKENS != 16 {
+            bail!("kernels hard-code PAGE_TOKENS=16 but paged.rs says {PAGE_TOKENS}");
+        }
+        let kv_dim = self.cfg.n_kv_head * self.cfg.head_dim();
+        let page_floats = self.cfg.n_layer * PAGE_TOKENS * kv_dim;
+
+        // One table entry per page a single sequence could ever need.
+        self.table_stride = self.capacity.div_ceil(PAGE_TOKENS);
+        self.max_batch = max_batch;
+        self.pool = PagePool::new(n_pages, self.cfg.n_layer, kv_dim);
+        self.k_pool = self.gpu.alloc(n_pages * page_floats)?;
+        self.v_pool = self.gpu.alloc(n_pages * page_floats)?;
+        self.host_tables = vec![0i32; max_batch * self.table_stride];
+        self.host_lens = vec![0i32; max_batch];
+        self.page_tables = self.gpu.to_device_i32(&self.host_tables.clone())?;
+        self.seq_lens = self.gpu.to_device_i32(&self.host_lens.clone())?;
+        self.seq = SequencePages::new();
+        let d = self.cfg.n_embd;
+        self.batch = Some(BatchScratch {
+            tokens: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
+            positions: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
+            x: self.gpu.alloc(max_batch * d)?,
+            normed: self.gpu.alloc(max_batch * d)?,
+            q: self.gpu.alloc(max_batch * d)?,
+            kv: self.gpu.alloc(max_batch * kv_dim)?,
+            attn: self.gpu.alloc(max_batch * d)?,
+            proj: self.gpu.alloc(max_batch * d)?,
+            gate: self.gpu.alloc(max_batch * self.hidden)?,
+            up: self.gpu.alloc(max_batch * self.hidden)?,
+            logits: self.gpu.alloc(max_batch * self.cfg.vocab_size)?,
+        });
+        self.use_paged = true;
+        // A captured contiguous-path graph would replay contiguous kernels.
+        self.graph = None;
+        Ok(())
+    }
+
+    pub fn use_paged(&self) -> bool {
+        self.use_paged
+    }
+
+    /// Switch back to the contiguous cache, keeping the pool allocated.
+    pub fn set_paged(&mut self, on: bool) {
+        if on != self.use_paged {
+            self.graph = None;
+        }
+        self.use_paged = on;
+    }
+
+    pub fn page_pool(&self) -> &PagePool {
+        &self.pool
+    }
+
+    /// The page allocator, so a scheduler can grow and release sequences it
+    /// owns. The pool lives here because the device memory it hands out does.
+    pub fn page_pool_mut(&mut self) -> &mut PagePool {
+        &mut self.pool
+    }
+
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
+    /// One decode step for `n` requests at once.
+    ///
+    /// Every per-request quantity arrives as an array: the token to embed, the
+    /// position to rotate at, the page table to write into and attend over, and
+    /// the sequence length that bounds the attention loop. Nothing is padded to
+    /// the longest sequence -- a 7-position request costs a 7-position
+    /// attention loop even when batched with a 511-position one.
+    ///
+    /// Returns `[n][vocab_size]` logits, one row per request, in the order
+    /// given.
+    pub fn decode_batch(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        if !self.use_paged {
+            bail!("decode_batch requires paging; call enable_paging first");
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n > self.max_batch {
+            bail!("batch of {n} exceeds max_batch {}", self.max_batch);
+        }
+        if positions.len() != n || lens.len() != n {
+            bail!("batch metadata length mismatch");
+        }
+        if tables.len() != self.max_batch * self.table_stride {
+            bail!(
+                "page table buffer must be max_batch * table_stride = {}",
+                self.max_batch * self.table_stride
+            );
+        }
+        for &t in tokens {
+            if t >= self.cfg.vocab_size {
+                bail!("token id {t} outside vocabulary {}", self.cfg.vocab_size);
+            }
+        }
+
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+
+        // Upload this step's metadata. Slots past `n` keep a length of 0, which
+        // the attention kernel treats as inactive.
+        let mut host_tok = vec![0i32; self.max_batch];
+        let mut host_pos = vec![0i32; self.max_batch];
+        let mut host_len = vec![0i32; self.max_batch];
+        for i in 0..n {
+            host_tok[i] = tokens[i] as i32;
+            host_pos[i] = positions[i] as i32;
+            host_len[i] = lens[i];
+        }
+        self.host_tables.copy_from_slice(tables);
+        {
+            let ht = self.host_tables.clone();
+            self.gpu.write_i32(&mut self.page_tables, &ht)?;
+            self.gpu.write_i32(&mut self.seq_lens, &host_len)?;
+        }
+        {
+            let b = self.batch.as_mut().expect("paging allocates batch scratch");
+            self.gpu.write_i32(&mut b.tokens, &host_tok)?;
+            self.gpu.write_i32(&mut b.positions, &host_pos)?;
+        }
+
+        {
+            let b = self.batch.as_mut().expect("batch scratch");
+            self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
+        }
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            let b = self.batch.as_mut().expect("batch scratch");
+
+            self.gpu.rmsnorm_batch(&b.x, &layer.attn_norm, &mut b.normed, n, d, NORM_EPS)?;
+
+            // K/V go through a dense [n, kv_dim] block and are then scattered,
+            // one row per request, into that request's own page.
+            self.gpu.gemm(&layer.k_proj.view(), &b.normed, &mut b.kv, n, kv_dim, d, false)?;
+            self.gpu.rope_rows(&mut b.kv, &self.rope_cos, &self.rope_sin,
+                               &b.positions, n, n_kv, hd, kv_dim)?;
+            self.gpu.cache_store_rows_paged(&b.kv, &mut self.k_pool, &self.page_tables,
+                                            &b.positions, n, kv_dim, self.table_stride,
+                                            cfg.n_layer, l)?;
+
+            self.gpu.gemm(&layer.v_proj.view(), &b.normed, &mut b.kv, n, kv_dim, d, false)?;
+            self.gpu.cache_store_rows_paged(&b.kv, &mut self.v_pool, &self.page_tables,
+                                            &b.positions, n, kv_dim, self.table_stride,
+                                            cfg.n_layer, l)?;
+
+            self.gpu.gemm(&layer.q_proj.view(), &b.normed, &mut b.q, n, d, d, false)?;
+            self.gpu.rope_rows(&mut b.q, &self.rope_cos, &self.rope_sin,
+                               &b.positions, n, n_head, hd, d)?;
+
+            self.gpu.attention_decode_paged(
+                &b.q, &self.k_pool, &self.v_pool, &mut b.attn,
+                &self.page_tables, &self.seq_lens,
+                n, n_head, n_kv, hd, self.table_stride,
+                cfg.n_layer, l, kv_dim, self.capacity,
+            )?;
+
+            self.gpu.gemm(&layer.o_proj.view(), &b.attn, &mut b.proj, n, d, d, false)?;
+            self.gpu.add_inplace(&mut b.x, &b.proj, n * d)?;
+
+            self.gpu.rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
+            match &layer.gate_proj {
+                Some(gate) => {
+                    self.gpu.gemm(&gate.view(), &b.normed, &mut b.gate, n, self.hidden, d, false)?;
+                    self.gpu.gemm(&layer.up_proj.view(), &b.normed, &mut b.up,
+                                  n, self.hidden, d, false)?;
+                    self.gpu.swiglu_batch(&mut b.gate, &b.up, n * self.hidden)?;
+                }
+                None => bail!("the GPU path currently implements swiglu only"),
+            }
+            self.gpu.gemm(&layer.down_proj.view(), &b.gate, &mut b.proj,
+                          n, d, self.hidden, false)?;
+            self.gpu.add_inplace(&mut b.x, &b.proj, n * d)?;
+        }
+
+        let b = self.batch.as_mut().expect("batch scratch");
+        self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
+        self.gpu.gemm(&self.tok_emb.view(), &b.normed, &mut b.logits,
+                      n, cfg.vocab_size, d, false)?;
+
+        let rows = n * cfg.vocab_size;
+        self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows)
+    }
+
+    pub fn table_stride(&self) -> usize {
+        self.table_stride
+    }
+
+    /// Pages held by the single-request sequence.
+    pub fn seq_pages(&self) -> usize {
+        self.seq.n_pages()
+    }
+
+    /// Allocated-but-unoccupied slots in the single-request sequence.
+    pub fn seq_wasted_slots(&self) -> usize {
+        self.seq.wasted_slots()
+    }
+
     pub fn cache_len(&self) -> usize {
         self.cache_len
     }
 
     pub fn reset(&mut self) {
         self.cache_len = 0;
+        if self.use_paged {
+            // Releasing on reset is what makes a slot reusable. Leaking here
+            // would look like a slow capacity loss rather than a bug.
+            let _ = self.seq.release(&mut self.pool);
+        }
     }
 
     /// Enable CUDA graph capture for single-token decode.
@@ -360,9 +644,30 @@ impl GpuModel {
         self.host_params[PARAM_TOKEN] = token as i32;
         self.host_params[PARAM_POS] = pos as i32;
         self.host_params[PARAM_SEQ] = (pos + 1) as i32;
-        self.host_params[PARAM_SLOT] = (pos * kv_dim) as i32;
+        // Paged: the destination splits into a per-launch layer constant
+        // (folded into layer_base below) and this one per-step scalar, which is
+        // why decode needs no new projection kernel and the captured graph
+        // stays valid as the sequence grows.
+        self.host_params[PARAM_SLOT] = if self.use_paged {
+            let (page, slot) = self.seq.translate(pos)?;
+            ((page as usize * self.cfg.n_layer * PAGE_TOKENS + slot) * kv_dim) as i32
+        } else {
+            (pos * kv_dim) as i32
+        };
         let host = self.host_params.clone();
-        self.gpu.write_i32(&mut self.params, &host)
+        self.gpu.write_i32(&mut self.params, &host)?;
+
+        if self.use_paged {
+            // Buffer addresses never change, only their contents, so these
+            // uploads sit outside graph capture and do not invalidate a replay.
+            let table = self.seq.table_padded(self.table_stride);
+            self.host_tables[..self.table_stride].copy_from_slice(&table);
+            self.host_lens[0] = (pos + 1) as i32;
+            let (t, l) = (self.host_tables.clone(), self.host_lens.clone());
+            self.gpu.write_i32(&mut self.page_tables, &t)?;
+            self.gpu.write_i32(&mut self.seq_lens, &l)?;
+        }
+        Ok(())
     }
 
     /// Queue every kernel for one token. Shared by the eager path and by graph
@@ -383,26 +688,48 @@ impl GpuModel {
         }
 
         for (l, layer) in self.layers.iter().enumerate() {
-            let layer_base = l * self.capacity * kv_dim;
+            // Paged pages hold PAGE_TOKENS positions for every layer, so the
+            // layer stride shrinks from the whole context to one page.
+            let layer_base = if self.use_paged {
+                l * PAGE_TOKENS * kv_dim
+            } else {
+                l * self.capacity * kv_dim
+            };
             let s = &mut self.scratch;
 
             self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
 
             // K and V land directly in the cache; the slot offset comes from
             // the parameter buffer so the graph stays valid as pos advances.
-            Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
-                              kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-            Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
-                              kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-            self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
-                             n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+            if self.use_paged {
+                Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_pool,
+                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
+                Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_pool,
+                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
+                self.gpu.rope_at(&mut self.k_pool, &self.rope_cos, &self.rope_sin,
+                                 n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+            } else {
+                Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
+                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
+                Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
+                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
+                self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
+                                 n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+            }
 
             Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
                               d, d, &self.params, 0, PARAM_ZERO, false)?;
             self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
                              n_head, hd, &self.params, 0, PARAM_ZERO)?;
 
-            if self.split_attention {
+            if self.use_paged {
+                self.gpu.attention_decode_paged(
+                    &s.q, &self.k_pool, &self.v_pool, &mut s.attn,
+                    &self.page_tables, &self.seq_lens,
+                    1, n_head, n_kv, hd, self.table_stride,
+                    cfg.n_layer, l, kv_dim, self.capacity,
+                )?;
+            } else if self.split_attention {
                 self.gpu.attention_split(
                     &s.q, &self.k_cache, &self.v_cache,
                     &mut s.partial_o, &mut s.partial_m, &mut s.partial_l,
@@ -699,11 +1026,56 @@ impl GpuModel {
     /// 92,071. This path costs ~14 launches per layer for the entire prompt
     /// regardless of its length.
     fn prefill(&mut self, tokens: &[usize]) -> Result<Vec<f32>> {
+        let pos_offset = self.cache_len;
+        if self.use_paged {
+            self.seq.grow(&mut self.pool, tokens.len())?;
+            let table = self.seq.table_padded(self.table_stride);
+            self.upload_slot0(&table, pos_offset + tokens.len())?;
+        }
+        let out = self.prefill_body(tokens, pos_offset)?;
+        self.cache_len += tokens.len();
+        Ok(out)
+    }
+
+    /// Upload one page table and length into batch slot 0.
+    ///
+    /// Slot 0 is what the single-request paged path and prefill both use; a
+    /// batched decode step overwrites every slot anyway.
+    fn upload_slot0(&mut self, table: &[i32], len: usize) -> Result<()> {
+        self.host_tables[..self.table_stride]
+            .copy_from_slice(&table[..self.table_stride]);
+        self.host_lens[0] = len as i32;
+        let (ht, hl) = (self.host_tables.clone(), self.host_lens.clone());
+        self.gpu.write_i32(&mut self.page_tables, &ht)?;
+        self.gpu.write_i32(&mut self.seq_lens, &hl)?;
+        Ok(())
+    }
+
+    /// Prefill a prompt into pages the caller owns.
+    ///
+    /// Used to admit a new request: the scheduler holds that request's
+    /// `SequencePages`, so the model must not touch its own. Returns the final
+    /// position's logits, which is the request's first generated token.
+    pub fn prefill_request(
+        &mut self,
+        tokens: &[usize],
+        table: &[i32],
+        pos_offset: usize,
+    ) -> Result<Vec<f32>> {
+        if !self.use_paged {
+            bail!("prefill_request requires paging; call enable_paging first");
+        }
+        self.upload_slot0(table, pos_offset + tokens.len())?;
+        self.prefill_body(tokens, pos_offset)
+    }
+
+    /// The prefill compute itself. Assumes page tables are already uploaded
+    /// when paged, and touches neither `self.seq` nor `self.cache_len`.
+    fn prefill_body(&mut self, tokens: &[usize], pos_offset: usize) -> Result<Vec<f32>> {
         let cfg = self.cfg.clone();
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
         let t = tokens.len();
-        let pos_offset = self.cache_len;
 
         let ids: Vec<i32> = tokens.iter().map(|v| *v as i32).collect();
         self.gpu.write_i32(&mut self.prefill_scratch.tokens, &ids)?;
@@ -724,18 +1096,36 @@ impl GpuModel {
             self.gpu.gemm(&layer.k_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
             self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
                                 t, n_kv, hd, kv_dim, pos_offset)?;
-            self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
+            if self.use_paged {
+                self.gpu.cache_store_paged(&p.kv, &mut self.k_pool, &self.page_tables,
+                                           t, kv_dim, cfg.n_layer, l, pos_offset)?;
+            } else {
+                self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
+            }
 
             self.gpu.gemm(&layer.v_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
-            self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
+            if self.use_paged {
+                self.gpu.cache_store_paged(&p.kv, &mut self.v_pool, &self.page_tables,
+                                           t, kv_dim, cfg.n_layer, l, pos_offset)?;
+            } else {
+                self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
+            }
 
             self.gpu.gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
             self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
                                 t, n_head, hd, d, pos_offset)?;
 
-            self.gpu.attention_prefill(&p.q, &self.k_cache, &self.v_cache, &mut p.attn,
-                                       t, n_head, n_kv, hd, self.capacity,
-                                       kv_dim, layer_base, pos_offset)?;
+            if self.use_paged {
+                self.gpu.attention_prefill_paged(&p.q, &self.k_pool, &self.v_pool,
+                                                 &mut p.attn, &self.page_tables,
+                                                 t, n_head, n_kv, hd,
+                                                 cfg.n_layer, l, kv_dim,
+                                                 self.capacity, pos_offset)?;
+            } else {
+                self.gpu.attention_prefill(&p.q, &self.k_cache, &self.v_cache, &mut p.attn,
+                                           t, n_head, n_kv, hd, self.capacity,
+                                           kv_dim, layer_base, pos_offset)?;
+            }
 
             self.gpu.gemm(&layer.o_proj.view(), &p.attn, &mut p.proj, t, d, d, false)?;
             self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
@@ -768,7 +1158,6 @@ impl GpuModel {
                           &mut self.scratch.logits, cfg.vocab_size, d,
                           &self.params, 0, PARAM_ZERO, false)?;
 
-        self.cache_len += t;
         self.gpu.to_host(&self.scratch.logits)
     }
 
@@ -807,6 +1196,12 @@ impl GpuModel {
 
         for &token in tokens {
             let pos = self.cache_len;
+            // Pages are taken one position at a time, so a short request never
+            // reserves a full context. Exhaustion surfaces here as an error
+            // rather than as a silent overwrite of somebody else's page.
+            if self.use_paged {
+                self.seq.grow(&mut self.pool, 1)?;
+            }
             self.set_params(token, pos)?;
 
             let single = tokens.len() == 1;
