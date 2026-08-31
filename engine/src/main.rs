@@ -116,6 +116,32 @@ enum Command {
     /// Aggregate throughput and per-request throughput are different claims and
     /// are reported separately: batching raises the first while lowering the
     /// second, and calling that a latency improvement would be wrong.
+    /// Stage breakdown of a batched decode step, at several batch sizes.
+    /// Batched GEMV against the tiled GEMM, per projection shape and batch.
+    ///
+    /// Also checks the two agree numerically before reporting any timing: a
+    /// faster kernel that computes something else is not a result.
+    #[cfg(feature = "cuda")]
+    GpuGemvBench {
+        #[arg(long, default_value = "1,2,4,8,16")]
+        batches: String,
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+    },
+    #[cfg(feature = "cuda")]
+    GpuProfileBatch {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "1,2,4,8,16")]
+        batches: String,
+        /// Sequence length every request sits at, so the attention cost is
+        /// comparable across batch sizes.
+        #[arg(long, default_value_t = 256)]
+        context: usize,
+        #[arg(long, default_value_t = 40)]
+        iters: usize,
+    },
     #[cfg(feature = "cuda")]
     GpuServeBench {
         model: PathBuf,
@@ -215,6 +241,12 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        #[cfg(feature = "cuda")]
+        Command::GpuGemvBench { batches, iters } => gpu_gemv_bench(&batches, iters),
+        #[cfg(feature = "cuda")]
+        Command::GpuProfileBatch { model, quant, batches, context, iters } => {
+            gpu_profile_batch(model, &quant, &batches, context, iters)
+        }
         #[cfg(feature = "cuda")]
         Command::GpuServeBench { model, quant, batches, lengths, steps, trials } => {
             gpu_serve_bench(model, &quant, &batches, &lengths, steps, trials)
@@ -796,6 +828,205 @@ fn envelope() -> String {
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
+    use llm_engine::gpu::{Gpu, Proj2};
+    use std::time::Instant;
+
+    let sizes: Vec<usize> = batches
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0 && *v <= 16)
+        .collect();
+
+    // The model's actual decode shapes. There is no fused QKV here: q is
+    // 768x768 and k/v are 192x768 each, because n_kv_head=3 with head_dim=64.
+    let shapes: [(&str, usize, usize); 6] = [
+        ("q_proj / o_proj", 768, 768),
+        ("k_proj / v_proj", 192, 768),
+        ("gate / up_proj", 2048, 768),
+        ("down_proj", 768, 2048),
+        ("lm_head", 50304, 768),
+        ("lm_head (f32 cols)", 50304, 768),
+    ];
+
+    let gpu = Gpu::new(0)?;
+    println!("gpu      {}", envelope());
+    println!("workload int8 weights, {iters} iterations, median of 3");
+    println!();
+
+    let header = format!("{:<20} {:>6} {:>10} {:>10} {:>9} {:>10}",
+                         "shape", "batch", "gemm us", "gemv us", "speedup", "max reldiff");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    for (name, rows, cols) in shapes.iter().take(5) {
+        let (rows, cols) = (*rows, *cols);
+        // Deterministic, mantissa-dense, single-sign -- the properties the
+        // GEMM validation had to learn the hard way.
+        let wf: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.7391).sin() * 0.4 + 0.6)
+            .collect();
+        let mut qw = vec![0i8; rows * cols];
+        let mut qs = vec![0.0f32; rows];
+        for r in 0..rows {
+            let row = &wf[r * cols..(r + 1) * cols];
+            let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            qs[r] = scale;
+            for (j, v) in row.iter().enumerate() {
+                qw[r * cols + j] = (v / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        let d_w = gpu.to_device_i8(&qw)?;
+        let d_s = gpu.to_device(&qs)?;
+
+        for &n in &sizes {
+            let x: Vec<f32> = (0..n * cols)
+                .map(|i| ((i as f32) * 1.2113).cos() * 0.3 + 0.5)
+                .collect();
+            let d_x = gpu.to_device(&x)?;
+            let mut d_gemm = gpu.alloc(n * rows)?;
+            let mut d_gemv = gpu.alloc(n * rows)?;
+
+            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm, n, rows, cols, false)?;
+            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv, rows, cols, n, false)?;
+            gpu.sync()?;
+            let a = gpu.to_host(&d_gemm)?;
+            let b = gpu.to_host(&d_gemv)?;
+            let reldiff = a
+                .iter()
+                .zip(&b)
+                .map(|(p, q)| {
+                    let scale = (p.abs().max(q.abs()) as f64).max(1e-6);
+                    ((*p as f64) - (*q as f64)).abs() / scale
+                })
+                .fold(0.0f64, f64::max);
+
+            let mut timings = [0.0f64; 2];
+            for (slot, gemm_path) in [(0usize, true), (1usize, false)] {
+                let mut runs = Vec::new();
+                for _ in 0..3 {
+                    // Warm, then time.
+                    for _ in 0..5 {
+                        if gemm_path {
+                            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm,
+                                     n, rows, cols, false)?;
+                        } else {
+                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv,
+                                              rows, cols, n, false)?;
+                        }
+                    }
+                    gpu.sync()?;
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        if gemm_path {
+                            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm,
+                                     n, rows, cols, false)?;
+                        } else {
+                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv,
+                                              rows, cols, n, false)?;
+                        }
+                    }
+                    gpu.sync()?;
+                    runs.push(t0.elapsed().as_secs_f64() / iters as f64);
+                }
+                runs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+                timings[slot] = runs[1];
+            }
+
+            println!("{name:<20} {n:>6} {:>10.1} {:>10.1} {:>8.2}x {:>10.3e}",
+                     timings[0] * 1e6, timings[1] * 1e6,
+                     timings[0] / timings[1], reldiff);
+        }
+        println!();
+    }
+
+    println!("GEMV keeps one warp per output row and carries the batch inside the");
+    println!("warp, so weight traffic does not grow with batch; GEMM amortises the");
+    println!("weight read but has almost no parallelism at these M.");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_profile_batch(
+    dir: PathBuf,
+    quant: &str,
+    batches: &str,
+    context: usize,
+    iters: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::{SequencePages, PAGE_TOKENS};
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let sizes: Vec<usize> = batches
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let max_n = *sizes.iter().max().unwrap_or(&1);
+    let pages_each = context.div_ceil(PAGE_TOKENS) + 1;
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(pages_each * max_n, max_n)?;
+
+    println!("gpu        {}", envelope());
+    println!("context    {context} positions per request, {iters} iterations");
+    println!();
+
+    for &n in &sizes {
+        // Give every request its own pages at the same length, so the batch
+        // dimension is the only thing changing between rows.
+        let mut seqs: Vec<SequencePages> = Vec::new();
+        for _ in 0..n {
+            let mut sq = SequencePages::new();
+            sq.grow(model.page_pool_mut(), context)?;
+            seqs.push(sq);
+        }
+        let stride = model.table_stride();
+        let mut tables = vec![0i32; model.max_batch() * stride];
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
+        let mut lens = Vec::new();
+        for (i, sq) in seqs.iter().enumerate() {
+            tables[i * stride..(i + 1) * stride].copy_from_slice(&sq.table_padded(stride));
+            tokens.push((i * 37 + 11) % cfg.vocab_size);
+            positions.push(context - 1);
+            lens.push(context as i32);
+        }
+
+        let rep = model.profile_batch(&tokens, &positions, &tables, &lens, iters)?;
+        let total: f64 = rep.stages.iter().map(|s| s.adjusted).sum();
+        let raw_total: f64 = rep.stages.iter().map(|s| s.raw).sum();
+
+        println!("batch {n}   raw step {:.3} ms, adjusted {:.3} ms, sync {:.1} us/call",
+                 raw_total * 1e3, total * 1e3, rep.sync_cost * 1e6);
+        println!("  {:<14} {:>6} {:>10} {:>10} {:>7}",
+                 "stage", "calls", "raw ms", "adj ms", "% adj");
+        let mut ranked: Vec<_> = rep.stages.iter().collect();
+        ranked.sort_by(|a, b| b.adjusted.partial_cmp(&a.adjusted).unwrap());
+        for st in ranked {
+            println!("  {:<14} {:>6} {:>10.3} {:>10.3} {:>6.1}%",
+                     st.name, st.calls, st.raw * 1e3, st.adjusted * 1e3,
+                     if total > 0.0 { st.adjusted / total * 100.0 } else { 0.0 });
+        }
+        println!();
+
+        for mut sq in seqs {
+            sq.release(model.page_pool_mut())?;
+        }
+    }
+
+    println!("Adjusted removes one sync per timed block, estimated from the");
+    println!("cheapest kernel-launching stage. Raw is what the wall clock saw.");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn gpu_serve_bench(
     dir: PathBuf,
     quant: &str,
@@ -892,56 +1123,65 @@ fn gpu_serve_bench(
              model.page_pool().page_bytes() * 2 / PAGE_TOKENS);
     println!();
 
-    let header = format!("{:>6}  {:>12}  {:>12}  {:>11}  {:>8}  {:>7}  {:>7}",
-                         "batch", "aggregate", "per-request", "step ms", "vs 1x", "pages", "wasted");
+    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>7}",
+                         "batch", "gemm agg", "gemv agg", "gemv/req",
+                         "step ms", "speedup", "pages", "wasted");
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
-    let mut base_agg = 0.0f64;
     let mut rt = Runtime::new(model)?;
     for &n in &sizes {
-        let mut secs = Vec::new();
+        // GEMV and GEMM trials are interleaved, not run in blocks: measuring
+        // one path fully and then the other lets thermal drift masquerade as a
+        // kernel difference, which this repo has already been caught by once.
+        let mut secs = [Vec::new(), Vec::new()];
         let mut pages_used = 0usize;
         let mut wasted = 0usize;
         for _ in 0..trials {
-            for i in 0..n {
-                rt.submit(Request {
-                    id: i as u64,
-                    prompt: probe_tokens(lens[i % lens.len()], cfg.vocab_size),
-                    max_new_tokens: steps,
-                });
-            }
-            // Admission (which prefills) is one step; time the decode steps
-            // only, so prompt processing is not counted as decode throughput.
-            rt.step()?;
-            let (p, w) = rt.residency();
-            pages_used = pages_used.max(p);
-            wasted = wasted.max(w);
-
-            let t0 = Instant::now();
-            let mut done = 0;
-            while !rt.is_idle() {
-                rt.step()?;
-                done += 1;
-                if done > steps * 4 + 16 {
-                    anyhow::bail!("runtime did not drain");
+            for (slot, force_gemm) in [(0usize, true), (1usize, false)] {
+                rt.model_mut().set_force_decode_gemm(force_gemm);
+                for i in 0..n {
+                    rt.submit(Request {
+                        id: i as u64,
+                        prompt: probe_tokens(lens[i % lens.len()], cfg.vocab_size),
+                        max_new_tokens: steps,
+                    });
                 }
+                // Admission prefills; time only the decode steps, so prompt
+                // processing is not counted as decode throughput.
+                rt.step()?;
+                let (p, w) = rt.residency();
+                pages_used = pages_used.max(p);
+                wasted = wasted.max(w);
+
+                let t0 = Instant::now();
+                let mut done = 0;
+                while !rt.is_idle() {
+                    rt.step()?;
+                    done += 1;
+                    if done > steps * 4 + 16 {
+                        anyhow::bail!("runtime did not drain");
+                    }
+                }
+                secs[slot].push(t0.elapsed().as_secs_f64());
+                let _ = rt.completed();
             }
-            secs.push(t0.elapsed().as_secs_f64());
-            let _ = rt.completed();
         }
-        secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let t = secs[secs.len() / 2];
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let t_gemm = med(&mut secs[0]);
+        let t_gemv = med(&mut secs[1]);
         let decode_steps = (steps - 1) as f64;
-        let agg = n as f64 * decode_steps / t;
-        let per = decode_steps / t;
-        let step_ms = t / decode_steps * 1000.0;
-        if n == 1 {
-            base_agg = agg;
-        }
-        println!("{n:>6}  {agg:>10.0} t/s  {per:>10.0} t/s  {step_ms:>9.2}  {:>7.2}x  {pages_used:>7}  {wasted:>7}",
-                 if base_agg > 0.0 { agg / base_agg } else { 1.0 });
+        let agg_gemm = n as f64 * decode_steps / t_gemm;
+        let agg_gemv = n as f64 * decode_steps / t_gemv;
+        let per_gemv = decode_steps / t_gemv;
+        let step_ms = t_gemv / decode_steps * 1000.0;
+        println!("{n:>6}  {agg_gemm:>9.0} t/s  {agg_gemv:>9.0} t/s  {per_gemv:>7.0} t/s  {step_ms:>9.2}  {:>7.2}x  {pages_used:>7}  {wasted:>7}",
+                 agg_gemv / agg_gemm);
     }
+    rt.model_mut().set_force_decode_gemm(false);
 
     println!();
     println!("Aggregate is total tokens per second across the batch; per-request is");
@@ -1195,6 +1435,70 @@ fn gpu_batch(
     }
     if failures > 0 {
         anyhow::bail!("{failures} request(s) differed from independent execution");
+    }
+
+    // --- dispatch numerics -------------------------------------------------
+    // GEMV and GEMM sum in different orders, so bit-identical logits are not
+    // mathematically available. What matters is that the difference stays at
+    // rounding level and never changes a decision that was not already a
+    // near-tie.
+    {
+        use llm_engine::paged::SequencePages;
+        let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        m.enable_paging(needed, prompts.len())?;
+        let n = prompts.len().min(m.max_batch());
+
+        let mut seqs = Vec::new();
+        for p in prompts.iter().take(n) {
+            let mut sq = SequencePages::new();
+            sq.grow(m.page_pool_mut(), p.len())?;
+            seqs.push(sq);
+        }
+        let stride = m.table_stride();
+        let mut tables = vec![0i32; m.max_batch() * stride];
+        let (mut toks, mut pos, mut lens2) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, sq) in seqs.iter().enumerate() {
+            tables[i * stride..(i + 1) * stride].copy_from_slice(&sq.table_padded(stride));
+            toks.push(prompts[i][0]);
+            pos.push(sq.len() - 1);
+            lens2.push(sq.len() as i32);
+        }
+
+        m.set_force_decode_gemm(true);
+        let a = m.decode_batch(&toks, &pos, &tables, &lens2)?;
+        m.set_force_decode_gemm(false);
+        let b = m.decode_batch(&toks, &pos, &tables, &lens2)?;
+
+        let vocab = cfg.vocab_size;
+        let mut max_abs = 0.0f64;
+        let mut max_rel = 0.0f64;
+        let mut top1_agree = 0usize;
+        let mut worst_margin = f32::INFINITY;
+        for i in 0..n {
+            let (ra, rb) = (&a[i * vocab..(i + 1) * vocab], &b[i * vocab..(i + 1) * vocab]);
+            for (x, y) in ra.iter().zip(rb) {
+                let d = ((*x as f64) - (*y as f64)).abs();
+                max_abs = max_abs.max(d);
+                let scale = (x.abs().max(y.abs()) as f64).max(1e-6);
+                max_rel = max_rel.max(d / scale);
+            }
+            if argmax(ra) == argmax(rb) {
+                top1_agree += 1;
+            } else {
+                worst_margin = worst_margin.min(top_gap(ra));
+            }
+        }
+        println!();
+        println!("dispatch numerics, GEMV vs forced GEMM, {n} rows.");
+        println!("Note the GEMM here is the tensor-core path, which rounds");
+        println!("activations to half; GEMV accumulates in f32 throughout, so");
+        println!("this difference is mostly the GEMM's, not the GEMV's:");
+        println!("  max absolute error   {max_abs:.3e}");
+        println!("  max relative error   {max_rel:.3e}");
+        println!("  top-1 agreement      {top1_agree}/{n}");
+        if top1_agree < n {
+            println!("  min top-2 margin on disagreement  {worst_margin:.3e}");
+        }
     }
 
     println!();

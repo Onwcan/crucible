@@ -197,6 +197,8 @@ pub struct GpuModel {
     seq: SequencePages,
     use_paged: bool,
     batch: Option<BatchScratch>,
+    /// Force the tiled GEMM for every batched projection, for A/B measurement.
+    force_decode_gemm: bool,
     capacity: usize,
     cache_len: usize,
     hidden: usize,
@@ -348,6 +350,7 @@ impl GpuModel {
             seq: SequencePages::new(),
             use_paged: false,
             batch: None,
+            force_decode_gemm: std::env::var("CRUCIBLE_DECODE_GEMM").is_ok(),
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
@@ -463,6 +466,68 @@ impl GpuModel {
         self.max_batch
     }
 
+    /// Force the tiled GEMM for batched projections instead of GEMV.
+    pub fn set_force_decode_gemm(&mut self, on: bool) {
+        self.force_decode_gemm = on;
+    }
+
+    /// Whether a batched projection of this shape should use GEMV or the
+    /// tiled GEMM.
+    ///
+    /// Measured, int8, 200 iterations, median of 3, 158 W (speedup = gemm/gemv):
+    ///
+    ///   shape                b1     b2     b4     b8    b16
+    ///   q/o    768x768      4.69   4.02   4.49   3.74   2.96
+    ///   k/v    192x768      3.68   4.19   3.73   2.97   3.09
+    ///   gate/up 2048x768    3.53   3.50   3.92   3.01   2.41
+    ///   down   768x2048     7.87  10.64   7.30   6.35   5.39
+    ///   lm_head 50304x768   7.76   5.56   3.57   1.77   1.00
+    ///
+    /// So the rule is shape-sensitive, because the shapes genuinely differ. The
+    /// per-layer projections have at most 2048 output rows, which gives the
+    /// GEMM only 12-32 blocks at decode M -- it is occupancy-starved and GEMV
+    /// wins across the whole range. The lm_head has 50304 rows, so the GEMM
+    /// already has 786 blocks and is not starved; there GEMV wins only to batch
+    /// 8 and reaches parity by 10.
+    ///
+    /// The lm_head crossover sits on the instantiation boundary rather than
+    /// anywhere physical: a batch of 10 runs the BMAX=16 kernel and pays for six
+    /// accumulators it discards. Finer instantiations would move it, which is a
+    /// reason not to read the constant as fundamental.
+    fn use_gemv(rows: usize, batch: usize) -> bool {
+        /// Below this many output rows, GEMV won at every batch measured.
+        const ROWS_ALWAYS: usize = 4096;
+        /// Above it, only up to this batch. Measured on the lm_head, the one
+        /// shape in this model with more rows than that.
+        const BIG_ROWS_MAX_BATCH: usize = 8;
+        rows <= ROWS_ALWAYS || batch <= BIG_ROWS_MAX_BATCH
+    }
+
+    /// One batched projection, dispatched by measured shape and batch size.
+    fn project_batch(
+        gpu: &Gpu,
+        w: &Proj,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        accumulate: bool,
+        force_gemm: bool,
+    ) -> Result<()> {
+        match w {
+            Proj::Int8 { data, scales }
+                if !force_gemm && Self::use_gemv(rows, batch) && cols % 4 == 0 =>
+            {
+                gpu.gemv_batch_i8(data, scales, x, y, rows, cols, batch, accumulate)
+            }
+            // f32 weights and the large-batch lm_head keep the GEMM. f32 is not
+            // the production decode path and a second GEMV instantiation family
+            // for it would be untested code.
+            _ => gpu.gemm(&w.view(), x, y, batch, rows, cols, accumulate),
+        }
+    }
+
     /// One decode step for `n` requests at once.
     ///
     /// Every per-request quantity arrives as an array: the token to embed, the
@@ -536,6 +601,7 @@ impl GpuModel {
             self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
         }
 
+        let force_gemm = self.force_decode_gemm;
         for (l, layer) in self.layers.iter().enumerate() {
             let b = self.batch.as_mut().expect("batch scratch");
 
@@ -543,19 +609,22 @@ impl GpuModel {
 
             // K/V go through a dense [n, kv_dim] block and are then scattered,
             // one row per request, into that request's own page.
-            self.gpu.gemm(&layer.k_proj.view(), &b.normed, &mut b.kv, n, kv_dim, d, false)?;
+            Self::project_batch(&self.gpu, &layer.k_proj, &b.normed, &mut b.kv,
+                                kv_dim, d, n, false, force_gemm)?;
             self.gpu.rope_rows(&mut b.kv, &self.rope_cos, &self.rope_sin,
                                &b.positions, n, n_kv, hd, kv_dim)?;
             self.gpu.cache_store_rows_paged(&b.kv, &mut self.k_pool, &self.page_tables,
                                             &b.positions, n, kv_dim, self.table_stride,
                                             cfg.n_layer, l)?;
 
-            self.gpu.gemm(&layer.v_proj.view(), &b.normed, &mut b.kv, n, kv_dim, d, false)?;
+            Self::project_batch(&self.gpu, &layer.v_proj, &b.normed, &mut b.kv,
+                                kv_dim, d, n, false, force_gemm)?;
             self.gpu.cache_store_rows_paged(&b.kv, &mut self.v_pool, &self.page_tables,
                                             &b.positions, n, kv_dim, self.table_stride,
                                             cfg.n_layer, l)?;
 
-            self.gpu.gemm(&layer.q_proj.view(), &b.normed, &mut b.q, n, d, d, false)?;
+            Self::project_batch(&self.gpu, &layer.q_proj, &b.normed, &mut b.q,
+                                d, d, n, false, force_gemm)?;
             self.gpu.rope_rows(&mut b.q, &self.rope_cos, &self.rope_sin,
                                &b.positions, n, n_head, hd, d)?;
 
@@ -566,28 +635,31 @@ impl GpuModel {
                 cfg.n_layer, l, kv_dim, self.capacity,
             )?;
 
-            self.gpu.gemm(&layer.o_proj.view(), &b.attn, &mut b.proj, n, d, d, false)?;
-            self.gpu.add_inplace(&mut b.x, &b.proj, n * d)?;
+            // Residual folded into the projection, the same fusion the
+            // single-request decode path uses: one kernel instead of two, and
+            // no [batch, d] intermediate.
+            Self::project_batch(&self.gpu, &layer.o_proj, &b.attn, &mut b.x,
+                                d, d, n, true, force_gemm)?;
 
             self.gpu.rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
             match &layer.gate_proj {
                 Some(gate) => {
-                    self.gpu.gemm(&gate.view(), &b.normed, &mut b.gate, n, self.hidden, d, false)?;
-                    self.gpu.gemm(&layer.up_proj.view(), &b.normed, &mut b.up,
-                                  n, self.hidden, d, false)?;
+                    Self::project_batch(&self.gpu, gate, &b.normed, &mut b.gate,
+                                        self.hidden, d, n, false, force_gemm)?;
+                    Self::project_batch(&self.gpu, &layer.up_proj, &b.normed, &mut b.up,
+                                        self.hidden, d, n, false, force_gemm)?;
                     self.gpu.swiglu_batch(&mut b.gate, &b.up, n * self.hidden)?;
                 }
                 None => bail!("the GPU path currently implements swiglu only"),
             }
-            self.gpu.gemm(&layer.down_proj.view(), &b.gate, &mut b.proj,
-                          n, d, self.hidden, false)?;
-            self.gpu.add_inplace(&mut b.x, &b.proj, n * d)?;
+            Self::project_batch(&self.gpu, &layer.down_proj, &b.gate, &mut b.x,
+                                d, self.hidden, n, true, force_gemm)?;
         }
 
         let b = self.batch.as_mut().expect("batch scratch");
         self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
-        self.gpu.gemm(&self.tok_emb.view(), &b.normed, &mut b.logits,
-                      n, cfg.vocab_size, d, false)?;
+        Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
+                            cfg.vocab_size, d, n, false, force_gemm)?;
 
         let rows = n * cfg.vocab_size;
         self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows)
@@ -785,6 +857,208 @@ impl GpuModel {
         Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
                           cfg.vocab_size, d, &self.params, 0, PARAM_ZERO, false)?;
         Ok(())
+    }
+
+    /// Stage breakdown of one batched decode step.
+    ///
+    /// Not the single-request profiler with a batch argument. That one groups
+    /// three projections into "qkv_proj" and folds the residual into the
+    /// projection kernel, neither of which matches this path; and its per-call
+    /// arithmetic assumes every stage in a group launches the same shape. Here
+    /// the whole question is which projection shape dominates, so they are
+    /// timed separately.
+    ///
+    /// Sync-overhead handling is inherited unchanged, because the failure it
+    /// prevents is the same: each timed block ends with a stream sync, so a
+    /// stage called 36 times absorbs 36 syncs and looks expensive for being
+    /// frequent. The cost is estimated from the cheapest kernel-launching
+    /// stage rather than by timing an idle-stream sync, which measured 70.8 us
+    /// here and is arithmetically impossible.
+    pub fn profile_batch(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+        iters: usize,
+    ) -> Result<ProfileReport> {
+        let n = tokens.len();
+        if !self.use_paged {
+            bail!("profile_batch requires paging");
+        }
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+        let nl = cfg.n_layer;
+
+        let calls: Vec<(String, usize)> = vec![
+            ("embed".into(), 1),
+            ("rmsnorm".into(), 2 * nl + 1),
+            ("qkv_proj".into(), 3 * nl),
+            ("rope".into(), 2 * nl),
+            ("cache_store".into(), 2 * nl),
+            ("attention".into(), nl),
+            ("o_proj".into(), nl),
+            ("gate_up_proj".into(), 2 * nl),
+            ("swiglu".into(), nl),
+            ("down_proj".into(), nl),
+            ("residual".into(), 0),
+            ("lm_head".into(), 1),
+            ("logits_copy".into(), 1),
+        ];
+        let mut totals: Vec<(String, f64)> =
+            calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
+
+        let mut host_tok = vec![0i32; self.max_batch];
+        let mut host_pos = vec![0i32; self.max_batch];
+        let mut host_len = vec![0i32; self.max_batch];
+        for i in 0..n {
+            host_tok[i] = tokens[i] as i32;
+            host_pos[i] = positions[i] as i32;
+            host_len[i] = lens[i];
+        }
+        self.host_tables.copy_from_slice(tables);
+        let ht = self.host_tables.clone();
+        self.gpu.write_i32(&mut self.page_tables, &ht)?;
+        self.gpu.write_i32(&mut self.seq_lens, &host_len)?;
+        {
+            let b = self.batch.as_mut().expect("batch scratch");
+            self.gpu.write_i32(&mut b.tokens, &host_tok)?;
+            self.gpu.write_i32(&mut b.positions, &host_pos)?;
+        }
+
+        let force_gemm = self.force_decode_gemm;
+        for _ in 0..iters {
+            self.gpu.sync()?;
+            macro_rules! timed {
+                ($slot:expr, $body:block) => {{
+                    let t0 = std::time::Instant::now();
+                    $body
+                    self.gpu.sync()?;
+                    totals[$slot].1 += t0.elapsed().as_secs_f64();
+                }};
+            }
+
+            timed!(0, {
+                let b = self.batch.as_mut().expect("batch scratch");
+                self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
+            });
+
+            for (l, layer) in self.layers.iter().enumerate() {
+                let b = self.batch.as_mut().expect("batch scratch");
+                timed!(1, {
+                    self.gpu.rmsnorm_batch(&b.x, &layer.attn_norm, &mut b.normed, n, d, NORM_EPS)?;
+                });
+                timed!(2, {
+                    Self::project_batch(&self.gpu, &layer.k_proj, &b.normed, &mut b.kv,
+                                        kv_dim, d, n, false, force_gemm)?;
+                });
+                timed!(3, {
+                    self.gpu.rope_rows(&mut b.kv, &self.rope_cos, &self.rope_sin,
+                                       &b.positions, n, n_kv, hd, kv_dim)?;
+                });
+                timed!(4, {
+                    self.gpu.cache_store_rows_paged(&b.kv, &mut self.k_pool, &self.page_tables,
+                                                    &b.positions, n, kv_dim, self.table_stride,
+                                                    cfg.n_layer, l)?;
+                });
+                timed!(2, {
+                    Self::project_batch(&self.gpu, &layer.v_proj, &b.normed, &mut b.kv,
+                                        kv_dim, d, n, false, force_gemm)?;
+                });
+                timed!(4, {
+                    self.gpu.cache_store_rows_paged(&b.kv, &mut self.v_pool, &self.page_tables,
+                                                    &b.positions, n, kv_dim, self.table_stride,
+                                                    cfg.n_layer, l)?;
+                });
+                timed!(2, {
+                    Self::project_batch(&self.gpu, &layer.q_proj, &b.normed, &mut b.q,
+                                        d, d, n, false, force_gemm)?;
+                });
+                timed!(3, {
+                    self.gpu.rope_rows(&mut b.q, &self.rope_cos, &self.rope_sin,
+                                       &b.positions, n, n_head, hd, d)?;
+                });
+                timed!(5, {
+                    self.gpu.attention_decode_paged(
+                        &b.q, &self.k_pool, &self.v_pool, &mut b.attn,
+                        &self.page_tables, &self.seq_lens,
+                        n, n_head, n_kv, hd, self.table_stride,
+                        cfg.n_layer, l, kv_dim, self.capacity,
+                    )?;
+                });
+                // Residual fused into the projection, as decode_batch does.
+                timed!(6, {
+                    Self::project_batch(&self.gpu, &layer.o_proj, &b.attn, &mut b.x,
+                                        d, d, n, true, force_gemm)?;
+                });
+                timed!(1, {
+                    self.gpu.rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
+                });
+                match &layer.gate_proj {
+                    Some(gate) => {
+                        timed!(7, {
+                            Self::project_batch(&self.gpu, gate, &b.normed, &mut b.gate,
+                                                self.hidden, d, n, false, force_gemm)?;
+                        });
+                        timed!(7, {
+                            Self::project_batch(&self.gpu, &layer.up_proj, &b.normed, &mut b.up,
+                                                self.hidden, d, n, false, force_gemm)?;
+                        });
+                        timed!(8, {
+                            self.gpu.swiglu_batch(&mut b.gate, &b.up, n * self.hidden)?;
+                        });
+                    }
+                    None => bail!("the GPU path currently implements swiglu only"),
+                }
+                timed!(9, {
+                    Self::project_batch(&self.gpu, &layer.down_proj, &b.gate, &mut b.x,
+                                        d, self.hidden, n, true, force_gemm)?;
+                });
+            }
+
+            let b = self.batch.as_mut().expect("batch scratch");
+            timed!(1, {
+                self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
+            });
+            timed!(11, {
+                Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
+                                    cfg.vocab_size, d, n, false, force_gemm)?;
+            });
+            timed!(12, {
+                let _ = self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits,
+                                           n * cfg.vocab_size)?;
+            });
+        }
+
+        let per_call: Vec<f64> = totals
+            .iter()
+            .enumerate()
+            .map(|(i, (_, raw))| {
+                let c = calls[i].1;
+                if c == 0 { 0.0 } else { raw / iters as f64 / c as f64 }
+            })
+            .collect();
+
+        let sync_cost = totals
+            .iter()
+            .enumerate()
+            .filter(|(i, (name, _))| name != "logits_copy" && calls[*i].1 > 0)
+            .map(|(i, _)| per_call[i])
+            .fold(f64::INFINITY, f64::min);
+
+        let mut stages = Vec::new();
+        for (i, (name, raw)) in totals.into_iter().enumerate() {
+            let c = calls[i].1;
+            let overhead = if name == "logits_copy" { 0.0 } else { sync_cost };
+            stages.push(Stage {
+                name,
+                calls: c,
+                raw: raw / iters as f64,
+                adjusted: ((per_call[i] - overhead) * c as f64).max(0.0),
+            });
+        }
+        Ok(ProfileReport { stages, sync_cost })
     }
 
     /// Bytes of device memory held by weights and cache.

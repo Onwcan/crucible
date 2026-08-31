@@ -127,6 +127,8 @@ pub struct Gpu {
     cache_store: CudaFunction,
     attention_prefill: CudaFunction,
     cache_store_paged: CudaFunction,
+    /// Batched GEMV, indexed by log2 of the instantiated BMAX.
+    gemv_batch_i8: [CudaFunction; 5],
     rope_rows: CudaFunction,
     cache_store_rows_paged: CudaFunction,
     attention_decode_paged: CudaFunction,
@@ -227,6 +229,13 @@ impl Gpu {
             cache_store: cu(module.load_function("cache_store_f32"))?,
             attention_prefill: cu(module.load_function("attention_prefill_f32"))?,
             cache_store_paged: cu(module.load_function("cache_store_paged_f32"))?,
+            gemv_batch_i8: [
+                cu(module.load_function("gemv_batch_i8_b1"))?,
+                cu(module.load_function("gemv_batch_i8_b2"))?,
+                cu(module.load_function("gemv_batch_i8_b4"))?,
+                cu(module.load_function("gemv_batch_i8_b8"))?,
+                cu(module.load_function("gemv_batch_i8_b16"))?,
+            ],
             rope_rows: cu(module.load_function("rope_rows_f32"))?,
             cache_store_rows_paged: cu(module.load_function("cache_store_rows_paged_f32"))?,
             attention_decode_paged: cu(module.load_function("attention_decode_paged_f32"))?,
@@ -821,6 +830,60 @@ impl Gpu {
         b.arg(src).arg(pool).arg(page_table)
             .arg(&r).arg(&kd).arg(&nl).arg(&l).arg(&po);
         unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Largest batch the batched-GEMV kernels are instantiated for.
+    pub const GEMV_BATCH_MAX: usize = 16;
+
+    /// Batched GEMV: `y[batch, rows] = x[batch, cols] @ w[rows, cols]^T`.
+    ///
+    /// int8 only. An f32 model still runs, through the GEMM, because f32
+    /// weights are not the production decode path and adding a second
+    /// instantiation family for them would be untested code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_batch_i8(
+        &self,
+        w: &CudaSlice<i8>,
+        scales: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        if cols % 4 != 0 {
+            anyhow::bail!("batched gemv needs cols divisible by 4, got {cols}");
+        }
+        if batch == 0 || batch > Self::GEMV_BATCH_MAX {
+            anyhow::bail!("batched gemv supports 1..={} rows, got {batch}",
+                          Self::GEMV_BATCH_MAX);
+        }
+        // Smallest instantiation that covers this batch.
+        let idx = match batch {
+            1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            _ => 4,
+        };
+        const THREADS: u32 = 256;
+        let warps = THREADS / 32;
+        let cfg = LaunchConfig {
+            grid_dim: ((rows as u32).div_ceil(warps), 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (r, c, b, acc) = (
+            rows as i32,
+            cols as i32,
+            batch as i32,
+            i32::from(accumulate),
+        );
+        let mut bl = self.stream.launch_builder(&self.gemv_batch_i8[idx]);
+        bl.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(&b).arg(&acc);
+        unsafe { cu(bl.launch(cfg))? };
         Ok(())
     }
 

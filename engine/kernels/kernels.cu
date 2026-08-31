@@ -1163,6 +1163,104 @@ extern "C" __global__ void attention_prefill_f32(
 }
 
 // ===========================================================================
+// Batched GEMV for small-M decode
+//
+// Y[batch, rows] = X[batch, cols] @ W[rows, cols]^T, int8 weights with per-row
+// scales. This exists because the tiled prefill GEMM has almost no parallelism
+// at decode shapes: at M=1 it launches ceil(768/64) x ceil(1/64) = 12 blocks on
+// a 60-SM GPU, and profiling showed its cost is flat from batch 1 to batch 16 --
+// sixteen times the work for the same wall time, which is what an
+// occupancy-starved kernel looks like. The projections are 83% of a batched
+// decode step, so that is the whole problem.
+//
+// The mapping is one warp per OUTPUT ROW, carrying every request's accumulator
+// at once.
+//
+// The obvious alternative -- one warp per (row, request), grid (rows, batch) --
+// also restores parallelism, and re-reads the whole weight matrix once per
+// request. Decode is bandwidth-bound, so at batch 16 that is 16x the traffic on
+// the one tensor that dominates it. Keeping the batch inside the warp reads
+// each weight row exactly once no matter the batch size, and pays instead with
+// BMAX registers per lane and BMAX reads of X, which is small and L1-resident.
+//
+// BMAX is a template parameter rather than a runtime count because `acc[b]`
+// indexed by a runtime value is not a register array -- it lands in local
+// memory, which is exactly the failure the big-tile register investigation
+// documented. Instantiating at 1/2/4/8/16 and rounding the batch up wastes at
+// most 2x of the accumulate work while keeping the accumulators in registers.
+// ===========================================================================
+
+template <int BMAX>
+__device__ __forceinline__ void gemv_batch_i8_impl(
+    const signed char* __restrict__ w,   // [rows, cols]
+    const float* __restrict__ scales,    // [rows]
+    const float* __restrict__ x,         // [batch, cols]
+    float* __restrict__ y,               // [batch, rows]
+    const int rows,
+    const int cols,
+    const int batch,
+    const int accumulate)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    const int row = blockIdx.x * warps_per_block + warp;
+    if (row >= rows) return;
+
+    // Vectorised exactly as the single-request warp GEMV: char4 against float4,
+    // which is what made that kernel bandwidth-bound in the first place.
+    const char4* w_row = reinterpret_cast<const char4*>(w + (size_t)row * cols);
+    const int cols4 = cols / 4;
+
+    float acc[BMAX];
+#pragma unroll
+    for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
+
+    for (int i = lane; i < cols4; i += WARP_SIZE) {
+        const char4 a = w_row[i];
+        const float ax = (float)a.x, ay = (float)a.y, az = (float)a.z, aw = (float)a.w;
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            // Rows past the active batch still read: the buffer is allocated
+            // for max_batch so this is in bounds, and the result is discarded
+            // at the guarded store below. Branching here instead would
+            // serialise the unrolled loop for no gain.
+            const float4 v = reinterpret_cast<const float4*>(x + (size_t)b * cols)[i];
+            acc[b] += ax * v.x + ay * v.y + az * v.z + aw * v.w;
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < BMAX; ++b) {
+        const float sum = warp_reduce_sum(acc[b]);
+        if (lane == 0 && b < batch) {
+            const size_t o = (size_t)b * rows + row;
+            const float val = sum * scales[row];
+            // accumulate folds the residual add into this write, the same
+            // fusion the single-request decode path uses for o_proj and
+            // down_proj.
+            y[o] = accumulate ? y[o] + val : val;
+        }
+    }
+}
+
+#define GEMV_BATCH_ARGS                                                        \
+    const signed char* __restrict__ w, const float* __restrict__ scales,       \
+    const float* __restrict__ x, float* __restrict__ y,                        \
+    const int rows, const int cols, const int batch, const int accumulate
+
+extern "C" __global__ void gemv_batch_i8_b1(GEMV_BATCH_ARGS)
+{ gemv_batch_i8_impl<1>(w, scales, x, y, rows, cols, batch, accumulate); }
+extern "C" __global__ void gemv_batch_i8_b2(GEMV_BATCH_ARGS)
+{ gemv_batch_i8_impl<2>(w, scales, x, y, rows, cols, batch, accumulate); }
+extern "C" __global__ void gemv_batch_i8_b4(GEMV_BATCH_ARGS)
+{ gemv_batch_i8_impl<4>(w, scales, x, y, rows, cols, batch, accumulate); }
+extern "C" __global__ void gemv_batch_i8_b8(GEMV_BATCH_ARGS)
+{ gemv_batch_i8_impl<8>(w, scales, x, y, rows, cols, batch, accumulate); }
+extern "C" __global__ void gemv_batch_i8_b16(GEMV_BATCH_ARGS)
+{ gemv_batch_i8_impl<16>(w, scales, x, y, rows, cols, batch, accumulate); }
+
+// ===========================================================================
 // Paged KV cache
 //
 // The contiguous cache above stores position j of a layer at a fixed linear

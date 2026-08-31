@@ -124,6 +124,10 @@ impl Runtime {
         &self.model
     }
 
+    pub fn model_mut(&mut self) -> &mut GpuModel {
+        &mut self.model
+    }
+
     pub fn free_pages(&self) -> usize {
         self.model.page_pool().free_pages()
     }

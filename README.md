@@ -9,7 +9,7 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > tensor-core GEMM — 2.4x the scalar kernel it replaced. Remaining gap to
 > llama.cpp on prefill is 2.8x, down from 7.2x. A paged KV cache and a
 > continuous-batching scheduler now keep multiple requests resident and decode
-> them together: 1,916 tok/s aggregate at batch 16 against 1,662 for one
+> them together: **4,587 tok/s aggregate at batch 16** against ~1,660 for one
 > graph-replayed stream.
 
 ## Why Blackwell specifically
@@ -1241,7 +1241,98 @@ Batching raises the first and lowers the second. That is a throughput result and
 not a latency result, and it is worth being precise about which one is being
 claimed.
 
-### What limits the batched path
+### Batched GEMV: the projections were the whole problem
+
+Profiling the batched step first, rather than guessing, showed the projections
+were 83-84% of it -- and that their cost was *flat* across batch sizes:
+
+| stage | b1 | b4 | b16 |
+|---|---:|---:|---:|
+| qkv_proj | 2.061 ms | 1.828 ms | 1.974 ms |
+| down_proj | 1.760 ms | 1.641 ms | 1.767 ms |
+
+Sixteen times the work for the same wall time is what an occupancy-starved
+kernel looks like. At decode M the tiled GEMM launches `ceil(768/64) x 1` = 12
+blocks on a 60-SM GPU.
+
+The replacement puts **one warp on each output row, carrying every request's
+accumulator at once**. The obvious alternative -- one warp per (row, request),
+grid `(rows, batch)` -- also restores parallelism but re-reads the whole weight
+matrix once per request, which at batch 16 is 16x the traffic on the tensor that
+dominates a bandwidth-bound step. Keeping the batch inside the warp reads each
+weight row exactly once regardless of batch.
+
+`BMAX` is a template parameter, not a runtime count: `acc[b]` indexed by a
+runtime value is not a register array, it is local memory -- the exact failure
+the big-tile register investigation documented. Instantiated at 1/2/4/8/16.
+
+Speedup over the tiled GEMM (int8, 200 iterations, median of 3, 158 W):
+
+| shape | b1 | b2 | b4 | b8 | b16 |
+|---|---:|---:|---:|---:|---:|
+| q/o 768x768 | 4.69x | 4.02x | 4.49x | 3.74x | 2.96x |
+| k/v 192x768 | 3.68x | 4.19x | 3.73x | 2.97x | 3.09x |
+| gate/up 2048x768 | 3.53x | 3.50x | 3.92x | 3.01x | 2.41x |
+| down 768x2048 | 7.87x | 10.64x | 7.30x | 6.35x | 5.39x |
+| lm_head 50304x768 | 7.76x | 5.56x | 3.57x | 1.77x | 1.00x |
+
+The crossover is shape-dependent because the shapes genuinely differ. The
+per-layer projections top out at 2048 output rows, so the GEMM is starved and
+GEMV wins across the range. The lm_head has 50304 rows and 786 blocks, so it is
+not starved: GEMV wins to batch 8 and reaches parity by 10. The dispatch is
+therefore `rows <= 4096 || batch <= 8`.
+
+That lm_head crossover sits on the instantiation boundary rather than anywhere
+physical -- a batch of 10 runs the BMAX=16 kernel and discards six accumulators
+-- which is a reason not to read the constant as fundamental.
+
+Residual accumulation is folded back into `o_proj` and `down_proj` through the
+kernel's `accumulate` flag, the same fusion single-request decode uses, removing
+24 kernels per step.
+
+End-to-end through the runtime, GEMV and GEMM trials interleaved:
+
+| batch | GEMM aggregate | GEMV aggregate | per-request | step ms | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 150 t/s | 599 t/s | 599 t/s | 1.67 | 4.00x |
+| 2 | 290 t/s | 1,137 t/s | 568 t/s | 1.76 | 3.92x |
+| 4 | 537 t/s | 1,696 t/s | 424 t/s | 2.36 | 3.16x |
+| 8 | 1,040 t/s | 2,974 t/s | 372 t/s | 2.69 | 2.86x |
+| 16 | 1,892 t/s | **4,587 t/s** | 287 t/s | 3.49 | 2.42x |
+
+### GEMV is also the more accurate path
+
+Worth stating because it was not the goal. The GEMM being replaced is the
+tensor-core one, which rounds activations to half; GEMV accumulates in f32
+throughout. Their outputs differ by up to 8.7e-3 absolute, and most of that is
+the GEMM's.
+
+The evidence is a test that used to fail. When the batched path used GEMM, one
+of eight requests diverged from the single-request `forward` reference on a
+near-tie -- top-2 logit gap 6.9e-4, against 1.8e-2 to 1.3e0 for the seven that
+agreed. With GEMV, **all eight now match `forward` exactly, including that one**.
+Switching kernels for speed removed a numerical discrepancy as a side effect.
+
+### What limits the batched path now
+
+Re-profiling after the change (155 W):
+
+| | batch 1 | batch 16 |
+|---|---:|---:|
+| adjusted step, before | 6.895 ms | 6.971 ms |
+| adjusted step, after | **1.015 ms** | **2.061 ms** |
+| projections, share of step | 16% | 44% |
+| attention | 31.5% | 16.6% |
+| logits copy | 23.3% | 22.9% |
+
+The bottleneck is no longer the projections. It is **launch overhead**: the
+measured step is 1.67 ms at batch 1 against 1.015 ms of adjusted kernel work, so
+roughly 40% of the step is the cost of issuing ~183 kernels eagerly. That is
+what CUDA graphs exist to remove, and it is now the largest single item -- which
+is the evidence for making graph capture the next task rather than a guess that
+it would help.
+
+### What limited the batched path before
 
 Batch 1 through the batched runtime is 152 tok/s against 1,662 for the
 single-request path. That looks alarming and is not a paging cost:
@@ -1468,9 +1559,10 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Paged KV cache — 16-token pages, bit-identical to the contiguous cache
 - [x] Batched decode over heterogeneous lengths, no padding to the longest
 - [x] Continuous-batching scheduler — admission, retirement, page reclaim
-- [ ] Batched decode uses GEMM at low M and is ~5x off the GEMV decode path;
-      a batched GEMV would fix it (see "What limits the batched path")
-- [ ] CUDA graphs for the batched path (single-request replay is unaffected)
+- [x] Batched GEMV — 2.4x to 4.0x end-to-end; aggregate 1,916 -> 4,587 tok/s
+- [ ] CUDA graphs for the batched path — ~40% of the step is now launch
+      overhead across ~183 kernels; the largest remaining item
+- [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix
 - [x] Tensor-core GEMM — prefill 2.4x faster, llama.cpp gap 7.2x -> 2.8x
