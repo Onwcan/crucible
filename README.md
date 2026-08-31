@@ -9,8 +9,8 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > tensor-core GEMM — 2.4x the scalar kernel it replaced. Remaining gap to
 > llama.cpp on prefill is 2.8x, down from 7.2x. A paged KV cache and a
 > continuous-batching scheduler now keep multiple requests resident and decode
-> them together: **4,587 tok/s aggregate at batch 16** against ~1,660 for one
-> graph-replayed stream.
+> them together, graph-replayed: **5,764 tok/s aggregate at batch 16** and
+> 1,492 tok/s at batch 1, against ~1,630 for one single-request stream.
 
 ## Why Blackwell specifically
 
@@ -1313,7 +1313,84 @@ near-tie -- top-2 logit gap 6.9e-4, against 1.8e-2 to 1.3e0 for the seven that
 agreed. With GEMV, **all eight now match `forward` exactly, including that one**.
 Switching kernels for speed removed a numerical discrepancy as a side effect.
 
-### What limits the batched path now
+### CUDA graphs for the batched path
+
+After batched GEMV the projections were no longer the bottleneck; issuing 183
+kernels eagerly was. Graph replay removes that.
+
+**Capture constraints.** Everything varying per step falls into three groups.
+Token ids, positions, sequence lengths and page-table entries already live in
+persistent device buffers, so they are free -- only their *contents* change
+between replays. All scratch, pool and weight addresses are allocated once in
+`enable_paging` and never move. That leaves exactly one thing that cannot be
+absorbed: the **active count `n`**, which drives grid dimensions, the batch
+kernel argument, attention's `grid.y`, which GEMV `BMAX` instantiation runs, and
+the lm_head GEMV/GEMM dispatch.
+
+Two things stay outside the graph: the host-to-device metadata upload
+(`memcpy_htod` from a temporary buffer would be captured as a node holding a
+dangling host pointer) and the final device-to-host logits copy.
+
+**Cache keyed by exact batch size**, up to `max_batch`. Bucketing at `BMAX`
+would need an active mask threaded through the KV scatter, RoPE and the GEMV
+store, because padded page-table slots read 0 -- an inactive row would write KV
+into *physical page 0*, corrupting whichever request owns it. That is a kernel
+change plus a safety proof to save eleven graphs that together do not measure on
+the VRAM counter. Exact keying also preserves the measured GEMV/GEMM dispatch
+for free, since `n` is never rounded up to graph capacity.
+
+Nothing captured depends on which request occupies a slot, only on slot
+position, so the scheduler reordering slots with `swap_remove` cannot invalidate
+a graph. Graphs are dropped only when something they baked in could have
+changed: buffer addresses (`enable_paging`) or which kernels run
+(`set_force_decode_gemm`). `CRUCIBLE_BATCH_GRAPH=0` keeps the eager path.
+
+| batch | eager | graph | speedup | per-request | step ms | spread |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 606 t/s | **1,492** | 2.46x | 1,492 | 0.67 | 6.2% |
+| 2 | 1,175 t/s | **2,265** | 1.93x | 1,133 | 0.88 | 2.6% |
+| 4 | 1,699 t/s | **2,568** | 1.51x | 642 | 1.56 | 2.9% |
+| 8 | 2,992 t/s | **4,067** | 1.36x | 508 | 1.97 | 2.3% |
+| 16 | 4,723 t/s | **5,764** | 1.22x | 360 | 2.78 | 1.9% |
+
+Five graphs, 0.4-0.5 ms to capture each (1.5 ms each from a cold context), and
+graph storage does not move `nvidia-smi`'s MB-resolution counter.
+
+### Launch overhead is now solved, and the profiler was over-estimating
+
+Replaying the graph back to back with a single sync gives the GPU's execution
+time for the kernel sequence with no upload, copy-back or host work -- the floor
+a full step can approach:
+
+| batch | pure replay | measured step | non-kernel | kernel share |
+|---:|---:|---:|---:|---:|
+| 1 | 0.561 ms | 0.670 ms | 0.110 ms | 83.6% |
+| 2 | 0.709 ms | 0.883 ms | 0.174 ms | 80.3% |
+| 4 | 1.255 ms | 1.558 ms | 0.302 ms | 80.6% |
+| 8 | 1.478 ms | 1.967 ms | 0.489 ms | 75.2% |
+| 16 | 1.943 ms | 2.776 ms | 0.833 ms | 70.0% |
+
+This also corrects the profiler. It had put batch-1 kernel work at 1.015 ms
+adjusted, and graph replay completes a whole step in 0.670 ms -- so that figure
+was an over-estimate, and launch overhead was a larger share of the old 1.67 ms
+step than the 40% it implied. The cause is methodological: the profiler syncs
+between stages, which suppresses the kernel overlap a replay gets for free.
+"Adjusted" is an upper bound on kernel time, not a measurement of it.
+
+### What limits the runtime now
+
+The non-kernel column. Host-side argmax is measured at 0.015 ms per
+request-step -- 2.3% of a batch-1 step, 8.4% at batch 16 -- so it is real but
+not dominant. The larger part is the device-to-host copy of full logits rows:
+3.2 MB at batch 16, which at observed PCIe rates accounts for most of the
+remaining 0.6 ms.
+
+Both have the same fix, and it is not another kernel optimisation: the scheduler
+only needs `argmax`, so a device-side reduction would turn 3.2 MB of transfer
+plus 0.24 ms of host scanning into 64 bytes. That is the next thing worth
+measuring, and it is deliberately not done here.
+
+### What limited the batched path before
 
 Re-profiling after the change (155 W):
 
@@ -1560,8 +1637,10 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Batched decode over heterogeneous lengths, no padding to the longest
 - [x] Continuous-batching scheduler — admission, retirement, page reclaim
 - [x] Batched GEMV — 2.4x to 4.0x end-to-end; aggregate 1,916 -> 4,587 tok/s
-- [ ] CUDA graphs for the batched path — ~40% of the step is now launch
-      overhead across ~183 kernels; the largest remaining item
+- [x] CUDA graphs for the batched path — 1.22x to 2.46x; 70-84% of the step is
+      now pure kernel execution
+- [ ] Device-side argmax — 3.2 MB of logits per step at batch 16 crosses PCIe
+      so the host can scan for one token id
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

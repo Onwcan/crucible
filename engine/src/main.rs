@@ -121,6 +121,21 @@ enum Command {
     ///
     /// Also checks the two agree numerically before reporting any timing: a
     /// faster kernel that computes something else is not a result.
+    /// Eager versus graph replay on identical inputs, across graph-cache
+    /// transitions and slot permutations.
+    #[cfg(feature = "cuda")]
+    GpuGraphCheck {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        /// Active counts to execute in order. Repeats exercise cache hits;
+        /// changes exercise capture of a new shape.
+        #[arg(long, default_value = "1,4,8,3,16,2,16,1,8,4")]
+        shapes: String,
+        /// Prompt lengths, cycled. Chosen around page boundaries.
+        #[arg(long, default_value = "15,16,17,31,32,33,127,128,129,255,256,511,512,513,700,900")]
+        lengths: String,
+    },
     #[cfg(feature = "cuda")]
     GpuGemvBench {
         #[arg(long, default_value = "1,2,4,8,16")]
@@ -241,6 +256,10 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        #[cfg(feature = "cuda")]
+        Command::GpuGraphCheck { model, quant, shapes, lengths } => {
+            gpu_graph_check(model, &quant, &shapes, &lengths)
+        }
         #[cfg(feature = "cuda")]
         Command::GpuGemvBench { batches, iters } => gpu_gemv_bench(&batches, iters),
         #[cfg(feature = "cuda")]
@@ -827,6 +846,145 @@ fn envelope() -> String {
         .unwrap_or_else(|| "unavailable".into())
 }
 
+/// Execute a sequence of active counts, returning each step's logits.
+///
+/// State is rebuilt from scratch at the start, so two calls with the same
+/// arguments see identical KV history and their outputs are directly
+/// comparable. Slots are permuted every step: the metadata arrays are rebuilt
+/// each time, so which request sits in which slot must not matter, and this is
+/// what would catch it if a captured graph had tied itself to slot contents.
+#[cfg(feature = "cuda")]
+fn run_shape_sequence(
+    model: &mut llm_engine::gpu_model::GpuModel,
+    prompts: &[Vec<usize>],
+    shapes: &[usize],
+) -> Result<Vec<Vec<f32>>> {
+    use llm_engine::paged::SequencePages;
+
+    let stride = model.table_stride();
+    let vocab = model.cfg.vocab_size;
+
+    let mut seqs: Vec<SequencePages> = Vec::new();
+    for p in prompts {
+        let mut sq = SequencePages::new();
+        sq.grow(model.page_pool_mut(), p.len())?;
+        let table = sq.table_padded(stride);
+        model.prefill_request(p, &table, 0)?;
+        seqs.push(sq);
+    }
+
+    let mut out = Vec::new();
+    for (step, &n) in shapes.iter().enumerate() {
+        let n = n.min(seqs.len()).min(model.max_batch());
+        // Rotate which sequence occupies which slot.
+        let order: Vec<usize> = (0..n).map(|i| (i + step) % seqs.len()).collect();
+
+        let mut tables = vec![0i32; model.max_batch() * stride];
+        let (mut toks, mut pos, mut lens) = (Vec::new(), Vec::new(), Vec::new());
+        for (slot, &si) in order.iter().enumerate() {
+            let p = seqs[si].len();
+            seqs[si].grow(model.page_pool_mut(), 1)?;
+            tables[slot * stride..(slot + 1) * stride]
+                .copy_from_slice(&seqs[si].table_padded(stride));
+            toks.push((si * 31 + step * 7 + 3) % vocab);
+            pos.push(p);
+            lens.push((p + 1) as i32);
+        }
+        out.push(model.decode_batch(&toks, &pos, &tables, &lens)?);
+    }
+
+    for mut sq in seqs {
+        sq.release(model.page_pool_mut())?;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let shape_list: Vec<usize> = shapes
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let max_batch = *shape_list.iter().max().unwrap_or(&1);
+    let prompts: Vec<Vec<usize>> = lens
+        .iter()
+        .take(max_batch)
+        .map(|l| probe_tokens(*l, cfg.vocab_size))
+        .collect();
+
+    let steps = shape_list.len();
+    let pages: usize = prompts
+        .iter()
+        .map(|p| (p.len() + steps + 2).div_ceil(PAGE_TOKENS) + 1)
+        .sum();
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(pages, max_batch)?;
+
+    println!("shapes     {shape_list:?}");
+    println!("prompts    {:?}", prompts.iter().map(|p| p.len()).collect::<Vec<_>>());
+    println!("pool       {pages} pages, {:.2} MB",
+             model.page_pool().total_bytes() as f64 / 1e6);
+    println!();
+
+    model.set_batch_graph(false);
+    let eager = run_shape_sequence(&mut model, &prompts, &shape_list)?;
+    let free_after_eager = model.page_pool().free_pages();
+
+    model.set_batch_graph(true);
+    let graphed = run_shape_sequence(&mut model, &prompts, &shape_list)?;
+    let free_after_graph = model.page_pool().free_pages();
+
+    println!("{:>5}  {:>6}  {:>14}  {:>10}", "step", "batch", "max abs diff", "verdict");
+    println!("{}", "-".repeat(42));
+    let mut failures = 0usize;
+    for (i, (a, b)) in eager.iter().zip(&graphed).enumerate() {
+        let diff = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
+            .fold(0.0f64, f64::max);
+        let ok = diff == 0.0 && a.len() == b.len();
+        if !ok {
+            failures += 1;
+        }
+        println!("{:>5}  {:>6}  {diff:>14.3e}  {:>10}",
+                 i, shape_list[i], if ok { "identical" } else { "MISMATCH" });
+    }
+
+    println!();
+    println!("graphs captured        {}", model.graphs_captured());
+    println!("capture time total     {:.1} ms", model.graph_capture_secs() * 1e3);
+    println!("kernels per step       {}", model.batch_step_kernels());
+    println!("pages free, eager pass {free_after_eager}");
+    println!("pages free, graph pass {free_after_graph}");
+
+    if failures > 0 {
+        anyhow::bail!("{failures} step(s) differed between eager and graph replay");
+    }
+    if free_after_eager != free_after_graph {
+        anyhow::bail!("page accounting differed between eager and graph passes");
+    }
+    println!();
+    println!("Graph replay is bit-identical to eager execution at every shape,");
+    println!("across cache transitions and slot permutations.");
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
     use llm_engine::gpu::{Gpu, Proj2};
@@ -1026,6 +1184,16 @@ fn gpu_profile_batch(
     Ok(())
 }
 
+/// GPU memory currently in use, in MB, for reporting graph storage overhead.
+#[cfg(feature = "cuda")]
+fn gpu_mem_used_mb() -> Option<i64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
 #[cfg(feature = "cuda")]
 fn gpu_serve_bench(
     dir: PathBuf,
@@ -1123,23 +1291,29 @@ fn gpu_serve_bench(
              model.page_pool().page_bytes() * 2 / PAGE_TOKENS);
     println!();
 
-    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>7}",
-                         "batch", "gemm agg", "gemv agg", "gemv/req",
-                         "step ms", "speedup", "pages", "wasted");
+    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>6}",
+                         "batch", "eager agg", "graph agg", "graph/req",
+                         "step ms", "speedup", "spread", "pages");
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
     let mut rt = Runtime::new(model)?;
+    let mem_before = gpu_mem_used_mb();
+    let mut step_ms: Vec<f64> = Vec::new();
     for &n in &sizes {
-        // GEMV and GEMM trials are interleaved, not run in blocks: measuring
+        // Eager and graph trials are interleaved, not run in blocks: measuring
         // one path fully and then the other lets thermal drift masquerade as a
         // kernel difference, which this repo has already been caught by once.
+        //
+        // A warm-up round runs first at each size so the graph for that shape
+        // is already captured; capture cost is reported separately rather than
+        // charged to steady-state throughput.
         let mut secs = [Vec::new(), Vec::new()];
         let mut pages_used = 0usize;
         let mut wasted = 0usize;
-        for _ in 0..trials {
-            for (slot, force_gemm) in [(0usize, true), (1usize, false)] {
-                rt.model_mut().set_force_decode_gemm(force_gemm);
+        for warm in 0..(trials + 1) {
+            for (slot, eager) in [(0usize, true), (1usize, false)] {
+                rt.model_mut().set_batch_graph(!eager);
                 for i in 0..n {
                     rt.submit(Request {
                         id: i as u64,
@@ -1163,7 +1337,9 @@ fn gpu_serve_bench(
                         anyhow::bail!("runtime did not drain");
                     }
                 }
-                secs[slot].push(t0.elapsed().as_secs_f64());
+                if warm > 0 {
+                    secs[slot].push(t0.elapsed().as_secs_f64());
+                }
                 let _ = rt.completed();
             }
         }
@@ -1171,17 +1347,75 @@ fn gpu_serve_bench(
             v.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap());
             v[v.len() / 2]
         };
-        let t_gemm = med(&mut secs[0]);
-        let t_gemv = med(&mut secs[1]);
+        let spread = |v: &Vec<f64>| {
+            let (lo, hi) = (v.iter().cloned().fold(f64::INFINITY, f64::min),
+                            v.iter().cloned().fold(0.0f64, f64::max));
+            (hi - lo) / v[v.len() / 2] * 100.0
+        };
+        let sp = spread(&secs[0]).max(spread(&secs[1]));
+        let t_eager = med(&mut secs[0]);
+        let t_graph = med(&mut secs[1]);
         let decode_steps = (steps - 1) as f64;
-        let agg_gemm = n as f64 * decode_steps / t_gemm;
-        let agg_gemv = n as f64 * decode_steps / t_gemv;
-        let per_gemv = decode_steps / t_gemv;
-        let step_ms = t_gemv / decode_steps * 1000.0;
-        println!("{n:>6}  {agg_gemm:>9.0} t/s  {agg_gemv:>9.0} t/s  {per_gemv:>7.0} t/s  {step_ms:>9.2}  {:>7.2}x  {pages_used:>7}  {wasted:>7}",
-                 agg_gemv / agg_gemm);
+        let agg_eager = n as f64 * decode_steps / t_eager;
+        let agg_graph = n as f64 * decode_steps / t_graph;
+        let per_graph = decode_steps / t_graph;
+        let step = t_graph / decode_steps * 1000.0;
+        println!("{n:>6}  {agg_eager:>9.0} t/s  {agg_graph:>9.0} t/s  {per_graph:>7.0} t/s  {step:>9.2}  {:>7.2}x  {sp:>6.1}%  {pages_used:>6}",
+                 agg_graph / agg_eager);
+        step_ms.push(step);
     }
-    rt.model_mut().set_force_decode_gemm(false);
+    rt.model_mut().set_batch_graph(true);
+    let mem_after = gpu_mem_used_mb();
+
+    // Host-side cost per step, which graph replay does not touch: the
+    // scheduler reads a full logits row per request and scans it for argmax.
+    // Worth measuring rather than assuming, because at 50304 entries per
+    // request it is not obviously small next to a 0.67 ms step.
+    {
+        let vocab = cfg.vocab_size;
+        let probe: Vec<f32> = (0..vocab).map(|i| ((i as f32) * 0.7391).sin()).collect();
+        let t0 = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..1000 {
+            sink ^= argmax(&probe);
+        }
+        let per = t0.elapsed().as_secs_f64() / 1000.0;
+        std::hint::black_box(sink);
+        println!();
+        println!("host argmax          {:.3} ms per request-step", per * 1e3);
+        for &n in &sizes {
+            println!("  batch {n:<2}           {:.3} ms per step", per * n as f64 * 1e3);
+        }
+    }
+
+    // Pure replay: kernels only, no upload, no copy-back, no host work. The
+    // gap to the measured step is everything graph replay cannot remove.
+    println!();
+    println!("{:>6}  {:>11}  {:>11}  {:>12}  {:>9}",
+             "batch", "replay ms", "step ms", "non-kernel", "kernel %");
+    for (i, &n) in sizes.iter().enumerate() {
+        match rt.model_mut().time_graph_replay(n, 200) {
+            Ok(replay) => {
+                let step = step_ms[i] / 1e3;
+                println!("{n:>6}  {:>11.3}  {:>11.3}  {:>12.3}  {:>8.1}%",
+                         replay * 1e3, step * 1e3, (step - replay) * 1e3,
+                         replay / step * 100.0);
+            }
+            Err(e) => println!("{n:>6}  {e}"),
+        }
+    }
+
+    println!();
+    println!("graphs captured      {}", rt.model().graphs_captured());
+    println!("capture time total   {:.1} ms ({:.1} ms per shape)",
+             rt.model().graph_capture_secs() * 1e3,
+             rt.model().graph_capture_secs() * 1e3
+                 / rt.model().graphs_captured().max(1) as f64);
+    println!("kernels per step     {}", rt.model().batch_step_kernels());
+    match (mem_before, mem_after) {
+        (Some(a), Some(b)) => println!("VRAM used            {a} MB -> {b} MB (graph storage {} MB)", b - a),
+        _ => println!("VRAM used            unavailable"),
+    }
 
     println!();
     println!("Aggregate is total tokens per second across the batch; per-request is");

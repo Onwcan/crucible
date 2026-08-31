@@ -199,6 +199,24 @@ pub struct GpuModel {
     batch: Option<BatchScratch>,
     /// Force the tiled GEMM for every batched projection, for A/B measurement.
     force_decode_gemm: bool,
+
+    /// Captured decode graphs, indexed by exact active count minus one.
+    ///
+    /// Keyed by the exact batch rather than bucketed, because `n` drives five
+    /// separate things -- grid dimensions, the batch kernel argument,
+    /// attention's grid.y, which GEMV BMAX instantiation runs, and the lm_head
+    /// GEMV/GEMM dispatch -- and bucketing would have to round `n` up to graph
+    /// capacity for all five. Rounding the last one up silently changes the
+    /// measured dispatch policy; masking the others needs an active flag
+    /// threaded through the KV scatter, since padded page-table slots read 0
+    /// and an inactive row would write into physical page 0, corrupting
+    /// whichever request owns it. Sixteen small graphs are cheaper than that
+    /// proof.
+    batch_graphs: Vec<Option<CudaGraph>>,
+    use_batch_graph: bool,
+    /// Wall time spent capturing, and how many shapes were captured.
+    graph_capture_secs: f64,
+    graphs_captured: usize,
     capacity: usize,
     cache_len: usize,
     hidden: usize,
@@ -351,6 +369,12 @@ impl GpuModel {
             use_paged: false,
             batch: None,
             force_decode_gemm: std::env::var("CRUCIBLE_DECODE_GEMM").is_ok(),
+            batch_graphs: Vec::new(),
+            // On by default; CRUCIBLE_BATCH_GRAPH=0 keeps the eager path for
+            // A/B measurement and debugging.
+            use_batch_graph: std::env::var("CRUCIBLE_BATCH_GRAPH").as_deref() != Ok("0"),
+            graph_capture_secs: 0.0,
+            graphs_captured: 0,
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
@@ -434,6 +458,9 @@ impl GpuModel {
             up: self.gpu.alloc(max_batch * self.hidden)?,
             logits: self.gpu.alloc(max_batch * self.cfg.vocab_size)?,
         });
+        // Buffer addresses just changed, so every captured graph is stale.
+        self.invalidate_batch_graphs();
+        self.batch_graphs = (0..max_batch).map(|_| None).collect();
         self.use_paged = true;
         // A captured contiguous-path graph would replay contiguous kernels.
         self.graph = None;
@@ -467,8 +494,87 @@ impl GpuModel {
     }
 
     /// Force the tiled GEMM for batched projections instead of GEMV.
+    ///
+    /// Changes which kernels a step launches, so any captured graph is stale.
     pub fn set_force_decode_gemm(&mut self, on: bool) {
+        if on != self.force_decode_gemm {
+            self.invalidate_batch_graphs();
+        }
         self.force_decode_gemm = on;
+    }
+
+    /// Enable or disable graph replay for the batched decode path.
+    ///
+    /// Disabling does not drop the captured graphs: replay and eager execution
+    /// queue the same kernels, so a graph stays valid while unused. Keeping
+    /// them makes an interleaved eager-vs-graph benchmark measure replay rather
+    /// than repeated capture.
+    pub fn set_batch_graph(&mut self, on: bool) {
+        self.use_batch_graph = on;
+    }
+
+    pub fn batch_graph_enabled(&self) -> bool {
+        self.use_batch_graph
+    }
+
+    /// Drop every captured decode graph.
+    ///
+    /// Called whenever something a graph baked in could have changed: buffer
+    /// addresses (`enable_paging`), or which kernels run (`force_decode_gemm`).
+    /// Dropping the `CudaGraph` releases the exec object, so this is also the
+    /// only place graphs are freed.
+    pub fn invalidate_batch_graphs(&mut self) {
+        for g in self.batch_graphs.iter_mut() {
+            *g = None;
+        }
+        self.graphs_captured = 0;
+        self.graph_capture_secs = 0.0;
+    }
+
+    /// Batch sizes with a captured graph resident.
+    pub fn graphs_captured(&self) -> usize {
+        self.graphs_captured
+    }
+
+    /// Total time spent capturing graphs, which a steady-state throughput
+    /// number must exclude.
+    pub fn graph_capture_secs(&self) -> f64 {
+        self.graph_capture_secs
+    }
+
+    /// Time pure graph replay for an already-captured shape.
+    ///
+    /// Replays back to back with a single sync at the end, so the result is the
+    /// GPU's execution time for the kernel sequence with no metadata upload, no
+    /// device-to-host copy and no host work. This is the floor a full step can
+    /// approach, and it is a better reference than the profiler's "adjusted"
+    /// figure: that one syncs between stages, which suppresses the overlap a
+    /// replay gets for free and so over-estimates kernel time.
+    pub fn time_graph_replay(&mut self, n: usize, iters: usize) -> Result<f64> {
+        if n == 0 || n > self.batch_graphs.len() {
+            bail!("no graph slot for batch {n}");
+        }
+        let Some(g) = &self.batch_graphs[n - 1] else {
+            bail!("no captured graph for batch {n}; run a step at that size first");
+        };
+        // Warm, then time.
+        for _ in 0..5 {
+            self.gpu.graph_launch(g)?;
+        }
+        self.gpu.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.gpu.graph_launch(g)?;
+        }
+        self.gpu.sync()?;
+        Ok(t0.elapsed().as_secs_f64() / iters as f64)
+    }
+
+    /// Kernels launched by one batched decode step, for reporting.
+    pub fn batch_step_kernels(&self) -> usize {
+        // embed + per layer (2 rmsnorm, 3 proj, 2 rope, 2 cache_store,
+        // attention, o_proj, gate, up, swiglu, down) + final rmsnorm + lm_head
+        1 + self.cfg.n_layer * 15 + 2
     }
 
     /// Whether a batched projection of this shape should use GEMV or the
@@ -596,6 +702,51 @@ impl GpuModel {
             self.gpu.write_i32(&mut b.positions, &host_pos)?;
         }
 
+        // Capture-or-replay. Everything above this point is host-to-device
+        // metadata, which must stay outside the graph: memcpy_htod from a
+        // temporary Vec would be captured as a node holding a dangling host
+        // pointer.
+        if self.use_batch_graph && n <= self.batch_graphs.len() {
+            if self.batch_graphs[n - 1].is_none() {
+                let t0 = std::time::Instant::now();
+                self.gpu.begin_capture()?;
+                let queued = self.queue_decode_batch(n);
+                // End capture unconditionally: leaving the stream in capture
+                // mode would break every later launch.
+                let graph = self.gpu.end_capture();
+                queued?;
+                self.batch_graphs[n - 1] = Some(graph?);
+                self.graph_capture_secs += t0.elapsed().as_secs_f64();
+                self.graphs_captured += 1;
+            }
+            let g = self.batch_graphs[n - 1]
+                .as_ref()
+                .expect("just captured above");
+            self.gpu.graph_launch(g)?;
+        } else {
+            self.queue_decode_batch(n)?;
+        }
+
+        let rows = n * cfg.vocab_size;
+        return self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows);
+    }
+
+    /// Queue every kernel of one batched decode step.
+    ///
+    /// Shared by the eager path and by graph capture, so a replay executes
+    /// exactly what eager execution would. Reads all per-request state from
+    /// device buffers whose addresses never change, which is what makes the
+    /// captured graph valid across steps: only the *contents* of those buffers
+    /// differ between replays.
+    ///
+    /// Nothing here depends on which request occupies a slot, only on slot
+    /// position, so the scheduler reordering slots with `swap_remove` cannot
+    /// invalidate a graph.
+    fn queue_decode_batch(&mut self, n: usize) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
+
         {
             let b = self.batch.as_mut().expect("batch scratch");
             self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
@@ -660,9 +811,7 @@ impl GpuModel {
         self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
         Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
                             cfg.vocab_size, d, n, false, force_gemm)?;
-
-        let rows = n * cfg.vocab_size;
-        self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows)
+        Ok(())
     }
 
     pub fn table_stride(&self) -> usize {
