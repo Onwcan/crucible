@@ -222,14 +222,23 @@ impl Runtime {
             tables[i * stride..(i + 1) * stride].copy_from_slice(&t);
         }
 
-        let vocab = self.model.cfg.vocab_size;
-        let logits = self.model.decode_batch(&tokens, &positions, &tables, &lens)?;
+        // Device argmax returns n token ids; the full-logit path returns
+        // n * vocab_size floats for the host to scan. Same compute either way,
+        // and one token id per request is all the scheduler ever needed.
+        let next: Vec<usize> = if self.model.device_argmax() {
+            self.model
+                .decode_batch_tokens(&tokens, &positions, &tables, &lens)?
+        } else {
+            let vocab = self.model.cfg.vocab_size;
+            let logits = self.model.decode_batch(&tokens, &positions, &tables, &lens)?;
+            (0..n)
+                .map(|i| argmax(&logits[i * vocab..(i + 1) * vocab]))
+                .collect()
+        };
 
-        for (i, a) in self.active.iter_mut().enumerate() {
-            let row = &logits[i * vocab..(i + 1) * vocab];
-            let next = argmax(row);
-            a.next_token = next;
-            a.generated.push(next);
+        for (a, tok) in self.active.iter_mut().zip(next) {
+            a.next_token = tok;
+            a.generated.push(tok);
         }
         Ok(n)
     }

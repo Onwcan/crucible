@@ -1163,6 +1163,94 @@ extern "C" __global__ void attention_prefill_f32(
 }
 
 // ===========================================================================
+// Row-wise argmax
+//
+// The scheduler needs one token id per request, but the logits row it scanned
+// to get that is 50304 floats. At batch 16 that is 3.2 MB crossing PCIe every
+// step so the host can find one integer. This does the reduction on the device
+// and returns 4 bytes per request instead.
+//
+// Tie-breaking has to match the host implementation exactly, or generated text
+// diverges on the first tie. The host does:
+//
+//     best = 0; for i: if v[i] > v[best] { best = i }
+//
+// which is a strict comparison, so the LOWEST index wins a tie, and NaN never
+// displaces anything -- it can only win by starting at index 0. Stated without
+// reference to iteration order, that is: the winner is the lowest index i such
+// that no j satisfies v[j] > v[i]. That form is order-independent, which is what
+// makes it safe to evaluate as a tree.
+//
+// Hence the merge rule below: take the challenger if it strictly dominates,
+// otherwise keep whichever index is lower. Equal values and NaN comparisons
+// both fall into "neither dominates", so both resolve by index, matching the
+// host in every case including all-NaN rows.
+// ===========================================================================
+
+#define ARGMAX_NO_INDEX 0x7fffffff
+
+__device__ __forceinline__ void argmax_merge(
+    float& bv, int& bi, const float ov, const int oi)
+{
+    // (ov > bv)            challenger strictly dominates
+    // (!(bv > ov) && ...)  neither dominates -- equal, or a NaN is involved --
+    //                      so the lower index wins, exactly as the host's
+    //                      strict > leaves the earlier element in place.
+    if (ov > bv || (!(bv > ov) && oi < bi)) {
+        bv = ov;
+        bi = oi;
+    }
+}
+
+// One block per row. Grid is (rows), so requests never interact.
+extern "C" __global__ void argmax_rows_f32(
+    const float* __restrict__ x,     // [rows, cols]
+    int* __restrict__ out,           // [rows]
+    const int rows,
+    const int cols)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* r = x + (size_t)row * cols;
+
+    // Identity loses to any real value, and carries the largest index so it
+    // also loses every tie.
+    float bv = NEG_INF;
+    int bi = ARGMAX_NO_INDEX;
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        argmax_merge(bv, bi, r[i], i);
+    }
+
+    #pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffff, bv, off);
+        const int oi = __shfl_down_sync(0xffffffff, bi, off);
+        argmax_merge(bv, bi, ov, oi);
+    }
+
+    __shared__ float warp_val[WARP_SIZE];
+    __shared__ int warp_idx[WARP_SIZE];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+    if (lane == 0) {
+        warp_val[warp] = bv;
+        warp_idx[warp] = bi;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float fv = warp_val[0];
+        int fi = warp_idx[0];
+        for (int w = 1; w < n_warps; ++w) {
+            argmax_merge(fv, fi, warp_val[w], warp_idx[w]);
+        }
+        out[row] = fi;
+    }
+}
+
+// ===========================================================================
 // Batched GEMV for small-M decode
 //
 // Y[batch, rows] = X[batch, cols] @ W[rows, cols]^T, int8 weights with per-row

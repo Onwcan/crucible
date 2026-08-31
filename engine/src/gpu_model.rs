@@ -157,6 +157,11 @@ struct BatchScratch {
     gate: CudaSlice<f32>,
     up: CudaSlice<f32>,
     logits: CudaSlice<f32>,
+    /// One token id per request, produced on the device.
+    ///
+    /// Persistent so it can be written from inside a captured graph and read
+    /// back afterwards.
+    argmax_ids: CudaSlice<i32>,
 }
 
 pub struct GpuModel {
@@ -217,6 +222,8 @@ pub struct GpuModel {
     /// Wall time spent capturing, and how many shapes were captured.
     graph_capture_secs: f64,
     graphs_captured: usize,
+    /// Take token ids from the device instead of copying full logits back.
+    use_device_argmax: bool,
     capacity: usize,
     cache_len: usize,
     hidden: usize,
@@ -375,6 +382,7 @@ impl GpuModel {
             use_batch_graph: std::env::var("CRUCIBLE_BATCH_GRAPH").as_deref() != Ok("0"),
             graph_capture_secs: 0.0,
             graphs_captured: 0,
+            use_device_argmax: std::env::var("CRUCIBLE_DEVICE_ARGMAX").as_deref() != Ok("0"),
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
@@ -457,6 +465,7 @@ impl GpuModel {
             gate: self.gpu.alloc(max_batch * self.hidden)?,
             up: self.gpu.alloc(max_batch * self.hidden)?,
             logits: self.gpu.alloc(max_batch * self.cfg.vocab_size)?,
+            argmax_ids: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
         });
         // Buffer addresses just changed, so every captured graph is stale.
         self.invalidate_batch_graphs();
@@ -517,6 +526,19 @@ impl GpuModel {
         self.use_batch_graph
     }
 
+    /// Whether the scheduler should take token ids from the device.
+    ///
+    /// Off routes it back through full logits plus a host scan, which is the
+    /// A/B control. Validation and evaluation keep using the full-logit path
+    /// regardless -- this only changes what the scheduler asks for.
+    pub fn set_device_argmax(&mut self, on: bool) {
+        self.use_device_argmax = on;
+    }
+
+    pub fn device_argmax(&self) -> bool {
+        self.use_device_argmax
+    }
+
     /// Drop every captured decode graph.
     ///
     /// Called whenever something a graph baked in could have changed: buffer
@@ -567,6 +589,30 @@ impl GpuModel {
             self.gpu.graph_launch(g)?;
         }
         self.gpu.sync()?;
+        Ok(t0.elapsed().as_secs_f64() / iters as f64)
+    }
+
+    /// Time just the device-to-host copy each path performs per step.
+    ///
+    /// Isolates the transfer from everything else, so the saving can be stated
+    /// as a measurement rather than inferred from byte counts.
+    pub fn time_d2h(&mut self, n: usize, device_argmax: bool, iters: usize) -> Result<f64> {
+        let vocab = self.cfg.vocab_size;
+        for _ in 0..5 {
+            if device_argmax {
+                self.gpu.to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
+            } else {
+                self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            if device_argmax {
+                self.gpu.to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
+            } else {
+                self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
+            }
+        }
         Ok(t0.elapsed().as_secs_f64() / iters as f64)
     }
 
@@ -634,29 +680,21 @@ impl GpuModel {
         }
     }
 
-    /// One decode step for `n` requests at once.
+    /// Validate this step's metadata and upload it.
     ///
-    /// Every per-request quantity arrives as an array: the token to embed, the
-    /// position to rotate at, the page table to write into and attend over, and
-    /// the sequence length that bounds the attention loop. Nothing is padded to
-    /// the longest sequence -- a 7-position request costs a 7-position
-    /// attention loop even when batched with a 511-position one.
-    ///
-    /// Returns `[n][vocab_size]` logits, one row per request, in the order
-    /// given.
-    pub fn decode_batch(
+    /// Must run outside graph capture: these are host-to-device copies from
+    /// temporary buffers, and capturing one would freeze a host pointer that is
+    /// gone by the next replay.
+    fn upload_batch(
         &mut self,
         tokens: &[usize],
         positions: &[usize],
         tables: &[i32],
         lens: &[i32],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         let n = tokens.len();
         if !self.use_paged {
-            bail!("decode_batch requires paging; call enable_paging first");
-        }
-        if n == 0 {
-            return Ok(Vec::new());
+            bail!("batched decode requires paging; call enable_paging first");
         }
         if n > self.max_batch {
             bail!("batch of {n} exceeds max_batch {}", self.max_batch);
@@ -676,12 +714,8 @@ impl GpuModel {
             }
         }
 
-        let cfg = self.cfg.clone();
-        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
-        let kv_dim = n_kv * hd;
-
-        // Upload this step's metadata. Slots past `n` keep a length of 0, which
-        // the attention kernel treats as inactive.
+        // Slots past `n` keep a length of 0, which the attention kernel treats
+        // as inactive.
         let mut host_tok = vec![0i32; self.max_batch];
         let mut host_pos = vec![0i32; self.max_batch];
         let mut host_len = vec![0i32; self.max_batch];
@@ -691,18 +725,78 @@ impl GpuModel {
             host_len[i] = lens[i];
         }
         self.host_tables.copy_from_slice(tables);
-        {
-            let ht = self.host_tables.clone();
-            self.gpu.write_i32(&mut self.page_tables, &ht)?;
-            self.gpu.write_i32(&mut self.seq_lens, &host_len)?;
-        }
-        {
-            let b = self.batch.as_mut().expect("paging allocates batch scratch");
-            self.gpu.write_i32(&mut b.tokens, &host_tok)?;
-            self.gpu.write_i32(&mut b.positions, &host_pos)?;
-        }
+        let ht = self.host_tables.clone();
+        self.gpu.write_i32(&mut self.page_tables, &ht)?;
+        self.gpu.write_i32(&mut self.seq_lens, &host_len)?;
+        let b = self.batch.as_mut().expect("paging allocates batch scratch");
+        self.gpu.write_i32(&mut b.tokens, &host_tok)?;
+        self.gpu.write_i32(&mut b.positions, &host_pos)?;
+        Ok(())
+    }
 
-        // Capture-or-replay. Everything above this point is host-to-device
+    /// One decode step for `n` requests at once.
+    ///
+    /// Every per-request quantity arrives as an array: the token to embed, the
+    /// position to rotate at, the page table to write into and attend over, and
+    /// the sequence length that bounds the attention loop. Nothing is padded to
+    /// the longest sequence -- a 7-position request costs a 7-position
+    /// attention loop even when batched with a 511-position one.
+    ///
+    /// Returns `[n][vocab_size]` logits, one row per request, in the order
+    /// given.
+    pub fn decode_batch(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        self.upload_batch(tokens, positions, tables, lens)?;
+        self.run_decode_batch(n)?;
+        let rows = n * self.cfg.vocab_size;
+        return self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows);
+    }
+
+    /// One decode step returning only the argmax token id per request.
+    ///
+    /// The scheduler's path. Identical compute to `decode_batch` -- same graph,
+    /// same kernels -- differing only in what crosses PCIe afterwards: `n * 4`
+    /// bytes instead of `n * vocab_size * 4`.
+    pub fn decode_batch_tokens(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+    ) -> Result<Vec<usize>> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        self.upload_batch(tokens, positions, tables, lens)?;
+        self.run_decode_batch(n)?;
+        let ids = self
+            .gpu
+            .to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
+        Ok(ids.into_iter().map(|v| v as usize).collect())
+    }
+
+    /// Bytes copied device-to-host by one step on each path.
+    pub fn d2h_bytes(&self, n: usize, device_argmax: bool) -> usize {
+        if device_argmax {
+            n * std::mem::size_of::<i32>()
+        } else {
+            n * self.cfg.vocab_size * std::mem::size_of::<f32>()
+        }
+    }
+
+    /// Capture-or-replay the decode graph for `n` active requests.
+    fn run_decode_batch(&mut self, n: usize) -> Result<()> {
+        // Capture-or-replay. Everything before this is host-to-device
         // metadata, which must stay outside the graph: memcpy_htod from a
         // temporary Vec would be captured as a node holding a dangling host
         // pointer.
@@ -726,9 +820,7 @@ impl GpuModel {
         } else {
             self.queue_decode_batch(n)?;
         }
-
-        let rows = n * cfg.vocab_size;
-        return self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows);
+        Ok(())
     }
 
     /// Queue every kernel of one batched decode step.
@@ -811,6 +903,11 @@ impl GpuModel {
         self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
         Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
                             cfg.vocab_size, d, n, false, force_gemm)?;
+        // Inside the graph, so the token ids are ready the moment replay ends
+        // and the step's only transfer is n * 4 bytes. Runs unconditionally:
+        // the full-logit path ignores the result, and a single graph per batch
+        // size then serves both paths.
+        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, n, cfg.vocab_size)?;
         Ok(())
     }
 

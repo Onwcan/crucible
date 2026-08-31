@@ -890,7 +890,22 @@ fn run_shape_sequence(
             pos.push(p);
             lens.push((p + 1) as i32);
         }
-        out.push(model.decode_batch(&toks, &pos, &tables, &lens)?);
+        // Both paths run the same graph; compare what each returns. The
+        // device ids must equal a host scan of the full logits, or generated
+        // text would diverge the first time two logits tie.
+        let ids = model.decode_batch_tokens(&toks, &pos, &tables, &lens)?;
+        let logits = model.decode_batch(&toks, &pos, &tables, &lens)?;
+        let n_rows = ids.len();
+        for i in 0..n_rows {
+            let host = argmax(&logits[i * vocab..(i + 1) * vocab]);
+            if host != ids[i] {
+                anyhow::bail!(
+                    "step {step} row {i}: device argmax {} != host argmax {host}",
+                    ids[i]
+                );
+            }
+        }
+        out.push(logits);
     }
 
     for mut sq in seqs {
@@ -1291,9 +1306,9 @@ fn gpu_serve_bench(
              model.page_pool().page_bytes() * 2 / PAGE_TOKENS);
     println!();
 
-    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>6}",
-                         "batch", "eager agg", "graph agg", "graph/req",
-                         "step ms", "speedup", "spread", "pages");
+    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>10}",
+                         "batch", "logits agg", "argmax agg", "argmax/req",
+                         "step ms", "speedup", "spread", "D2H/step");
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -1301,9 +1316,11 @@ fn gpu_serve_bench(
     let mem_before = gpu_mem_used_mb();
     let mut step_ms: Vec<f64> = Vec::new();
     for &n in &sizes {
-        // Eager and graph trials are interleaved, not run in blocks: measuring
-        // one path fully and then the other lets thermal drift masquerade as a
-        // kernel difference, which this repo has already been caught by once.
+        // Full-logit and device-argmax trials are interleaved, not run in
+        // blocks: measuring one path fully and then the other lets thermal
+        // drift masquerade as a real difference, which this repo has been
+        // caught by once. Graph replay is on for both, so the only variable is
+        // what crosses PCIe.
         //
         // A warm-up round runs first at each size so the graph for that shape
         // is already captured; capture cost is reported separately rather than
@@ -1312,8 +1329,8 @@ fn gpu_serve_bench(
         let mut pages_used = 0usize;
         let mut wasted = 0usize;
         for warm in 0..(trials + 1) {
-            for (slot, eager) in [(0usize, true), (1usize, false)] {
-                rt.model_mut().set_batch_graph(!eager);
+            for (slot, dev_argmax) in [(0usize, false), (1usize, true)] {
+                rt.model_mut().set_device_argmax(dev_argmax);
                 for i in 0..n {
                     rt.submit(Request {
                         id: i as u64,
@@ -1353,18 +1370,20 @@ fn gpu_serve_bench(
             (hi - lo) / v[v.len() / 2] * 100.0
         };
         let sp = spread(&secs[0]).max(spread(&secs[1]));
-        let t_eager = med(&mut secs[0]);
-        let t_graph = med(&mut secs[1]);
+        let t_logits = med(&mut secs[0]);
+        let t_argmax = med(&mut secs[1]);
         let decode_steps = (steps - 1) as f64;
-        let agg_eager = n as f64 * decode_steps / t_eager;
-        let agg_graph = n as f64 * decode_steps / t_graph;
-        let per_graph = decode_steps / t_graph;
-        let step = t_graph / decode_steps * 1000.0;
-        println!("{n:>6}  {agg_eager:>9.0} t/s  {agg_graph:>9.0} t/s  {per_graph:>7.0} t/s  {step:>9.2}  {:>7.2}x  {sp:>6.1}%  {pages_used:>6}",
-                 agg_graph / agg_eager);
+        let agg_logits = n as f64 * decode_steps / t_logits;
+        let agg_argmax = n as f64 * decode_steps / t_argmax;
+        let per_argmax = decode_steps / t_argmax;
+        let step = t_argmax / decode_steps * 1000.0;
+        let bytes = rt.model().d2h_bytes(n, true);
+        println!("{n:>6}  {agg_logits:>9.0} t/s  {agg_argmax:>9.0} t/s  {per_argmax:>7.0} t/s  {step:>9.2}  {:>7.2}x  {sp:>6.1}%  {bytes:>8} B",
+                 agg_argmax / agg_logits);
         step_ms.push(step);
+        let _ = (pages_used, wasted);
     }
-    rt.model_mut().set_batch_graph(true);
+    rt.model_mut().set_device_argmax(true);
     let mem_after = gpu_mem_used_mb();
 
     // Host-side cost per step, which graph replay does not touch: the
@@ -1391,19 +1410,18 @@ fn gpu_serve_bench(
     // Pure replay: kernels only, no upload, no copy-back, no host work. The
     // gap to the measured step is everything graph replay cannot remove.
     println!();
-    println!("{:>6}  {:>11}  {:>11}  {:>12}  {:>9}",
-             "batch", "replay ms", "step ms", "non-kernel", "kernel %");
+    println!("{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>9}",
+             "batch", "replay ms", "ids D2H", "logits D2H", "host/sched", "step ms");
     for (i, &n) in sizes.iter().enumerate() {
-        match rt.model_mut().time_graph_replay(n, 200) {
-            Ok(replay) => {
-                let step = step_ms[i] / 1e3;
-                println!("{n:>6}  {:>11.3}  {:>11.3}  {:>12.3}  {:>8.1}%",
-                         replay * 1e3, step * 1e3, (step - replay) * 1e3,
-                         replay / step * 100.0);
-            }
-            Err(e) => println!("{n:>6}  {e}"),
-        }
+        let replay = rt.model_mut().time_graph_replay(n, 200).unwrap_or(0.0);
+        let d_ids = rt.model_mut().time_d2h(n, true, 200).unwrap_or(0.0);
+        let d_log = rt.model_mut().time_d2h(n, false, 50).unwrap_or(0.0);
+        let step = step_ms[i] / 1e3;
+        println!("{n:>6}  {:>10.3}  {:>10.3}  {:>10.3}  {:>10.3}  {:>9.3}",
+                 replay * 1e3, d_ids * 1e3, d_log * 1e3,
+                 (step - replay - d_ids).max(0.0) * 1e3, step * 1e3);
     }
+    println!("(logits D2H is what the old path paid; it is not in the step total)");
 
     println!();
     println!("graphs captured      {}", rt.model().graphs_captured());
@@ -1412,6 +1430,13 @@ fn gpu_serve_bench(
              rt.model().graph_capture_secs() * 1e3
                  / rt.model().graphs_captured().max(1) as f64);
     println!("kernels per step     {}", rt.model().batch_step_kernels());
+    println!();
+    println!("{:>6}  {:>14}  {:>14}  {:>10}", "batch", "logits D2H", "ids D2H", "reduction");
+    for &n in &sizes {
+        let a = rt.model().d2h_bytes(n, false);
+        let b = rt.model().d2h_bytes(n, true);
+        println!("{n:>6}  {:>12} B  {:>12} B  {:>9.0}x", a, b, a as f64 / b as f64);
+    }
     match (mem_before, mem_after) {
         (Some(a), Some(b)) => println!("VRAM used            {a} MB -> {b} MB (graph storage {} MB)", b - a),
         _ => println!("VRAM used            unavailable"),

@@ -9,8 +9,9 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > tensor-core GEMM — 2.4x the scalar kernel it replaced. Remaining gap to
 > llama.cpp on prefill is 2.8x, down from 7.2x. A paged KV cache and a
 > continuous-batching scheduler now keep multiple requests resident and decode
-> them together, graph-replayed: **5,764 tok/s aggregate at batch 16** and
-> 1,492 tok/s at batch 1, against ~1,630 for one single-request stream.
+> them together, graph-replayed: **8,366 tok/s aggregate at batch 16** and
+> 1,618 tok/s at batch 1, against ~1,640 for one single-request stream.
+> 93-98% of a decode step is now GPU kernel execution.
 
 ## Why Blackwell specifically
 
@@ -1377,7 +1378,66 @@ step than the 40% it implied. The cause is methodological: the profiler syncs
 between stages, which suppresses the kernel overlap a replay gets for free.
 "Adjusted" is an upper bound on kernel time, not a measurement of it.
 
-### What limits the runtime now
+### Device-side argmax
+
+The scheduler needs one token id per request. It was getting that by copying the
+full logits row back and scanning it on the host -- 3.2 MB per step at batch 16
+to find sixteen integers.
+
+The kernel is one block per row, warp-shuffle reduction over (value, index)
+pairs. What matters is the tie-break, because the host's rule is
+`if v[i] > v[best]`: strict, so the **lowest** index wins a tie, and NaN never
+displaces anything -- it can only win by starting at index 0. Stated without
+reference to iteration order that is *"the winner is the lowest index i such that
+no j satisfies v[j] > v[i]"*, which is order-independent and therefore safe to
+evaluate as a tree. The merge takes the challenger if it strictly dominates and
+otherwise keeps the lower index; equal values and NaN comparisons both fall into
+"neither dominates" and resolve by index. `gpu-validate` checks all nine cases
+against the host rule, including exact ties, max at index 0 and at 50303, and
+NaN at index 0 / mid-row / everywhere.
+
+The kernel is captured as the last node of the decode graph, so token ids are
+ready the moment replay ends. It runs unconditionally and the full-logit path
+ignores it, which keeps one graph per batch size serving both paths.
+
+| batch | logits D2H | ids D2H | reduction |
+|---:|---:|---:|---:|
+| 1 | 201,216 B | 4 B | 50,304x |
+| 4 | 804,864 B | 16 B | 50,304x |
+| 16 | 3,219,456 B | 64 B | 50,304x |
+
+Full-logit and device-argmax trials interleaved, graph replay on for both:
+
+| batch | full logits | device argmax | speedup | per-request | step ms |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1,481 t/s | **1,618** | 1.09x | 1,618 | 0.62 |
+| 2 | 2,271 t/s | **2,544** | 1.12x | 1,272 | 0.79 |
+| 4 | 2,644 t/s | **3,056** | 1.16x | 764 | 1.31 |
+| 8 | 4,249 t/s | **5,268** | 1.24x | 659 | 1.52 |
+| 16 | 6,020 t/s | **8,366** | 1.39x | 523 | 1.91 |
+
+The gain scales with batch because the transfer it removes does.
+`CRUCIBLE_DEVICE_ARGMAX=0` restores the full-logit path, which is what
+`gpu-logits`, `gpu-eval` and `gpu-paged` still use -- retrieving complete logits
+was never removed.
+
+### The runtime is now kernel-bound
+
+| batch | graph replay | ids D2H | host + scheduler | step | kernel share |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.576 ms | 0.023 ms | 0.019 ms | 0.618 ms | **93.2%** |
+| 4 | 1.257 ms | 0.023 ms | 0.029 ms | 1.309 ms | 96.0% |
+| 16 | 1.882 ms | 0.026 ms | 0.005 ms | 1.912 ms | **98.4%** |
+
+The token-id copy is 0.022-0.026 ms regardless of batch -- latency-bound at 64
+bytes, not bandwidth-bound. Host and scheduler work is now under 0.04 ms.
+
+There is no longer a meaningful non-kernel cost to remove, which is the reason
+to stop optimising the runtime here rather than to look for the next thing.
+Going further would mean making the transformer itself cheaper, and that is a
+different project from making the runtime efficient.
+
+### What limited the runtime before
 
 The non-kernel column. Host-side argmax is measured at 0.015 ms per
 request-step -- 2.3% of a batch-1 step, 8.4% at batch 16 -- so it is real but
@@ -1639,8 +1699,9 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Batched GEMV — 2.4x to 4.0x end-to-end; aggregate 1,916 -> 4,587 tok/s
 - [x] CUDA graphs for the batched path — 1.22x to 2.46x; 70-84% of the step is
       now pure kernel execution
-- [ ] Device-side argmax — 3.2 MB of logits per step at batch 16 crosses PCIe
-      so the host can scan for one token id
+- [x] Device-side argmax — 50,304x less D2H; 1.09x to 1.39x end-to-end
+- [ ] HTTP + streaming service layer
+- [ ] Ratatui TUI client
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

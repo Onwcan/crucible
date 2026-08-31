@@ -129,6 +129,7 @@ pub struct Gpu {
     cache_store_paged: CudaFunction,
     /// Batched GEMV, indexed by log2 of the instantiated BMAX.
     gemv_batch_i8: [CudaFunction; 5],
+    argmax_rows: CudaFunction,
     rope_rows: CudaFunction,
     cache_store_rows_paged: CudaFunction,
     attention_decode_paged: CudaFunction,
@@ -229,6 +230,7 @@ impl Gpu {
             cache_store: cu(module.load_function("cache_store_f32"))?,
             attention_prefill: cu(module.load_function("attention_prefill_f32"))?,
             cache_store_paged: cu(module.load_function("cache_store_paged_f32"))?,
+            argmax_rows: cu(module.load_function("argmax_rows_f32"))?,
             gemv_batch_i8: [
                 cu(module.load_function("gemv_batch_i8_b1"))?,
                 cu(module.load_function("gemv_batch_i8_b2"))?,
@@ -256,6 +258,36 @@ impl Gpu {
 
     pub fn alloc(&self, n: usize) -> Result<CudaSlice<f32>> {
         cu(self.stream.alloc_zeros::<f32>(n))
+    }
+
+    /// Row-wise argmax on the device: `[rows, cols]` floats to `[rows]` ids.
+    ///
+    /// Ties resolve to the lowest index, matching the host implementation the
+    /// scheduler used before.
+    pub fn argmax_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<i32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        const THREADS: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (r, c) = (rows as i32, cols as i32);
+        let mut b = self.stream.launch_builder(&self.argmax_rows);
+        b.arg(x).arg(out).arg(&r).arg(&c);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Copy back the first `n` token ids.
+    pub fn to_host_i32_n(&self, dev: &CudaSlice<i32>, n: usize) -> Result<Vec<i32>> {
+        let view = dev.slice(0..n);
+        cu(self.stream.memcpy_dtov(&view))
     }
 
     pub fn to_host(&self, dev: &CudaSlice<f32>) -> Result<Vec<f32>> {
@@ -1370,6 +1402,102 @@ pub fn validate() -> Result<()> {
     gpu.rope(&mut d_v, &d_cos, &d_sin, n_heads, head_dim, pos)?;
     gpu.sync()?;
     println!("rope        max rel diff {:.3e}", max_rel_diff(&cpu_v, &gpu.to_host(&d_v)?));
+
+    // argmax, against the exact host rule the scheduler used before.
+    //
+    // Tie-breaking and NaN handling are the whole point: a mismatch here shows
+    // up as generated text that diverges on the first tie, which is far harder
+    // to trace back than a wrong number.
+    fn host_argmax(v: &[f32]) -> usize {
+        let mut best = 0;
+        for (i, x) in v.iter().enumerate() {
+            if *x > v[best] {
+                best = i;
+            }
+        }
+        best
+    }
+
+    let nan = f32::NAN;
+    let vocab = 50304usize;
+    let mut dense: Vec<f32> = (0..vocab)
+        .map(|i| ((i as f32) * 0.7391).sin() * 3.0 - 1.0)
+        .collect();
+    dense[31337] = 9.0; // unique maximum, deep in the row
+
+    let mut tied = vec![-2.0f32; vocab];
+    tied[100] = 5.0;
+    tied[7000] = 5.0; // exact tie: the lower index must win
+
+    let mut first = vec![-3.0f32; vocab];
+    first[0] = 1.0;
+
+    let mut last = vec![-3.0f32; vocab];
+    last[vocab - 1] = 1.0;
+
+    let mut close = vec![0.0f32; vocab];
+    close[4242] = 1.000_000_1;
+    close[4243] = 1.000_000_0;
+
+    let all_neg: Vec<f32> = (0..vocab).map(|i| -1.0 - (i as f32) * 1e-4).collect();
+
+    let mut nan_first = vec![1.0f32; vocab];
+    nan_first[0] = nan; // host keeps index 0: nothing is > NaN
+
+    let mut nan_mid = vec![1.0f32; vocab];
+    nan_mid[500] = nan;
+    nan_mid[900] = 4.0; // NaN must not displace the real maximum
+
+    let all_nan = vec![nan; vocab];
+
+    let cases: [(&str, &Vec<f32>); 8] = [
+        ("dense", &dense),
+        ("exact tie", &tied),
+        ("max at 0", &first),
+        ("max at last", &last),
+        ("close top-2", &close),
+        ("all negative", &all_neg),
+        ("NaN at 0", &nan_first),
+        ("NaN mid-row", &nan_mid),
+    ];
+
+    let rows = cases.len() + 1;
+    let mut flat: Vec<f32> = Vec::with_capacity(rows * vocab);
+    for (_, v) in cases.iter() {
+        flat.extend_from_slice(v);
+    }
+    flat.extend_from_slice(&all_nan);
+
+    let d_rows = gpu.to_device(&flat)?;
+    let mut d_ids = gpu.to_device_i32(&vec![0i32; rows])?;
+    gpu.argmax_rows(&d_rows, &mut d_ids, rows, vocab)?;
+    gpu.sync()?;
+    let got = gpu.to_host_i32_n(&d_ids, rows)?;
+
+    println!();
+    println!("{:<14} {:>10} {:>10} {:>8}", "argmax case", "host", "device", "match");
+    let mut argmax_bad = 0usize;
+    for (i, (name, v)) in cases.iter().enumerate() {
+        let want = host_argmax(v);
+        let ok = got[i] as usize == want;
+        if !ok {
+            argmax_bad += 1;
+        }
+        println!("{name:<14} {want:>10} {:>10} {:>8}", got[i], if ok { "ok" } else { "MISMATCH" });
+    }
+    {
+        let want = host_argmax(&all_nan);
+        let ok = got[rows - 1] as usize == want;
+        if !ok {
+            argmax_bad += 1;
+        }
+        println!("{:<14} {want:>10} {:>10} {:>8}", "all NaN", got[rows - 1],
+                 if ok { "ok" } else { "MISMATCH" });
+    }
+    if argmax_bad > 0 {
+        anyhow::bail!("device argmax disagreed with the host rule in {argmax_bad} case(s)");
+    }
+    println!();
 
     // gemm, both paths, against the same CPU reference.
     //
