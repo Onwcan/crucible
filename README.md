@@ -11,7 +11,8 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > continuous-batching scheduler now keep multiple requests resident and decode
 > them together, graph-replayed: **8,366 tok/s aggregate at batch 16** and
 > 1,618 tok/s at batch 1, against ~1,640 for one single-request stream.
-> 93-98% of a decode step is now GPU kernel execution.
+> 93-98% of a decode step is now GPU kernel execution. An HTTP service with
+> SSE streaming exposes it: `llm-engine serve`.
 
 ## Why Blackwell specifically
 
@@ -1497,6 +1498,134 @@ unmeasured kernel would be the wrong order.
 `generate`, `gpu-logits` and `gpu-eval` still use the contiguous cache and graph
 replay, and their numbers are identical to before.
 
+## HTTP inference service
+
+```bash
+llm-engine serve export/120m --tokenizer export/gpt2.tok --port 8080 --max-batch 16
+```
+
+Binds `127.0.0.1` unless `--host` says otherwise. There is no authentication, so
+reaching the network has to be a deliberate act rather than a default.
+
+### Concurrency architecture
+
+```text
+axum handlers  --jobs-->  inference thread  --tokens-->  per-request channel
+                                 |
+                         Runtime (scheduler, paged KV, graphs)
+```
+
+The GPU has exactly one owner: a dedicated OS thread. Handlers never touch it.
+A dedicated thread rather than a Tokio task for two reasons -- the CUDA context
+and its buffers are not `Sync`, and a decode step is a blocking GPU call that
+would stall an async worker for its whole duration. No mutex is ever held across
+a GPU launch.
+
+That boundary is what keeps batching intact. Had each handler called the model
+behind a lock, concurrent requests would serialise and the batching engine would
+have been bypassed by the very layer meant to feed it. Instead every in-flight
+request goes to one scheduler, which decides how they share a step.
+
+### Endpoints
+
+| method | path | purpose |
+|---|---|---|
+| GET | `/health` | model, device, max batch, context, sampling mode |
+| GET | `/metrics` | active/queued/completed, KV pages, batch size, uptime |
+| POST | `/v1/generate` | non-streaming; same scheduler, waits for completion |
+| POST | `/v1/generate/stream` | SSE token stream |
+
+```bash
+curl -s localhost:8080/v1/generate   -H 'content-type: application/json'   -d '{"prompt":"The capital of France is","max_tokens":32}'
+```
+
+```bash
+curl -N localhost:8080/v1/generate/stream   -H 'content-type: application/json'   -d '{"prompt":"The capital of France is","max_tokens":32}'
+```
+
+```text
+event: token
+data: {"token_id":6342,"text":" Paris"}
+
+event: done
+data: {"finish_reason":"length","tokens_generated":32,"text":""}
+```
+
+Sampling is greedy argmax, and `/health` says so rather than leaving it implied:
+the schema has no temperature field because the engine has no sampler, not
+because the field was forgotten.
+
+### Streaming text is not per-token decoding
+
+A GPT-2 token is a byte string, not a character. Multi-byte UTF-8 is routinely
+split across tokens and an emoji spans three or four, so decoding each token
+alone would emit replacement characters mid-word. `IncrementalDecoder` buffers
+bytes until they form something valid, and reproduces `decode`'s lossy handling
+of genuinely invalid sequences so a stream cannot diverge from a batch decode.
+Tested by feeding a 4-byte emoji one byte at a time, and end to end by checking
+the concatenated stream equals the non-streaming response exactly.
+
+### Cancellation
+
+A client that disconnects drops its channel. The inference thread notices before
+its next step, withdraws the request, and hands its KV pages straight back --
+an abandoned generation must not keep occupying the batch until `max_tokens`.
+
+Cancellation takes effect **between steps, never inside one**: a step is a single
+fused CUDA graph launch and cannot be interrupted partway. In practice that is
+one step of latency.
+
+### Backpressure
+
+`max_queue` bounds the waiting queue and `max_batch` the resident set; over
+either, the server answers `429` immediately rather than parking the connection.
+Prompt length, `max_tokens` and their sum against the model context are all
+validated before anything is submitted. The page allocator remains the final
+authority on memory -- these limits stop HTTP turning into unbounded allocation
+before it gets there.
+
+### Service benchmark
+
+Heterogeneous prompts, 128 tokens each, 3 trials, 166 W:
+
+| conc | e2e tok/s | steady tok/s | per-request | TTFT med | TTFT p95 | gap med | gap p95 | batch |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1,439 | 1,540 | 1,439 | 7.2 ms | 7.2 ms | 0.65 ms | 0.77 ms | 1.0 |
+| 2 | 2,522 | 2,887 | 1,261 | 10.8 ms | 14.3 ms | 0.69 ms | 0.84 ms | 2.0 |
+| 4 | 3,891 | 4,875 | 973 | 27.7 ms | 27.9 ms | 0.82 ms | 0.97 ms | 4.0 |
+| 8 | 5,410 | 7,506 | 676 | 54.3 ms | 54.8 ms | 1.07 ms | 1.27 ms | 8.0 |
+| 16 | 6,975 | 10,875 | 436 | 106.4 ms | 106.9 ms | 1.47 ms | 1.88 ms | 16.0 |
+
+Two throughput columns because they answer different questions. `e2e` spans the
+whole overlapped window including prefill, admission ramp-up and drain -- what a
+client experiences. `steady` is `n / median inter-token gap`, excluding those,
+and is the number comparable to a decode-only runtime benchmark. Reporting only
+one would either flatter the service or hide its real cost.
+
+The `batch` column is the proof of continuous batching over HTTP: mean tokens
+per decode step is exactly 1.0, 2.0, 4.0, 8.0 and 16.0. Every step carried every
+in-flight request. Four requests merely *completing* would have proved nothing.
+
+**HTTP overhead is about 5%**, measured at concurrency 1 where the comparison is
+like-for-like: 0.65 ms per token through HTTP and SSE against a 0.62 ms direct
+runtime step. The higher-concurrency `steady` figures exceed the direct-runtime
+table (10,875 against 8,366 at 16) and that is *not* the service being faster
+than the engine it wraps -- this benchmark uses short natural prompts while the
+runtime benchmark cycled 32/128/256/512-token prompts, so attention is cheaper
+here. Absolute cross-benchmark comparison at those sizes is not valid.
+
+TTFT grows with concurrency because admission prefills each prompt serially, so
+the sixteenth request waits behind fifteen prefills.
+
+### Known limitations
+
+- Greedy only. No temperature, top-p or beam search.
+- Cancellation is effective at the next step boundary, not immediately.
+- Admission prefills one request per step, so TTFT scales with queue depth.
+- No auth, TLS, or multi-model serving; local development scope.
+- `/metrics` counters are cumulative since startup, which is why the benchmark
+  computes per-run averages from deltas rather than reading them directly.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -1700,7 +1829,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] CUDA graphs for the batched path — 1.22x to 2.46x; 70-84% of the step is
       now pure kernel execution
 - [x] Device-side argmax — 50,304x less D2H; 1.09x to 1.39x end-to-end
-- [ ] HTTP + streaming service layer
+- [x] HTTP inference service — axum, one GPU owner, bounded queues
+- [x] Token streaming over SSE, with cancellation and page reclaim
 - [ ] Ratatui TUI client
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)

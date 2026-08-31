@@ -157,6 +157,84 @@ impl Tokenizer {
     }
 }
 
+/// Turns a stream of token ids into a stream of text fragments.
+///
+/// A GPT-2 token is a byte string, not a character: multi-byte UTF-8 is
+/// routinely split across tokens, and emojis span three or four. Decoding each
+/// token on its own would send replacement characters mid-word, so bytes are
+/// buffered until they form something valid.
+///
+/// The contract is that concatenating every `push` result and then `finish`
+/// gives exactly `Tokenizer::decode` over the same ids -- including its lossy
+/// handling of genuinely invalid bytes, which is why an unmappable sequence is
+/// replaced here too rather than held forever.
+#[derive(Debug, Default)]
+pub struct IncrementalDecoder {
+    buf: Vec<u8>,
+}
+
+impl IncrementalDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one token's bytes, returning whatever text is now complete.
+    ///
+    /// Returns an empty string when the token only extended a partial
+    /// character, which is normal and not an error.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.buf.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.buf.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // SAFETY-free path: valid_up_to guarantees this prefix
+                        // is well-formed.
+                        out.push_str(std::str::from_utf8(&self.buf[..valid]).unwrap());
+                    }
+                    match e.error_len() {
+                        // A truncated sequence. Keep it and wait for the rest.
+                        None => {
+                            self.buf.drain(..valid);
+                            return out;
+                        }
+                        // Genuinely invalid bytes: emit the same replacement
+                        // character from_utf8_lossy would, then carry on.
+                        Some(bad) => {
+                            out.push('\u{FFFD}');
+                            self.buf.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flush anything left over at end of stream.
+    ///
+    /// Trailing bytes here are an incomplete character the model stopped
+    /// mid-way through, which `decode` would also render lossily.
+    pub fn finish(&mut self) -> String {
+        if self.buf.is_empty() {
+            return String::new();
+        }
+        let out = String::from_utf8_lossy(&self.buf).into_owned();
+        self.buf.clear();
+        out
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +249,66 @@ mod tests {
     const PROBE_IDS: &[u32] = &[
         464, 2159, 318, 257, 3800, 11, 290, 5433, 16326, 2513, 4291, 340, 13, 198,
     ];
+
+    #[test]
+    fn incremental_decode_matches_whole_decode_on_split_utf8() {
+        // A 4-byte emoji delivered one byte at a time: every prefix is
+        // incomplete, so nothing may be emitted until the last byte.
+        let emoji = "\u{1F600}".as_bytes().to_vec();
+        assert_eq!(emoji.len(), 4);
+        let mut d = IncrementalDecoder::new();
+        let mut out = String::new();
+        for (i, b) in emoji.iter().enumerate() {
+            let piece = d.push(&[*b]);
+            if i < 3 {
+                assert!(piece.is_empty(), "emitted a partial character at byte {i}");
+            }
+            out.push_str(&piece);
+        }
+        out.push_str(&d.finish());
+        assert_eq!(out, "\u{1F600}");
+        assert_eq!(d.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn incremental_decode_handles_mixed_ascii_and_multibyte() {
+        let text = "hi \u{00e9}t\u{00e9} \u{4e16}\u{754c} \u{1F680} end";
+        let bytes = text.as_bytes();
+        let mut d = IncrementalDecoder::new();
+        let mut out = String::new();
+        // Chunk sizes that deliberately straddle character boundaries.
+        for chunk in bytes.chunks(3) {
+            out.push_str(&d.push(chunk));
+        }
+        out.push_str(&d.finish());
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn incremental_decode_matches_lossy_on_invalid_bytes() {
+        // 0xFF never appears in valid UTF-8. Streaming must produce exactly
+        // what from_utf8_lossy produces for the same byte sequence.
+        let bytes: Vec<u8> = vec![b'a', 0xFF, b'b'];
+        let mut d = IncrementalDecoder::new();
+        let mut out = String::new();
+        for b in &bytes {
+            out.push_str(&d.push(&[*b]));
+        }
+        out.push_str(&d.finish());
+        assert_eq!(out, String::from_utf8_lossy(&bytes));
+    }
+
+    #[test]
+    fn incremental_decode_flushes_a_truncated_tail_lossily() {
+        // Stream ends mid-character; decode would render it lossily too.
+        let bytes = vec![b'x', 0xE4, 0xB8];
+        let mut d = IncrementalDecoder::new();
+        let mut out = String::new();
+        out.push_str(&d.push(&bytes));
+        assert_eq!(out, "x");
+        out.push_str(&d.finish());
+        assert_eq!(out, String::from_utf8_lossy(&bytes));
+    }
 
     fn load() -> Option<Tokenizer> {
         // Skip rather than fail when the vocabulary has not been exported.

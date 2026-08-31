@@ -123,6 +123,34 @@ enum Command {
     /// faster kernel that computes something else is not a result.
     /// Eager versus graph replay on identical inputs, across graph-cache
     /// transitions and slot permutations.
+    /// Run the HTTP inference service.
+    ///
+    /// Binds loopback unless `--host` says otherwise: this service has no
+    /// authentication, so reaching the network must be a deliberate act.
+    #[cfg(feature = "cuda")]
+    Serve {
+        model: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value_t = 16)]
+        max_batch: usize,
+        /// Requests admitted to the waiting queue before 429.
+        #[arg(long, default_value_t = 64)]
+        max_queue: usize,
+        #[arg(long, default_value_t = 512)]
+        max_prompt_tokens: usize,
+        #[arg(long, default_value_t = 512)]
+        max_new_tokens: usize,
+        /// KV pages. Defaults to enough for max_batch full-context sequences.
+        #[arg(long)]
+        kv_pages: Option<usize>,
+    },
     #[cfg(feature = "cuda")]
     GpuGraphCheck {
         model: PathBuf,
@@ -256,6 +284,44 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        #[cfg(feature = "cuda")]
+        Command::Serve {
+            model,
+            tokenizer,
+            host,
+            port,
+            quant,
+            max_batch,
+            max_queue,
+            max_prompt_tokens,
+            max_new_tokens,
+            kv_pages,
+        } => {
+            use llm_engine::paged::PAGE_TOKENS;
+            use llm_engine::server::{serve, Limits, ServeOptions};
+
+            let cfg = Config::from_file(model.join("config.json"))?;
+            let host: std::net::IpAddr = host
+                .parse()
+                .with_context(|| format!("invalid --host {host:?}"))?;
+            let pages = kv_pages
+                .unwrap_or_else(|| max_batch * cfg.block_size.div_ceil(PAGE_TOKENS));
+            serve(ServeOptions {
+                host,
+                port,
+                model_dir: model,
+                tokenizer,
+                quant,
+                kv_pages: pages,
+                limits: Limits {
+                    max_batch,
+                    max_queue,
+                    max_prompt_tokens,
+                    max_new_tokens,
+                    context: cfg.block_size,
+                },
+            })
+        }
         #[cfg(feature = "cuda")]
         Command::GpuGraphCheck { model, quant, shapes, lengths } => {
             gpu_graph_check(model, &quant, &shapes, &lengths)

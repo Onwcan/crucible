@@ -22,6 +22,8 @@ pub mod ops;
 pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod runtime;
+#[cfg(feature = "cuda")]
+pub mod server;
 pub mod tokenizer;
 pub mod weights;
 

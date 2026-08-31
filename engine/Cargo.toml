@@ -27,9 +27,15 @@ fancy-regex = "0.13"
 # builds without the CUDA toolkit present.
 cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading"], default-features = false, optional = true }
 
+# HTTP service layer. Optional and tied to the cuda feature, so a CPU-only
+# `cargo test` neither builds nor waits for them.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"], optional = true }
+axum = { version = "0.7", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:tokio", "dep:axum", "dep:tokio-stream"]
 
 [profile.release]
 opt-level = 3

@@ -39,6 +39,24 @@ pub struct Request {
     pub max_new_tokens: usize,
 }
 
+/// Why a request left the active set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Reached its token budget.
+    Length,
+    /// Withdrawn before finishing, typically because the client went away.
+    Cancelled,
+}
+
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Length => "length",
+            FinishReason::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// A request that has left the active set.
 #[derive(Debug, Clone)]
 pub struct Completion {
@@ -47,6 +65,7 @@ pub struct Completion {
     pub tokens: Vec<usize>,
     /// Step index at which it left the batch, for deterministic tests.
     pub finished_at: u64,
+    pub reason: FinishReason,
 }
 
 /// One resident request.
@@ -67,6 +86,14 @@ pub struct StepInfo {
     pub admitted: Vec<u64>,
     pub decoded: usize,
     pub finished: Vec<u64>,
+    /// Tokens produced this step, as (request id, token). Admission also
+    /// produces a token -- prefill's final logits are the request's first
+    /// output -- so a newly admitted request appears here too.
+    ///
+    /// This exists so a streaming server can forward tokens as they are made
+    /// rather than waiting for completion. It reports what the scheduler
+    /// already did; it does not change what it does.
+    pub tokens: Vec<(u64, usize)>,
     pub active_after: usize,
     pub pending_after: usize,
     pub free_pages: usize,
@@ -147,10 +174,10 @@ impl Runtime {
             ..Default::default()
         };
 
-        info.admitted = self.admit()?;
+        info.admitted = self.admit(&mut info.tokens)?;
 
         if !self.active.is_empty() {
-            info.decoded = self.decode_active()?;
+            info.decoded = self.decode_active(&mut info.tokens)?;
         }
         info.finished = self.retire()?;
 
@@ -167,7 +194,7 @@ impl Runtime {
     /// taken. A prompt that does not fit leaves the request pending and stops
     /// admission for this step -- FCFS, so a large request is not starved by
     /// smaller ones queued behind it.
-    fn admit(&mut self) -> Result<Vec<u64>> {
+    fn admit(&mut self, first_tokens: &mut Vec<(u64, usize)>) -> Result<Vec<u64>> {
         let mut admitted = Vec::new();
         while self.active.len() < self.max_batch {
             let Some(req) = self.pending.front() else { break };
@@ -188,6 +215,7 @@ impl Runtime {
             let first = argmax(&logits);
 
             admitted.push(req.id);
+            first_tokens.push((req.id, first));
             self.active.push(Active {
                 id: req.id,
                 seq,
@@ -201,7 +229,7 @@ impl Runtime {
     }
 
     /// One batched decode step across every active request.
-    fn decode_active(&mut self) -> Result<usize> {
+    fn decode_active(&mut self, produced: &mut Vec<(u64, usize)>) -> Result<usize> {
         let n = self.active.len();
         let stride = self.model.table_stride();
 
@@ -239,6 +267,7 @@ impl Runtime {
         for (a, tok) in self.active.iter_mut().zip(next) {
             a.next_token = tok;
             a.generated.push(tok);
+            produced.push((a.id, tok));
         }
         Ok(n)
     }
@@ -263,12 +292,47 @@ impl Runtime {
                     prompt_len: a.prompt_len,
                     tokens: a.generated,
                     finished_at: self.step_no,
+                    reason: FinishReason::Length,
                 });
             } else {
                 i += 1;
             }
         }
         Ok(finished)
+    }
+
+    /// Withdraw a request, whether queued or resident.
+    ///
+    /// Returns whether anything was found. A resident request hands its pages
+    /// straight back, so the slot and its memory are available to the next
+    /// admission on the same step -- an abandoned generation must not keep
+    /// occupying the batch until it reaches max_tokens.
+    ///
+    /// Cancellation takes effect between steps, never inside one: a step is a
+    /// single fused GPU graph launch and cannot be interrupted partway.
+    pub fn cancel(&mut self, id: u64) -> Result<bool> {
+        if let Some(pos) = self.pending.iter().position(|r| r.id == id) {
+            self.pending.remove(pos);
+            return Ok(true);
+        }
+        if let Some(pos) = self.active.iter().position(|a| a.id == id) {
+            let mut a = self.active.swap_remove(pos);
+            a.seq.release(self.model.page_pool_mut())?;
+            self.done.push(Completion {
+                id: a.id,
+                prompt_len: a.prompt_len,
+                tokens: a.generated,
+                finished_at: self.step_no,
+                reason: FinishReason::Cancelled,
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Ids of the requests currently resident, in slot order.
+    pub fn active_ids(&self) -> Vec<u64> {
+        self.active.iter().map(|a| a.id).collect()
     }
 
     /// Run until every submitted request has finished.
