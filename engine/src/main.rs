@@ -127,6 +127,18 @@ enum Command {
     ///
     /// Binds loopback unless `--host` says otherwise: this service has no
     /// authentication, so reaching the network must be a deliberate act.
+    /// Terminal client for a running Crucible server.
+    ///
+    /// Speaks HTTP and SSE only. It never loads the model, so the server must
+    /// already be running -- start `llm-engine serve` in another terminal.
+    #[cfg(feature = "tui")]
+    Tui {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        /// Tokens to request per prompt.
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+    },
     #[cfg(feature = "cuda")]
     Serve {
         model: PathBuf,
@@ -284,6 +296,13 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
         Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        #[cfg(feature = "tui")]
+        Command::Tui { server, max_tokens } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(llm_engine::tui::run(server, max_tokens))
+        }
         #[cfg(feature = "cuda")]
         Command::Serve {
             model,

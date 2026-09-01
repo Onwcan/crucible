@@ -12,7 +12,8 @@ engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 > them together, graph-replayed: **8,366 tok/s aggregate at batch 16** and
 > 1,618 tok/s at batch 1, against ~1,640 for one single-request stream.
 > 93-98% of a decode step is now GPU kernel execution. An HTTP service with
-> SSE streaming exposes it: `llm-engine serve`.
+> SSE streaming exposes it, and a Ratatui terminal client uses it:
+> `llm-engine serve` then `llm-engine tui`.
 
 ## Why Blackwell specifically
 
@@ -1626,6 +1627,119 @@ the sixteenth request waits behind fifteen prefills.
 - `/metrics` counters are cumulative since startup, which is why the benchmark
   computes per-run averages from deltas rather than reading them directly.
 
+## Terminal client
+
+```bash
+# terminal 1
+llm-engine serve export/120m --tokenizer export/gpt2.tok --port 8080 --max-batch 16
+
+# terminal 2
+llm-engine tui --server http://127.0.0.1:8080
+```
+
+```text
+Crucible  ● connected   120m  greedy  max batch 16  batch 3
++-- conversation ----------------------------------------------+
+|  You                                                          |
+|  Explain why CUDA graphs help small-model inference.          |
+|                                                               |
+|  Crucible                                                     |
+|  CUDA graphs help because the launch overhead of ...          |
++---------------------------------------------------------------+
++-- generating - Esc to cancel ---------------------------------+
+| how does paged attention work_                                |
++---------------------------------------------------------------+
+| this request (client-observed) | service                      |
+| TTFT            11.3 ms        | active / queued     3 / 0    |
+| tok/s              893         | kv pages       178 / 1024    |
+| gap median       1.01 ms       | batch (last/avg)   3 / 2.4   |
+| generated           87         | tokens / uptime  9812 / 211s |
+Enter send   Esc cancel   PgUp/PgDn scroll   F1 help   F2 telemetry   Ctrl+C quit
+```
+
+The TUI is a **client**. It links `crucible::protocol` and nothing else from the
+inference side -- no `GpuModel`, no `Runtime`, no `PagePool`, no CUDA type -- and
+it builds with `--no-default-features --features tui`, without the `cuda`
+feature at all. That is the boundary being enforced by the compiler rather than
+asserted in a comment. It never loads the model; start `serve` first.
+
+### Keys
+
+| key | action |
+|---|---|
+| Enter | send |
+| Alt+Enter | newline |
+| Esc | cancel the active generation |
+| Ctrl+U | clear input |
+| Left/Right, Home/End | cursor |
+| PgUp/PgDn | scroll (End returns to the newest text) |
+| F1 | help overlay |
+| F2 | telemetry panel |
+| Ctrl+C | quit |
+
+### Event architecture
+
+```text
+keyboard task ─┐
+SSE task ──────┤
+metrics task ──┼──> AppEvent channel ──> app loop ──> render
+health task ───┘
+```
+
+Tasks only send events; one task owns `App` and applies them. No lock is held
+across an await, and no task touches a widget.
+
+### Rendering is decoupled from token arrival
+
+The backend emits well over a thousand tokens a second and a terminal cannot
+usefully repaint that fast. Events are applied as they arrive into an 8192-deep
+channel; the screen redraws on a ~30 FPS tick only when something changed. The
+coalescing is in the *drawing*, never in the data -- every token is applied
+exactly once, and the final text is exact.
+
+Measured: **0.4% CPU idle, 1.7% CPU while receiving ~900 tok/s.**
+
+### It does not throttle the server
+
+A client that rendered per token would become backpressure on the stream. Driving
+the same prompt and token budget through the server, one client at a time:
+
+| client | tokens | steps | tok/s |
+|---|---:|---:|---:|
+| plain HTTP reader | 512 | 511 | 735 |
+| plain HTTP reader (repeat) | 512 | 511 | 1,106 |
+| TUI | 512 | 511 | 998 |
+
+The TUI's rate sits *inside* the plain client's own run-to-run range, and both
+complete 512 tokens in 511 decode steps. No throttling is detectable above that
+variance — which is the honest claim; the two plain runs differ by 50% from each
+other, so any smaller effect would be unmeasurable here.
+
+### Cancellation
+
+Esc aborts the stream task, which drops the HTTP response. The server sees the
+disconnect and reclaims the request at its next scheduler boundary. There is no
+second cancellation protocol, and the TUI adds none. Verified end to end: the
+server's `cancelled_requests` increments and every KV page returns to the pool.
+
+A cancelled message is labelled and kept — partial output is not discarded to
+report that it was interrupted.
+
+### Connection handling
+
+`● connected`, `○ reconnecting`, `× disconnected`. `/health` is fetched on
+connect and after a failure, not polled; `/metrics` polls at 700 ms. One failed
+poll degrades the indicator rather than ending the session, and reconnect probes
+run at 1.5 s rather than spinning.
+
+### Known limitations
+
+- Greedy decoding only, inherited from the service.
+- One conversation per process; no persistence, no Markdown, no highlighting.
+- Cancellation takes effect at the next scheduler boundary, not instantly.
+- No model selector, settings screen, or multi-server management.
+- No mouse support; every action has a key.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -1831,7 +1945,7 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Device-side argmax — 50,304x less D2H; 1.09x to 1.39x end-to-end
 - [x] HTTP inference service — axum, one GPU owner, bounded queues
 - [x] Token streaming over SSE, with cancellation and page reclaim
-- [ ] Ratatui TUI client
+- [x] Ratatui TUI client — streaming chat, cancellation, live telemetry
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

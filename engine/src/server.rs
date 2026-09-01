@@ -42,12 +42,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::gpu_model::{GpuModel, Precision};
+use crate::protocol::{
+    ErrorBody, GenerateRequest, GenerateResponse, Health as HealthBody, Metrics as MetricsBody,
+};
 use crate::paged::PAGE_TOKENS;
 use crate::runtime::{FinishReason, Request as RtRequest, Runtime};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -77,60 +80,6 @@ pub struct ServeOptions {
 }
 
 // --- wire types -------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct GenerateRequest {
-    pub prompt: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-}
-
-fn default_max_tokens() -> usize {
-    64
-}
-
-#[derive(Debug, Serialize)]
-pub struct GenerateResponse {
-    pub text: String,
-    pub tokens_generated: usize,
-    pub finish_reason: String,
-    pub prompt_tokens: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: String,
-}
-
-#[derive(Debug, Serialize)]
-struct HealthBody {
-    status: &'static str,
-    model: String,
-    device: String,
-    max_batch: usize,
-    context: usize,
-    kv_pages: usize,
-    /// Sampling is greedy argmax. Stated rather than implied, because the
-    /// request schema has no temperature field and callers should know that is
-    /// a capability statement, not an omission.
-    sampling: &'static str,
-}
-
-#[derive(Debug, Serialize, Default, Clone)]
-struct MetricsBody {
-    active_requests: usize,
-    queued_requests: usize,
-    completed_requests: u64,
-    cancelled_requests: u64,
-    failed_requests: u64,
-    kv_pages_used: usize,
-    kv_pages_free: usize,
-    last_batch_size: usize,
-    decode_steps: u64,
-    aggregate_tokens_generated: u64,
-    average_batch_size: f64,
-    uptime_seconds: f64,
-}
 
 // --- inference thread plumbing ---------------------------------------------
 
@@ -628,13 +577,13 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     stats.lock().unwrap().pages_free = pages;
 
     let health_body = Arc::new(HealthBody {
-        status: "ok",
+        status: "ok".into(),
         model: model_name,
         device: device.clone(),
         max_batch: limits.max_batch,
         context: limits.context,
         kv_pages: pages,
-        sampling: "greedy",
+        sampling: "greedy".into(),
     });
 
     let state = AppState {

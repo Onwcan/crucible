@@ -18,12 +18,17 @@ pub mod gpu;
 pub mod gpu_model;
 pub mod model;
 pub mod paged;
+// Wire types, shared by the service and its clients. No feature gate: the point
+// is that a client can depend on the protocol without depending on the engine.
+pub mod protocol;
 pub mod ops;
 pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod runtime;
 #[cfg(feature = "cuda")]
 pub mod server;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod tokenizer;
 pub mod weights;
 
