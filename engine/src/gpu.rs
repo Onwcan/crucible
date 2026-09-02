@@ -294,6 +294,20 @@ impl Gpu {
         cu(self.stream.memcpy_dtov(dev))
     }
 
+    /// Copy back `len` elements starting at `start`.
+    ///
+    /// Lets one row of a `[batch, vocab]` buffer come back without dragging the
+    /// whole thing across PCIe.
+    pub fn to_host_range(
+        &self,
+        dev: &CudaSlice<f32>,
+        start: usize,
+        len: usize,
+    ) -> Result<Vec<f32>> {
+        let view = dev.slice(start..start + len);
+        cu(self.stream.memcpy_dtov(&view))
+    }
+
     /// Copy back only the first `n` elements.
     ///
     /// The batched logits buffer is sized for `max_batch`, so a batch of one

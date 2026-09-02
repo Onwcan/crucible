@@ -163,6 +163,38 @@ enum Command {
         #[arg(long)]
         kv_pages: Option<usize>,
     },
+    /// Check that a request's sampled output does not depend on who it is
+    /// batched with.
+    ///
+    /// The invariant: a request run alone with seed S must produce exactly the
+    /// same tokens when run concurrently with unrelated requests. If another
+    /// request's presence changes the sequence, the RNG is keyed on the wrong
+    /// thing.
+    /// What sampling costs, against the greedy fast path.
+    #[cfg(feature = "cuda")]
+    GpuSampleBench {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "1,4,8,16")]
+        batches: String,
+        #[arg(long, default_value = "32,128,256,512")]
+        lengths: String,
+        #[arg(long, default_value_t = 64)]
+        steps: usize,
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
+    },
+    #[cfg(feature = "cuda")]
+    GpuSampling {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value_t = 24)]
+        steps: usize,
+        #[arg(long, default_value_t = 16)]
+        max_batch: usize,
+    },
     #[cfg(feature = "cuda")]
     GpuGraphCheck {
         model: PathBuf,
@@ -342,6 +374,14 @@ fn main() -> Result<()> {
             })
         }
         #[cfg(feature = "cuda")]
+        Command::GpuSampleBench { model, quant, batches, lengths, steps, trials } => {
+            gpu_sample_bench(model, &quant, &batches, &lengths, steps, trials)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuSampling { model, quant, steps, max_batch } => {
+            gpu_sampling(model, &quant, steps, max_batch)
+        }
+        #[cfg(feature = "cuda")]
         Command::GpuGraphCheck { model, quant, shapes, lengths } => {
             gpu_graph_check(model, &quant, &shapes, &lengths)
         }
@@ -396,53 +436,11 @@ fn tokenize(path: PathBuf, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// xorshift64*, so sampling is reproducible without pulling in a rand crate.
-struct Rng(u64);
-
-impl Rng {
-    fn next_f32(&mut self) -> f32 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        // Top 24 bits give a uniform float in [0, 1).
-        ((self.0.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u32 << 24) as f32
-    }
-}
-
-fn sample(logits: &[f32], temperature: f32, top_k: usize, rng: &mut Rng) -> u32 {
-    if temperature <= 0.0 {
-        // Greedy: argmax, deterministic.
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-    }
-
-    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    let k = top_k.clamp(1, ranked.len());
-    // Only the top k matter; partial selection avoids sorting 50k entries.
-    ranked.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
-    ranked.truncate(k);
-
-    let max = ranked.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f64;
-    for (_, v) in ranked.iter_mut() {
-        *v = ((*v - max) / temperature).exp();
-        sum += *v as f64;
-    }
-
-    let threshold = rng.next_f32() as f64 * sum;
-    let mut acc = 0.0f64;
-    for (id, weight) in &ranked {
-        acc += *weight as f64;
-        if acc >= threshold {
-            return *id as u32;
-        }
-    }
-    ranked.last().map(|(i, _)| *i as u32).unwrap_or(0)
-}
+// Token selection lives in `llm_engine::sampling`, shared with the runtime.
+// It used to be duplicated here, which meant the CLI and the service could
+// disagree about the same prompt and seed. Two behaviours changed in the move
+// and both are deliberate: greedy ties now resolve to the lowest index, the
+// same rule the GPU argmax kernel uses, and a NaN logit no longer panics.
 
 fn generate(
     model_dir: PathBuf,
@@ -507,7 +505,7 @@ fn generate(
         anyhow::bail!("prompt encoded to zero tokens");
     }
     let prompt_len = ids.len();
-    let mut rng = Rng(seed | 1);
+    let mut rng = llm_engine::sampling::Rng::new(seed);
 
     println!("prompt      : {prompt:?} ({prompt_len} tokens)");
     println!("backend     : {}{}", if use_gpu { "gpu" } else { "cpu" },
@@ -535,7 +533,13 @@ fn generate(
             println!("\n[context full]");
             break;
         }
-        let next = sample(&logits, temperature, top_k, &mut rng);
+        let cfg = llm_engine::sampling::GenerationConfig {
+            max_tokens,
+            temperature,
+            top_k,
+            seed,
+        };
+        let next = llm_engine::sampling::sample(&logits, &cfg, &mut rng) as u32;
         if next == tok.eot {
             println!("\n[end of text]");
             break;
@@ -1000,6 +1004,290 @@ fn run_shape_sequence(
 }
 
 #[cfg(feature = "cuda")]
+fn gpu_sample_bench(
+    dir: PathBuf,
+    quant: &str,
+    batches: &str,
+    lengths: &str,
+    steps: usize,
+    trials: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+    use llm_engine::sampling::GenerationConfig;
+    use std::time::Instant;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let sizes: Vec<usize> = batches
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let max_n = *sizes.iter().max().unwrap_or(&1);
+    let pages: usize = (0..max_n)
+        .map(|i| (lens[i % lens.len()] + steps + 2).div_ceil(PAGE_TOKENS) + 1)
+        .sum();
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(pages, max_n)?;
+    let vocab = cfg.vocab_size;
+    let mut rt = Runtime::new(model)?;
+
+    println!("gpu        {}", envelope());
+    println!("workload   prompts {lens:?} cycled, {steps} tokens, {trials} trials");
+    println!("sampling   temperature 0.8, top-k 40");
+    println!();
+
+    // greedy / sampled / half sampled, interleaved so drift cannot masquerade
+    // as a cost difference.
+    let modes: [(&str, fn(usize) -> bool); 3] = [
+        ("greedy", |_| false),
+        ("sampled", |_| true),
+        ("mixed", |i| i % 2 == 1),
+    ];
+
+    let header = format!("{:>6}  {:>9}  {:>11}  {:>11}  {:>10}  {:>12}",
+                         "batch", "mode", "aggregate", "per-request", "step ms", "D2H/step");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    for &n in &sizes {
+        let mut baseline = 0.0f64;
+        for (label, is_sampled) in modes {
+            let mut secs = Vec::new();
+            for _ in 0..trials {
+                for i in 0..n {
+                    let config = if is_sampled(i) {
+                        GenerationConfig {
+                            max_tokens: steps,
+                            temperature: 0.8,
+                            top_k: 40,
+                            seed: 1000 + i as u64,
+                        }
+                    } else {
+                        GenerationConfig::greedy(steps)
+                    };
+                    rt.submit(Request {
+                        id: i as u64,
+                        prompt: probe_tokens(lens[i % lens.len()], vocab),
+                        config,
+                    });
+                }
+                rt.step()?; // admission + prefill, not timed as decode
+                let t0 = Instant::now();
+                let mut done = 0;
+                while !rt.is_idle() {
+                    rt.step()?;
+                    done += 1;
+                    if done > steps * 4 + 16 {
+                        anyhow::bail!("runtime did not drain");
+                    }
+                }
+                secs.push(t0.elapsed().as_secs_f64());
+                let _ = rt.completed();
+            }
+            secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let t = secs[secs.len() / 2];
+            let decode_steps = (steps - 1) as f64;
+            let agg = n as f64 * decode_steps / t;
+            if label == "greedy" {
+                baseline = agg;
+            }
+            let sampled_rows = (0..n).filter(|i| is_sampled(*i)).count();
+            // Ids always come back; sampled rows add one logits row each.
+            let d2h = n * 4 + sampled_rows * vocab * 4;
+            println!("{n:>6}  {label:>9}  {agg:>9.0} t/s  {:>9.0} t/s  {:>10.2}  {d2h:>10} B{}",
+                     agg / n as f64,
+                     t / decode_steps * 1000.0,
+                     if label == "greedy" { String::new() }
+                     else { format!("   {:.2}x", agg / baseline) });
+        }
+        println!();
+    }
+
+    println!("D2H/step is what each mode copies back: 4 bytes per request for the");
+    println!("argmax id, plus a full logits row for every sampled request.");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+    use llm_engine::sampling::GenerationConfig;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    // Deliberately heterogeneous in every dimension at once: prompt length,
+    // decoding policy, temperature, top-k and seed. A bug that only shows up
+    // when two sampled requests share a batch would survive a uniform test.
+    let specs: Vec<(usize, GenerationConfig)> = vec![
+        (15, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 1 }),
+        (16, GenerationConfig { max_tokens: steps, temperature: 0.7, top_k: 40, seed: 11 }),
+        (17, GenerationConfig { max_tokens: steps, temperature: 1.0, top_k: 5, seed: 22 }),
+        (63, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 2 }),
+        (129, GenerationConfig { max_tokens: steps, temperature: 0.3, top_k: 20, seed: 33 }),
+        (511, GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 10, seed: 44 }),
+    ];
+    let prompts: Vec<Vec<usize>> = specs
+        .iter()
+        .map(|(len, _)| probe_tokens(*len, cfg.vocab_size))
+        .collect();
+
+    let pages: usize = specs
+        .iter()
+        .map(|(len, _)| (len + steps + 2).div_ceil(PAGE_TOKENS) + 1)
+        .sum();
+
+    let load = |mb: usize, pg: usize| -> Result<Runtime> {
+        let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        m.enable_paging(pg, mb)?;
+        Runtime::new(m)
+    };
+
+    println!("steps        {steps} tokens per request");
+    println!("pool         {pages} pages");
+    println!();
+
+    // --- each request alone -------------------------------------------------
+    let mut alone: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut rt = load(1, pages)?;
+        for (i, prompt) in prompts.iter().enumerate() {
+            rt.submit(Request {
+                id: i as u64,
+                prompt: prompt.clone(),
+                config: specs[i].1.clone(),
+            });
+            rt.run_to_completion(steps * 4 + 16)?;
+            let mut c = rt.completed();
+            c.sort_by_key(|x| x.id);
+            alone.push(c.pop().expect("one completion").tokens);
+        }
+    }
+
+    // --- all together -------------------------------------------------------
+    let mut rt = load(max_batch, pages)?;
+    for (i, prompt) in prompts.iter().enumerate() {
+        rt.submit(Request {
+            id: i as u64,
+            prompt: prompt.clone(),
+            config: specs[i].1.clone(),
+        });
+    }
+    rt.run_to_completion(steps * 8 + 32)?;
+    let mut together = rt.completed();
+    together.sort_by_key(|c| c.id);
+
+    println!("{:>4}  {:>7}  {:>12}  {:>6}  {:>5}  {:>14}",
+             "req", "prompt", "mode", "top-k", "seed", "vs alone");
+    println!("{}", "-".repeat(60));
+    let mut failures = 0usize;
+    for c in &together {
+        let (len, gc) = &specs[c.id as usize];
+        let want = &alone[c.id as usize];
+        let ok = &c.tokens == want;
+        if !ok {
+            failures += 1;
+        }
+        let mode = if gc.is_greedy() {
+            "greedy".to_string()
+        } else {
+            format!("temp {:.1}", gc.temperature)
+        };
+        println!("{:>4}  {len:>7}  {mode:>12}  {:>6}  {:>5}  {:>14}",
+                 c.id, gc.top_k, gc.seed, if ok { "identical" } else { "MISMATCH" });
+    }
+
+    // --- staggered admission, forcing slot reordering -----------------------
+    println!();
+    println!("staggered admission (forces swap_remove reordering)");
+    let mut staggered: Vec<llm_engine::runtime::Completion> = Vec::new();
+    let mut pending: Vec<(usize, usize)> =
+        (0..prompts.len()).map(|i| (i * 3, i)).collect();
+    let mut t = 0usize;
+    while t < steps * 12 {
+        while let Some(pos) = pending.iter().position(|(at, _)| *at == t) {
+            let (_, i) = pending.remove(pos);
+            rt.submit(Request {
+                id: i as u64,
+                prompt: prompts[i].clone(),
+                config: specs[i].1.clone(),
+            });
+        }
+        if rt.is_idle() && pending.is_empty() {
+            break;
+        }
+        rt.step()?;
+        staggered.extend(rt.completed());
+        t += 1;
+    }
+    staggered.sort_by_key(|c| c.id);
+    for c in &staggered {
+        let want = &alone[c.id as usize];
+        let ok = &c.tokens == want;
+        if !ok {
+            failures += 1;
+        }
+        println!("{:>4}  {:>14}", c.id, if ok { "identical" } else { "MISMATCH" });
+    }
+
+    // --- cancellation must not disturb a later identical request ------------
+    println!();
+    println!("cancellation does not perturb a later request with the same seed");
+    let victim = 1usize;
+    rt.submit(Request {
+        id: 900,
+        prompt: prompts[victim].clone(),
+        config: specs[victim].1.clone(),
+    });
+    rt.step()?;
+    rt.step()?;
+    rt.cancel(900)?;
+    let _ = rt.completed();
+    rt.submit(Request {
+        id: 901,
+        prompt: prompts[victim].clone(),
+        config: specs[victim].1.clone(),
+    });
+    rt.run_to_completion(steps * 4 + 16)?;
+    let after = rt.completed().pop().expect("one completion").tokens;
+    let ok = after == alone[victim];
+    if !ok {
+        failures += 1;
+    }
+    println!("  request after a cancelled twin: {}",
+             if ok { "identical to running alone" } else { "MISMATCH" });
+
+    println!();
+    println!("pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+    if rt.free_pages() != rt.model().page_pool().n_pages() {
+        anyhow::bail!("pages leaked");
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} request(s) changed output when batched");
+    }
+    println!();
+    println!("Every request produced identical tokens alone and batched, under");
+    println!("simultaneous and staggered admission and across a cancellation.");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
     use llm_engine::paged::PAGE_TOKENS;
@@ -1420,7 +1708,7 @@ fn gpu_serve_bench(
                     rt.submit(Request {
                         id: i as u64,
                         prompt: probe_tokens(lens[i % lens.len()], cfg.vocab_size),
-                        max_new_tokens: steps,
+                        config: llm_engine::sampling::GenerationConfig::greedy(steps),
                     });
                 }
                 // Admission prefills; time only the decode steps, so prompt
@@ -1614,7 +1902,7 @@ fn gpu_batch(
             solo_rt.submit(Request {
                 id: i as u64,
                 prompt: prompt.clone(),
-                max_new_tokens: steps,
+                config: llm_engine::sampling::GenerationConfig::greedy(steps),
             });
             solo_rt.run_to_completion(steps * 4 + 16)?;
             let mut c = solo_rt.completed();
@@ -1666,7 +1954,7 @@ fn gpu_batch(
         rt.submit(Request {
             id: i as u64,
             prompt: prompt.clone(),
-            max_new_tokens: steps,
+            config: llm_engine::sampling::GenerationConfig::greedy(steps),
         });
     }
     let all_at_once = rt.run_to_completion(steps * 4 + 16)?;
@@ -1736,7 +2024,7 @@ fn gpu_batch(
             rt.submit(Request {
                 id: id as u64,
                 prompt: prompts[id].clone(),
-                max_new_tokens: steps,
+                config: llm_engine::sampling::GenerationConfig::greedy(steps),
             });
         }
         if rt.is_idle() && pending.is_empty() {

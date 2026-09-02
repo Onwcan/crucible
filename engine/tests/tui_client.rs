@@ -80,14 +80,14 @@ fn sse_headers() -> String {
     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n".into()
 }
 
-const HEALTH: &str = r#"{"status":"ok","model":"120m","device":"test-gpu","max_batch":16,"context":1024,"kv_pages":312,"sampling":"greedy"}"#;
+const HEALTH: &str = r#"{"status":"ok","model":"120m","device":"test-gpu","max_batch":16,"context":1024,"kv_pages":312,"sampling":{"greedy":true,"temperature":true,"top_k":true,"seed":true,"default_mode":"greedy"}}"#;
 const METRICS: &str = r#"{"active_requests":3,"queued_requests":1,"completed_requests":9,"cancelled_requests":2,"failed_requests":0,"kv_pages_used":78,"kv_pages_free":234,"last_batch_size":4,"decode_steps":100,"aggregate_tokens_generated":400,"average_batch_size":4.0,"uptime_seconds":12.5}"#;
 
 async fn collect(addr: SocketAddr, prompt: &str) -> Vec<StreamMessage> {
     let client = Client::new(format!("http://{addr}")).unwrap();
     let (tx, mut rx) = mpsc::channel(256);
     let p = prompt.to_string();
-    tokio::spawn(async move { client.stream(p, 8, tx).await });
+    tokio::spawn(async move { client.stream(p, 8, None, tx).await });
     let mut out = Vec::new();
     while let Some(m) = rx.recv().await {
         out.push(m);
@@ -102,7 +102,10 @@ async fn health_is_parsed() {
     let h = c.health().await.unwrap();
     assert_eq!(h.model, "120m");
     assert_eq!(h.max_batch, 16);
-    assert_eq!(h.sampling, "greedy");
+    assert!(h.sampling.greedy && h.sampling.temperature,
+            "server should advertise both modes: {:?}", h.sampling);
+    assert_eq!(h.sampling.default_mode, "greedy",
+               "omitting sampling parameters must stay greedy");
 }
 
 #[tokio::test]
@@ -297,7 +300,7 @@ async fn a_hangup_before_any_body_is_an_error_not_a_hang() {
     let addr = mock(|_| Reply::Hangup).await;
     let client = Client::new(format!("http://{addr}")).unwrap();
     let (tx, mut rx) = mpsc::channel(8);
-    tokio::spawn(async move { client.stream("hi".into(), 4, tx).await });
+    tokio::spawn(async move { client.stream("hi".into(), 4, None, tx).await });
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("client hung on an empty response");
@@ -324,7 +327,7 @@ async fn dropping_the_receiver_stops_the_stream_task() {
     for _ in 0..5 {
         let client = Client::new(format!("http://{addr}")).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(async move { client.stream("hi".into(), 500, tx).await });
+        let task = tokio::spawn(async move { client.stream("hi".into(), 500, None, tx).await });
         // Take a couple of tokens, then walk away.
         let _ = rx.recv().await;
         let _ = rx.recv().await;

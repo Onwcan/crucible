@@ -59,11 +59,11 @@ def get(args, path: str):
     return r.status, data
 
 
-def stream(args, prompt: str, max_tokens: int, stop_after=None):
+def stream(args, prompt: str, max_tokens: int, stop_after=None, **extra):
     """Consume an SSE stream. stop_after closes the connection early."""
     c = conn(args)
     c.request("POST", "/v1/generate/stream",
-              json.dumps({"prompt": prompt, "max_tokens": max_tokens}),
+              json.dumps({"prompt": prompt, "max_tokens": max_tokens, **extra}),
               {"Content-Type": "application/json"})
     r = c.getresponse()
     if r.status != 200:
@@ -108,7 +108,12 @@ def main() -> None:
     check("health returns 200", status == 200, str(status))
     check("health reports model/device/max_batch",
           all(k in h for k in ("model", "device", "max_batch", "context")), str(h))
-    check("health states greedy sampling", h.get("sampling") == "greedy", str(h))
+    cap = h.get("sampling")
+    check("health advertises sampling capabilities",
+          isinstance(cap, dict) and cap.get("greedy") and cap.get("temperature")
+          and cap.get("top_k") and cap.get("seed"), str(cap))
+    check("health says the default mode is greedy",
+          isinstance(cap, dict) and cap.get("default_mode") == "greedy", str(cap))
     m0 = metrics(args)
     check("metrics exposes required fields",
           all(k in m0 for k in ("active_requests", "queued_requests",
@@ -151,6 +156,63 @@ def main() -> None:
     check("streamed text equals non-streamed text", streamed == nonstream_text,
           f"\n    stream={streamed!r}\n    plain ={nonstream_text!r}")
 
+    print("\nsampling")
+    # Backward compatibility: a body with no sampling fields is what every
+    # client written before this feature sends, and must stay greedy.
+    a = post(args, "/v1/generate", {"prompt": "The capital of France is",
+                                    "max_tokens": 16})[1]
+    b = post(args, "/v1/generate", {"prompt": "The capital of France is",
+                                    "max_tokens": 16})[1]
+    check("omitting sampling fields is deterministic (greedy)",
+          json.loads(a)["text"] == json.loads(b)["text"],
+          f"{json.loads(a)['text']!r} vs {json.loads(b)['text']!r}")
+
+    m_before = metrics(args)
+    s1 = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24,
+                                     "temperature": 0.8, "top_k": 40, "seed": 4242})[1]
+    s2 = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24,
+                                     "temperature": 0.8, "top_k": 40, "seed": 4242})[1]
+    check("same seed reproduces the same sampled text",
+          json.loads(s1)["text"] == json.loads(s2)["text"],
+          f"{json.loads(s1)['text']!r} vs {json.loads(s2)['text']!r}")
+
+    s3 = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24,
+                                     "temperature": 0.8, "top_k": 40, "seed": 99})[1]
+    check("a different seed gives different text",
+          json.loads(s3)["text"] != json.loads(s1)["text"],
+          "two seeds produced identical output")
+
+    g = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24})[1]
+    check("sampled output differs from greedy",
+          json.loads(s1)["text"] != json.loads(g)["text"],
+          "sampling produced the greedy sequence")
+
+    m_after = metrics(args)
+    check("metrics count greedy and sampled requests separately",
+          m_after.get("sampled_requests", 0) > m_before.get("sampled_requests", 0)
+          and m_after.get("greedy_requests", 0) > m_before.get("greedy_requests", 0),
+          f"{m_before} -> {m_after}")
+
+    # Streaming carries the same parameters and must agree with non-streaming.
+    _, toks, done, _ = stream(args, "Once upon a time", 24,
+                              temperature=0.8, top_k=40, seed=4242)
+    streamed = "".join(t["text"] for t in toks) + (done or {}).get("text", "")
+    check("streamed sampled text equals non-streamed for the same seed",
+          streamed == json.loads(s1)["text"],
+          f"\n    stream={streamed!r}\n    plain ={json.loads(s1)['text']!r}")
+
+    print("\nsampling parameter validation")
+    for body, why in [
+        ({"prompt": "hi", "max_tokens": 8, "temperature": -1.0}, "negative temperature"),
+        ({"prompt": "hi", "max_tokens": 8, "temperature": 0.8, "top_k": 0}, "top_k of zero"),
+        ({"prompt": "hi", "max_tokens": 8, "top_k": 40}, "top_k without temperature"),
+        ({"prompt": "hi", "max_tokens": 8, "seed": 1}, "seed without temperature"),
+        ({"prompt": "hi", "max_tokens": 8, "temperature": 1e9}, "absurd temperature"),
+    ]:
+        status, _ = post(args, "/v1/generate", body)
+        check(f"{why} is rejected", status == 400, f"status {status}")
+    check("server healthy after bad sampling requests", get(args, "/health")[0] == 200)
+
     print("\nconcurrency and batching")
     results: dict = {}
     peak = {"batch": 0}
@@ -174,11 +236,16 @@ def main() -> None:
                "Q: Why is the sky blue?\nA:",
                "Once upon a time"]
 
+    # Long enough that later arrivals land while earlier ones are still
+    # generating. At ~1500 tok/s a 32-token request finishes in ~21 ms, which
+    # is shorter than the arrival stagger -- the requests would then run one
+    # after another and this check would fail for a reason that has nothing to
+    # do with batching.
     def worker(i: int, delay: float):
         time.sleep(delay)
-        results[i] = stream(args, prompts[i % len(prompts)], 32)
+        results[i] = stream(args, prompts[i % len(prompts)], 200)
 
-    threads = [threading.Thread(target=worker, args=(i, i * 0.03)) for i in range(6)]
+    threads = [threading.Thread(target=worker, args=(i, i * 0.005)) for i in range(6)]
     for t in threads:
         t.start()
     for t in threads:
@@ -192,7 +259,7 @@ def main() -> None:
     check("requests actually shared decode steps (batch > 1 observed)",
           peak["batch"] > 1, f"peak observed batch {peak['batch']}")
 
-    alone = stream(args, prompts[0], 32)
+    alone = stream(args, prompts[0], 200)
     batched = results[0]
     check("batched output equals solo output for the same prompt",
           [t["token_id"] for t in batched[1]] == [t["token_id"] for t in alone[1]],

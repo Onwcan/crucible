@@ -785,6 +785,56 @@ impl GpuModel {
         Ok(ids.into_iter().map(|v| v as usize).collect())
     }
 
+    /// One decode step returning argmax ids for every request plus full logits
+    /// for the rows named in `rows`.
+    ///
+    /// The compute is identical to the other two entry points -- same graph,
+    /// same kernels, one batched forward pass. Only what comes back differs.
+    ///
+    /// Rows are copied individually rather than as one `[batch, vocab]` block
+    /// because the sampled rows are usually a minority: with one sampled
+    /// request in a batch of sixteen, copying the block would move 3.2 MB to
+    /// use 200 KB of it. Each row is contiguous, so a per-row copy is a plain
+    /// range and needs no gather kernel.
+    ///
+    /// Returns `(ids, rows_concatenated)` where the second value holds
+    /// `rows.len() * vocab_size` floats in the order given.
+    pub fn decode_batch_select(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+        rows: &[usize],
+    ) -> Result<(Vec<usize>, Vec<f32>)> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        for &r in rows {
+            if r >= n {
+                bail!("row {r} outside a batch of {n}");
+            }
+        }
+        self.upload_batch(tokens, positions, tables, lens)?;
+        self.run_decode_batch(n)?;
+
+        let vocab = self.cfg.vocab_size;
+        let b = self.batch.as_ref().expect("paging allocates batch scratch");
+        let ids: Vec<usize> = self
+            .gpu
+            .to_host_i32_n(&b.argmax_ids, n)?
+            .into_iter()
+            .map(|v| v as usize)
+            .collect();
+
+        let mut out = Vec::with_capacity(rows.len() * vocab);
+        for &r in rows {
+            out.extend(self.gpu.to_host_range(&b.logits, r * vocab, vocab)?);
+        }
+        Ok((ids, out))
+    }
+
     /// Bytes copied device-to-host by one step on each path.
     pub fn d2h_bytes(&self, n: usize, device_argmax: bool) -> usize {
         if device_argmax {

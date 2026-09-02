@@ -7,7 +7,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::app::{App, ConnState, MessageState, RequestState, Role};
+use super::app::{App, ConnState, MessageState, RequestState, Role, SettingField};
 
 /// Below this the layout stops being useful and a message is shown instead.
 const MIN_WIDTH: u16 = 40;
@@ -47,9 +47,59 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, chunks[4], app);
 
+    if app.show_settings {
+        draw_settings(f, area, app);
+    }
     if app.show_help {
         draw_help(f, area, app);
     }
+}
+
+/// Generation settings overlay. Small and modal-ish rather than a screen of
+/// its own: the chat is the application, this is a corner of it.
+fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
+    let w = 48.min(area.width.saturating_sub(4));
+    let h = 9.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+
+    let s = &app.settings;
+    let row = |field: SettingField, label: &str, value: String| -> Line<'static> {
+        let selected = app.settings_field == field;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::from(vec![
+            Span::styled(format!(" {marker} {label:<14}"), style.fg(Color::Cyan)),
+            Span::styled(value, style),
+        ])
+    };
+
+    let lines = vec![
+        row(SettingField::Mode, "mode", if s.sample { "sample".into() } else { "greedy".into() }),
+        row(SettingField::Temperature, "temperature", format!("{:.2}", s.temperature)),
+        row(SettingField::TopK, "top-k", s.top_k.to_string()),
+        row(SettingField::Seed, "seed", s.seed.to_string()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Up/Down select   Left/Right change   F3 close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" generation ")),
+        popup,
+    );
 }
 
 fn conn_style(c: ConnState) -> Style {
@@ -76,11 +126,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(h.sampling.clone(), Style::default().fg(Color::DarkGray)));
+        let _ = &h.sampling;
         spans.push(Span::styled(
             format!("  max batch {}", h.max_batch),
             Style::default().fg(Color::DarkGray),
         ));
+    }
+    // What this client will actually ask for, which is more useful in a header
+    // than what the server could in principle do.
+    {
+        let s = app.settings.summary();
+        let style = if app.settings.sample {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(s, style));
     }
     if let Some(m) = &app.metrics {
         spans.push(Span::styled(
@@ -360,7 +422,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Red),
         )),
         None => Line::from(Span::styled(
-            "Enter send   Esc cancel   PgUp/PgDn scroll   F1 help   F2 telemetry   Ctrl+C quit",
+            "Enter send   Esc cancel   PgUp/PgDn scroll   F1 help   F2 telemetry   F3 settings   Ctrl+C quit",
             Style::default().fg(Color::DarkGray),
         )),
     };
@@ -387,6 +449,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         ("Home/End", "start / end of input"),
         ("PgUp/PgDn", "scroll conversation"),
         ("F2", "toggle telemetry"),
+        ("F3", "generation settings"),
         ("F1", "close this help"),
         ("Ctrl+C", "quit"),
     ];

@@ -246,11 +246,26 @@ fn handle_key(
         return false;
     }
 
+    // While the settings panel is open the arrow keys belong to it.
+    if app.show_settings {
+        match k.code {
+            KeyCode::Char('c') if ctrl => return true,
+            KeyCode::F(3) | KeyCode::Esc | KeyCode::Enter => app.show_settings = false,
+            KeyCode::Up => app.settings_field = app.settings_field.prev(),
+            KeyCode::Down => app.settings_field = app.settings_field.next(),
+            KeyCode::Left => app.adjust_setting(false),
+            KeyCode::Right => app.adjust_setting(true),
+            _ => {}
+        }
+        return false;
+    }
+
     match k.code {
         KeyCode::Char('c') if ctrl => return true,
         KeyCode::Char('u') if ctrl => app.input.clear(),
         KeyCode::F(1) => app.toggle_help(),
         KeyCode::F(2) => app.toggle_telemetry(),
+        KeyCode::F(3) => app.toggle_settings(),
 
         KeyCode::Esc => {
             // Dropping the task drops the HTTP response, which closes the
@@ -270,9 +285,11 @@ fn handle_key(
                 let c = client.clone();
                 let out = tx.clone();
                 let max = app.max_tokens;
+                let sampling = app.settings.request_params();
                 *stream_task = Some(tokio::spawn(async move {
                     let (stx, mut srx) = mpsc::channel::<StreamMessage>(STREAM_BUFFER);
-                    let pump = tokio::spawn(async move { c.stream(prompt, max, stx).await });
+                    let pump =
+                        tokio::spawn(async move { c.stream(prompt, max, sampling, stx).await });
                     while let Some(m) = srx.recv().await {
                         if out.send(AppEvent::Stream(m)).await.is_err() {
                             break;

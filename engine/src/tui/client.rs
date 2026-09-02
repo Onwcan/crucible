@@ -128,9 +128,18 @@ impl Client {
         &self,
         prompt: String,
         max_tokens: usize,
+        sampling: Option<(f32, usize, u64)>,
         out: mpsc::Sender<StreamMessage>,
     ) {
-        let req = GenerateRequest { prompt, max_tokens };
+        // None sends no sampling fields at all, so the request is byte-for-byte
+        // what this client sent before sampling existed.
+        let req = GenerateRequest {
+            prompt,
+            max_tokens,
+            temperature: sampling.map(|(t, _, _)| t),
+            top_k: sampling.map(|(_, k, _)| k),
+            seed: sampling.map(|(_, _, s)| s),
+        };
         let resp = match self
             .http
             .post(format!("{}/v1/generate/stream", self.base))

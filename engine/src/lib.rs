@@ -21,6 +21,9 @@ pub mod paged;
 // Wire types, shared by the service and its clients. No feature gate: the point
 // is that a client can depend on the protocol without depending on the engine.
 pub mod protocol;
+// Token selection, shared by the CLI and the batched runtime so the two cannot
+// drift apart.
+pub mod sampling;
 pub mod ops;
 pub mod quant;
 #[cfg(feature = "cuda")]

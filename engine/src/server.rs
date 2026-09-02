@@ -50,9 +50,11 @@ use tokio_stream::StreamExt;
 use crate::gpu_model::{GpuModel, Precision};
 use crate::protocol::{
     ErrorBody, GenerateRequest, GenerateResponse, Health as HealthBody, Metrics as MetricsBody,
+    SamplingCapabilities,
 };
 use crate::paged::PAGE_TOKENS;
 use crate::runtime::{FinishReason, Request as RtRequest, Runtime};
+use crate::sampling::{self, GenerationConfig, DEFAULT_SEED, DEFAULT_TOP_K};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 use crate::weights::Weights;
 use crate::Config;
@@ -87,7 +89,7 @@ pub struct ServeOptions {
 struct Job {
     id: u64,
     prompt: Vec<usize>,
-    max_new: usize,
+    config: GenerationConfig,
     events: mpsc::Sender<StreamItem>,
 }
 
@@ -113,6 +115,8 @@ struct Stats {
     steps: u64,
     tokens: u64,
     batch_sum: u64,
+    greedy_requests: u64,
+    sampled_requests: u64,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,7 @@ struct AppState {
     stats: Arc<Mutex<Stats>>,
     next_id: Arc<AtomicU64>,
     limits: Limits,
+    vocab: usize,
     health: Arc<HealthBody>,
     started: Instant,
     /// Set when the inference thread dies, so /health can report it.
@@ -139,6 +144,7 @@ struct InitInfo {
     pages: usize,
     pool_bytes: usize,
     weight_bytes: usize,
+    vocab: usize,
 }
 
 /// Per-request state held by the inference thread.
@@ -215,6 +221,8 @@ async fn metrics(State(st): State<AppState>) -> Json<MetricsBody> {
         last_batch_size: s.last_batch,
         decode_steps: s.steps,
         aggregate_tokens_generated: s.tokens,
+        greedy_requests: s.greedy_requests,
+        sampled_requests: s.sampled_requests,
         average_batch_size: if s.steps > 0 {
             s.batch_sum as f64 / s.steps as f64
         } else {
@@ -222,6 +230,48 @@ async fn metrics(State(st): State<AppState>) -> Json<MetricsBody> {
         },
         uptime_seconds: st.started.elapsed().as_secs_f64(),
     })
+}
+
+/// Turn a request body into a generation config, rejecting nonsense.
+///
+/// Pure, so the parameter semantics can be tested without a GPU or a server.
+pub fn config_from_request(
+    req: &GenerateRequest,
+    vocab: usize,
+) -> std::result::Result<GenerationConfig, String> {
+    // Absent temperature means greedy, which is what this service did before
+    // sampling existed.
+    let temperature = req.temperature.unwrap_or(0.0);
+    if let Some(t) = req.temperature {
+        if t.is_nan() {
+            return Err("temperature must be a number".into());
+        }
+        if t < 0.0 {
+            return Err(format!("temperature {t} must not be negative"));
+        }
+    }
+    if let Some(k) = req.top_k {
+        if k == 0 {
+            return Err("top_k must be at least 1".into());
+        }
+    }
+    if req.top_k.is_some() && !req.wants_sampling() {
+        return Err(
+            "top_k has no effect without a positive temperature; omit it for greedy".into(),
+        );
+    }
+    if req.seed.is_some() && !req.wants_sampling() {
+        return Err("seed has no effect without a positive temperature".into());
+    }
+
+    let cfg = GenerationConfig {
+        max_tokens: req.max_tokens,
+        temperature,
+        top_k: req.top_k.unwrap_or(DEFAULT_TOP_K),
+        seed: req.seed.unwrap_or(DEFAULT_SEED),
+    };
+    sampling::validate(&cfg, vocab)?;
+    Ok(cfg)
 }
 
 /// Tokenise, validate and submit. Shared by both generate endpoints so there is
@@ -238,6 +288,8 @@ async fn submit(
 
     validate(prompt.len(), req.max_tokens, &st.limits)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let config = config_from_request(req, st.vocab)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Bounded channel: a client that stops reading cannot make the inference
     // thread buffer without limit.
@@ -245,7 +297,7 @@ async fn submit(
     let job = Job {
         id: st.next_id.fetch_add(1, Ordering::Relaxed),
         prompt,
-        max_new: req.max_tokens,
+        config,
         events: tx,
     };
 
@@ -385,10 +437,18 @@ fn inference_thread(
         loop {
             match jobs.try_recv() {
                 Ok(job) => {
+                    {
+                        let mut s = stats.lock().unwrap();
+                        if job.config.is_greedy() {
+                            s.greedy_requests += 1;
+                        } else {
+                            s.sampled_requests += 1;
+                        }
+                    }
                     rt.submit(RtRequest {
                         id: job.id,
                         prompt: job.prompt,
-                        max_new_tokens: job.max_new,
+                        config: job.config,
                     });
                     live.insert(
                         job.id,
@@ -410,10 +470,18 @@ fn inference_thread(
         if rt.is_idle() {
             match jobs.blocking_recv() {
                 Some(job) => {
+                    {
+                        let mut s = stats.lock().unwrap();
+                        if job.config.is_greedy() {
+                            s.greedy_requests += 1;
+                        } else {
+                            s.sampled_requests += 1;
+                        }
+                    }
                     rt.submit(RtRequest {
                         id: job.id,
                         prompt: job.prompt,
-                        max_new_tokens: job.max_new,
+                        config: job.config,
                     });
                     live.insert(
                         job.id,
@@ -529,6 +597,7 @@ fn build_runtime(opts: &ServeOptions) -> Result<(Runtime, InitInfo)> {
         pages: model.page_pool().n_pages(),
         pool_bytes: model.page_pool().total_bytes(),
         weight_bytes: model.weight_bytes(),
+        vocab: cfg.vocab_size,
     };
     Ok((Runtime::new(model)?, info))
 }
@@ -570,6 +639,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let info = init_rx
         .recv()
         .context("inference thread exited before reporting readiness")??;
+    let vocab = info.vocab;
     let pool_mb = info.pool_bytes as f64 / 1e6;
     let weight_mb = info.weight_bytes as f64 / 1e6;
     let pages = info.pages;
@@ -583,11 +653,12 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         max_batch: limits.max_batch,
         context: limits.context,
         kv_pages: pages,
-        sampling: "greedy".into(),
+        sampling: SamplingCapabilities::default(),
     });
 
     let state = AppState {
         jobs: job_tx,
+        vocab,
         stats,
         next_id: Arc::new(AtomicU64::new(1)),
         limits: limits.clone(),

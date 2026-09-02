@@ -1627,6 +1627,87 @@ the sixteenth request waits behind fifteen prefills.
 - `/metrics` counters are cumulative since startup, which is why the benchmark
   computes per-run averages from deltas rather than reading them directly.
 
+## Sampling
+
+Greedy by default everywhere. Temperature and top-k are opt-in, per request, and
+deterministic.
+
+```bash
+curl -s localhost:8080/v1/generate -H 'content-type: application/json'   -d '{"prompt":"Once upon a time","max_tokens":64,
+       "temperature":0.8,"top_k":40,"seed":4242}'
+```
+
+Omitting `temperature` gives greedy, which is what every client written before
+this feature sends. A default of 0.8 here would have silently changed the output
+of every existing caller, so absence means greedy rather than "use the usual
+defaults". `top_k` or `seed` without a positive `temperature` is rejected rather
+than ignored: silently discarding a parameter the caller set is worse than
+saying no.
+
+There is no entropy-seeded mode. A sampled reply the user cannot reproduce is
+worth less than one they can, so an omitted seed uses a fixed documented default
+(1234) rather than something unrepeatable.
+
+### One sampler, not two
+
+Token selection lives in `sampling.rs`, shared by the CLI and the runtime. It
+was previously duplicated, which meant the same prompt and seed could produce
+different text depending on which entry point ran it. Unifying them changed two
+behaviours, both deliberate:
+
+- **Greedy ties now resolve to the lowest index.** The CLI used `max_by`, which
+  returns the *last* maximum; the GPU argmax kernel returns the *first*. Two
+  rules for the same operation is a latent bug, so both now use the kernel's.
+- **A NaN logit no longer panics.** The old comparator was
+  `partial_cmp().unwrap()`. In a CLI that is a crash; in a shared inference
+  thread it would take down every other request in the batch. NaN now sorts
+  lowest and never wins, matching the kernel.
+
+### Per-request RNG
+
+Each request owns its RNG, keyed on request identity rather than scheduler slot.
+That matters because `retire` and `cancel` use `swap_remove`, so slot indices are
+reused by unrelated requests between steps. The invariant:
+
+> a request run alone with seed S produces exactly the same tokens when run
+> concurrently with unrelated requests.
+
+Verified by `gpu-sampling` across six requests mixing greedy and sampled,
+prompt lengths 15 to 511, temperatures 0.3 to 1.0, top-k 5 to 40 and four
+different seeds — identical alone and batched, under simultaneous *and*
+staggered admission, and across a cancellation that reuses the same seed.
+
+Greedy consumes no randomness, which is what lets a batch mix both without one
+perturbing the other.
+
+### Mixed batches, and what sampling costs
+
+The forward pass stays batched regardless of decoding policy; only selection
+diverges after the logits exist. Greedy rows keep the device-argmax fast path
+and copy 4 bytes; sampled rows copy their own logits row. Rows are copied
+individually rather than as a block, because with one sampled request in a batch
+of sixteen a block copy would move 3.2 MB to use 200 KB of it.
+
+159.66 W, 3090 MHz, prompts 32/128/256/512 cycled, 64 tokens, temperature 0.8,
+top-k 40:
+
+| batch | greedy | all sampled | mixed 50/50 | D2H greedy | D2H sampled |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1,520 t/s | 1,296 (0.85x) | — | 4 B | 201 KB |
+| 4 | 3,046 t/s | 2,151 (0.71x) | 2,541 (0.83x) | 16 B | 805 KB |
+| 8 | 5,273 t/s | 3,061 (0.58x) | 3,918 (0.74x) | 32 B | 1.6 MB |
+| 16 | 8,358 t/s | 3,960 (0.47x) | 5,389 (0.64x) | 64 B | 3.2 MB |
+
+Greedy is unchanged from before sampling existed (8,358 against 8,366 at batch
+16). The cost of sampling is the transfer, and it tracks the byte count almost
+exactly: 15% at batch 1, 53% at batch 16 all-sampled. At batch 1 the "mixed"
+column is empty because a single row cannot be half sampled.
+
+**Whether a device-side top-k is worth building is now a measured question
+rather than a guess.** It would cut 3.2 MB/step to roughly 5 KB at batch 16, and
+that is the only remaining term. It is deliberately not built here: a correct
+sampled path first, then the measurement, then the decision.
+
 ## Terminal client
 
 ```bash
@@ -1675,6 +1756,7 @@ asserted in a comment. It never loads the model; start `serve` first.
 | PgUp/PgDn | scroll (End returns to the newest text) |
 | F1 | help overlay |
 | F2 | telemetry panel |
+| F3 | generation settings (mode, temperature, top-k, seed) |
 | Ctrl+C | quit |
 
 ### Event architecture
@@ -1734,7 +1816,8 @@ run at 1.5 s rather than spinning.
 
 ### Known limitations
 
-- Greedy decoding only, inherited from the service.
+- Greedy by default; sampling is opt-in per request (F3 in the TUI).
+- No top-p, min-p or repetition penalties.
 - One conversation per process; no persistence, no Markdown, no highlighting.
 - Cancellation takes effect at the next scheduler boundary, not instantly.
 - No model selector, settings screen, or multi-server management.
@@ -1946,6 +2029,9 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] HTTP inference service — axum, one GPU owner, bounded queues
 - [x] Token streaming over SSE, with cancellation and page reclaim
 - [x] Ratatui TUI client — streaming chat, cancellation, live telemetry
+- [x] Per-request sampling — temperature, top-k, deterministic seeds, through
+      HTTP/SSE and the TUI, with the greedy fast path preserved
+- [ ] Device-side top-k — measured at 3.2 MB/step of logits transfer at batch 16
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

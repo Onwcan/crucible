@@ -22,9 +22,46 @@ pub struct Health {
     pub max_batch: usize,
     pub context: usize,
     pub kv_pages: usize,
-    /// Decoding mode. Currently always "greedy"; published so a client can say
-    /// so rather than implying options that do not exist.
-    pub sampling: String,
+    /// Decoding modes the server supports.
+    ///
+    /// Was a bare string when greedy was the only option. Kept as a field of
+    /// the same name so existing clients still find something there, but it is
+    /// now structured: advertising "greedy" while accepting temperature would
+    /// be a lie, and a capability list is the smallest honest replacement.
+    pub sampling: SamplingCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingCapabilities {
+    pub greedy: bool,
+    pub temperature: bool,
+    pub top_k: bool,
+    pub seed: bool,
+    /// What a request gets when it specifies nothing.
+    pub default_mode: String,
+}
+
+impl Default for SamplingCapabilities {
+    fn default() -> Self {
+        Self {
+            greedy: true,
+            temperature: true,
+            top_k: true,
+            seed: true,
+            default_mode: "greedy".into(),
+        }
+    }
+}
+
+impl SamplingCapabilities {
+    /// One-line summary for a status bar.
+    pub fn summary(&self) -> String {
+        if self.temperature {
+            "greedy + top-k".into()
+        } else {
+            "greedy".into()
+        }
+    }
 }
 
 /// `GET /metrics`. Counters are cumulative since server start.
@@ -42,6 +79,12 @@ pub struct Metrics {
     pub aggregate_tokens_generated: u64,
     pub average_batch_size: f64,
     pub uptime_seconds: f64,
+    /// Cumulative request counts by decoding mode. Two counters, incremented
+    /// once at admission -- not per token, and not per request labels.
+    #[serde(default)]
+    pub greedy_requests: u64,
+    #[serde(default)]
+    pub sampled_requests: u64,
 }
 
 impl Metrics {
@@ -66,6 +109,29 @@ pub struct GenerateRequest {
     pub prompt: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+
+    /// Omitted means greedy.
+    ///
+    /// This is the backward-compatibility hinge: every client written before
+    /// sampling existed omits it and must keep getting exactly what it got
+    /// before. A default of 0.8 here would silently change every existing
+    /// caller's output.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// Omitted uses a fixed documented seed, so a sampled request without one
+    /// is still reproducible. Entropy-seeded randomness is deliberately not
+    /// offered: reproducibility is worth more here than convenience.
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+impl GenerateRequest {
+    /// Whether this request asked for sampling at all.
+    pub fn wants_sampling(&self) -> bool {
+        matches!(self.temperature, Some(t) if t > 0.0)
+    }
 }
 
 pub fn default_max_tokens() -> usize {

@@ -30,13 +30,28 @@ use std::collections::VecDeque;
 
 use crate::gpu_model::GpuModel;
 use crate::paged::SequencePages;
+use crate::sampling::{self, GenerationConfig, Rng};
 
 /// Work submitted to the runtime.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub id: u64,
     pub prompt: Vec<usize>,
-    pub max_new_tokens: usize,
+    /// Immutable for the request's lifetime. Every resident request may have a
+    /// different one; nothing is imposed on a batch as a whole.
+    pub config: GenerationConfig,
+}
+
+impl Request {
+    /// A greedy request, which is what every caller got before sampling
+    /// existed.
+    pub fn greedy(id: u64, prompt: Vec<usize>, max_new_tokens: usize) -> Self {
+        Self {
+            id,
+            prompt,
+            config: GenerationConfig::greedy(max_new_tokens),
+        }
+    }
 }
 
 /// Why a request left the active set.
@@ -76,7 +91,15 @@ struct Active {
     /// The token to feed at the next decode step.
     next_token: usize,
     generated: Vec<usize>,
-    max_new: usize,
+    config: GenerationConfig,
+    /// This request's own RNG.
+    ///
+    /// Owned by the request, not by the slot: `retire` and `cancel` use
+    /// `swap_remove`, so slot indices are reused by unrelated requests between
+    /// steps. State keyed on slot position would make a request's sampled
+    /// sequence depend on who else happened to be in the batch, which is
+    /// exactly the property that must not hold.
+    rng: Rng,
 }
 
 /// What one `step` did, so a test or benchmark can assert on it.
@@ -212,7 +235,11 @@ impl Runtime {
             let req = self.pending.pop_front().expect("front checked above");
             let table = seq.table_padded(self.model.table_stride());
             let logits = self.model.prefill_request(&req.prompt, &table, 0)?;
-            let first = argmax(&logits);
+            // Prefill's final logits are this request's first token, so its RNG
+            // is created here and used immediately -- the first sampled token
+            // draws the first random number, exactly as running alone would.
+            let mut rng = Rng::new(req.config.seed);
+            let first = sampling::sample(&logits, &req.config, &mut rng);
 
             admitted.push(req.id);
             first_tokens.push((req.id, first));
@@ -222,7 +249,8 @@ impl Runtime {
                 prompt_len: req.prompt.len(),
                 next_token: first,
                 generated: vec![first],
-                max_new: req.max_new_tokens,
+                config: req.config,
+                rng,
             });
         }
         Ok(admitted)
@@ -250,18 +278,41 @@ impl Runtime {
             tables[i * stride..(i + 1) * stride].copy_from_slice(&t);
         }
 
-        // Device argmax returns n token ids; the full-logit path returns
-        // n * vocab_size floats for the host to scan. Same compute either way,
-        // and one token id per request is all the scheduler ever needed.
-        let next: Vec<usize> = if self.model.device_argmax() {
+        // Which rows need their full logits. Greedy rows do not: the device
+        // already reduced them to one id, and copying 200 KB per row to
+        // rediscover it would undo the argmax work entirely.
+        let sampled: Vec<usize> = self
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.config.is_greedy())
+            .map(|(i, _)| i)
+            .collect();
+
+        // The transformer forward pass stays batched regardless: only token
+        // selection diverges, after the logits exist.
+        let next: Vec<usize> = if sampled.is_empty() && self.model.device_argmax() {
+            // Unchanged greedy fast path: n * 4 bytes back, no logits move.
             self.model
                 .decode_batch_tokens(&tokens, &positions, &tables, &lens)?
         } else {
             let vocab = self.model.cfg.vocab_size;
-            let logits = self.model.decode_batch(&tokens, &positions, &tables, &lens)?;
-            (0..n)
-                .map(|i| argmax(&logits[i * vocab..(i + 1) * vocab]))
-                .collect()
+            let (ids, rows) =
+                self.model
+                    .decode_batch_select(&tokens, &positions, &tables, &lens, &sampled)?;
+            let mut out = Vec::with_capacity(n);
+            let mut row_iter = rows.chunks_exact(vocab);
+            let mut next_sampled = sampled.iter().copied().peekable();
+            for (i, a) in self.active.iter_mut().enumerate() {
+                if next_sampled.peek() == Some(&i) {
+                    next_sampled.next();
+                    let row = row_iter.next().expect("one row per sampled request");
+                    out.push(sampling::sample(row, &a.config, &mut a.rng));
+                } else {
+                    out.push(ids[i]);
+                }
+            }
+            out
         };
 
         for (a, tok) in self.active.iter_mut().zip(next) {
@@ -283,7 +334,7 @@ impl Runtime {
         let mut i = 0;
         while i < self.active.len() {
             // generated holds the prefill token plus one per decode step.
-            if self.active[i].generated.len() >= self.active[i].max_new {
+            if self.active[i].generated.len() >= self.active[i].config.max_tokens {
                 let mut a = self.active.swap_remove(i);
                 a.seq.release(self.model.page_pool_mut())?;
                 finished.push(a.id);

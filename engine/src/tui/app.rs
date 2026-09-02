@@ -11,6 +11,80 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{Health, Metrics};
 
+/// Generation settings the user can change from the settings panel.
+///
+/// Greedy by default, matching the service: opening a TUI must not silently
+/// change what the same prompt produces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenSettings {
+    pub sample: bool,
+    pub temperature: f32,
+    pub top_k: usize,
+    /// Always explicit. There is no entropy-seeded mode: a sampled reply the
+    /// user cannot reproduce is worth less than one they can.
+    pub seed: u64,
+}
+
+impl Default for GenSettings {
+    fn default() -> Self {
+        Self {
+            sample: false,
+            temperature: 0.8,
+            top_k: 40,
+            seed: 1234,
+        }
+    }
+}
+
+impl GenSettings {
+    /// Header summary: what this client will actually ask for.
+    pub fn summary(&self) -> String {
+        if self.sample {
+            format!("temp {:.2}  top-k {}  seed {}", self.temperature, self.top_k, self.seed)
+        } else {
+            "greedy".into()
+        }
+    }
+
+    /// Sampling parameters for a request body, or None for greedy.
+    pub fn request_params(&self) -> Option<(f32, usize, u64)> {
+        if self.sample {
+            Some((self.temperature, self.top_k, self.seed))
+        } else {
+            None
+        }
+    }
+}
+
+/// Which field the settings panel is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingField {
+    Mode,
+    Temperature,
+    TopK,
+    Seed,
+}
+
+impl SettingField {
+    pub fn next(self) -> Self {
+        match self {
+            SettingField::Mode => SettingField::Temperature,
+            SettingField::Temperature => SettingField::TopK,
+            SettingField::TopK => SettingField::Seed,
+            SettingField::Seed => SettingField::Mode,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            SettingField::Mode => SettingField::Seed,
+            SettingField::Temperature => SettingField::Mode,
+            SettingField::TopK => SettingField::Temperature,
+            SettingField::Seed => SettingField::TopK,
+        }
+    }
+}
+
 /// Who produced a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -311,6 +385,9 @@ pub struct App {
     pub status: Option<String>,
     pub show_help: bool,
     pub show_telemetry: bool,
+    pub show_settings: bool,
+    pub settings: GenSettings,
+    pub settings_field: SettingField,
     /// Lines scrolled up from the bottom. 0 means pinned to the newest text.
     pub scroll: usize,
     /// Whether new tokens should keep the view at the bottom.
@@ -335,6 +412,9 @@ impl App {
             status: None,
             show_help: false,
             show_telemetry: false,
+            show_settings: false,
+            settings: GenSettings::default(),
+            settings_field: SettingField::Mode,
             scroll: 0,
             follow: true,
             should_quit: false,
@@ -498,6 +578,37 @@ impl App {
     pub fn toggle_telemetry(&mut self) {
         self.show_telemetry = !self.show_telemetry;
     }
+
+    pub fn toggle_settings(&mut self) {
+        self.show_settings = !self.show_settings;
+    }
+
+    /// Adjust the selected setting. `up` is the direction of the key pressed.
+    ///
+    /// Bounds are clamped rather than wrapped: a user holding an arrow key
+    /// should stop at a sensible edge, not roll over to the opposite extreme.
+    pub fn adjust_setting(&mut self, up: bool) {
+        let s = &mut self.settings;
+        match self.settings_field {
+            SettingField::Mode => s.sample = !s.sample,
+            SettingField::Temperature => {
+                let step = 0.05;
+                s.temperature = if up {
+                    (s.temperature + step).min(2.0)
+                } else {
+                    (s.temperature - step).max(0.05)
+                };
+                // Snap away from float drift so the display stays readable.
+                s.temperature = (s.temperature * 100.0).round() / 100.0;
+            }
+            SettingField::TopK => {
+                s.top_k = if up { (s.top_k + 5).min(1000) } else { s.top_k.saturating_sub(5).max(1) };
+            }
+            SettingField::Seed => {
+                s.seed = if up { s.seed.wrapping_add(1) } else { s.seed.wrapping_sub(1) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,16 +617,20 @@ mod tests {
 
     fn connected_app() -> App {
         let mut a = App::new("http://127.0.0.1:8080".into(), 128);
-        a.on_health(Health {
+        a.on_health(health());
+        a
+    }
+
+    fn health() -> Health {
+        Health {
             status: "ok".into(),
             model: "120m".into(),
             device: "test".into(),
             max_batch: 16,
             context: 1024,
             kv_pages: 312,
-            sampling: "greedy".into(),
-        });
-        a
+            sampling: crate::protocol::SamplingCapabilities::default(),
+        }
     }
 
     #[test]
@@ -655,15 +770,7 @@ mod tests {
         a.on_poll_failure("boom".into());
         a.on_poll_failure("boom".into());
         assert_eq!(a.conn, ConnState::Disconnected);
-        a.on_health(Health {
-            status: "ok".into(),
-            model: "120m".into(),
-            device: "test".into(),
-            max_batch: 16,
-            context: 1024,
-            kv_pages: 312,
-            sampling: "greedy".into(),
-        });
+        a.on_health(health());
         assert_eq!(a.conn, ConnState::Connected);
     }
 
@@ -702,6 +809,54 @@ mod tests {
     }
 
     // --- input editor ---
+
+    #[test]
+    fn the_tui_defaults_to_greedy() {
+        // Opening the client must not change what a prompt produces.
+        let a = App::new("s".into(), 64);
+        assert!(!a.settings.sample);
+        assert_eq!(a.settings.summary(), "greedy");
+        assert_eq!(a.settings.request_params(), None);
+    }
+
+    #[test]
+    fn settings_round_trip_between_greedy_and_sampled() {
+        let mut a = connected_app();
+        a.settings_field = SettingField::Mode;
+        a.adjust_setting(true);
+        assert!(a.settings.sample);
+        assert_eq!(a.settings.request_params(), Some((0.8, 40, 1234)));
+        assert!(a.settings.summary().contains("temp"));
+        a.adjust_setting(true);
+        assert!(!a.settings.sample, "mode did not toggle back");
+    }
+
+    #[test]
+    fn settings_are_clamped_not_wrapped() {
+        let mut a = connected_app();
+        a.settings_field = SettingField::Temperature;
+        for _ in 0..200 {
+            a.adjust_setting(false);
+        }
+        assert!(a.settings.temperature >= 0.05, "{}", a.settings.temperature);
+        for _ in 0..200 {
+            a.adjust_setting(true);
+        }
+        assert!(a.settings.temperature <= 2.0, "{}", a.settings.temperature);
+
+        a.settings_field = SettingField::TopK;
+        for _ in 0..200 {
+            a.adjust_setting(false);
+        }
+        assert!(a.settings.top_k >= 1);
+    }
+
+    #[test]
+    fn setting_field_cycles_both_ways() {
+        let f = SettingField::Mode;
+        assert_eq!(f.next().next().next().next(), f);
+        assert_eq!(f.prev().next(), f);
+    }
 
     #[test]
     fn input_edits_by_character_not_byte() {
