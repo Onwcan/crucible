@@ -120,6 +120,12 @@ pub struct StepInfo {
     pub active_after: usize,
     pub pending_after: usize,
     pub free_pages: usize,
+    /// Bytes this step's decode copied device to host.
+    ///
+    /// Measured rather than derived: the size of this number is the whole point
+    /// of selecting tokens on the device, so a benchmark should not be
+    /// reporting a formula that could drift from what the code does.
+    pub d2h_bytes: usize,
 }
 
 pub struct Runtime {
@@ -200,7 +206,9 @@ impl Runtime {
         info.admitted = self.admit(&mut info.tokens)?;
 
         if !self.active.is_empty() {
-            info.decoded = self.decode_active(&mut info.tokens)?;
+            let (decoded, d2h) = self.decode_active(&mut info.tokens)?;
+            info.decoded = decoded;
+            info.d2h_bytes = d2h;
         }
         info.finished = self.retire()?;
 
@@ -257,7 +265,9 @@ impl Runtime {
     }
 
     /// One batched decode step across every active request.
-    fn decode_active(&mut self, produced: &mut Vec<(u64, usize)>) -> Result<usize> {
+    ///
+    /// Returns the rows decoded and the bytes the step copied back.
+    fn decode_active(&mut self, produced: &mut Vec<(u64, usize)>) -> Result<(usize, usize)> {
         let n = self.active.len();
         let stride = self.model.table_stride();
 
@@ -278,49 +288,88 @@ impl Runtime {
             tables[i * stride..(i + 1) * stride].copy_from_slice(&t);
         }
 
-        // Which rows need their full logits. Greedy rows do not: the device
-        // already reduced them to one id, and copying 200 KB per row to
-        // rediscover it would undo the argmax work entirely.
-        let sampled: Vec<usize> = self
-            .active
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| !a.config.is_greedy())
-            .map(|(i, _)| i)
-            .collect();
+        // What each row needs beyond an argmax id. Greedy rows need nothing
+        // more: the device already reduced them to one id, and copying 200 KB
+        // per row to rediscover it would undo the argmax work entirely.
+        //
+        // A sampled row goes to the device top-k kernel when its k fits the
+        // kernel capacity, and to the full-logit path when it does not. That
+        // decision is per row, not per batch: one request asking for an
+        // unusually large top-k must not drag the other fifteen back onto the
+        // slow path with it.
+        let vocab = self.model.cfg.vocab_size;
+        let cap = self.model.topk_capacity();
+        let device_topk = self.model.device_topk();
+        let mut topk_rows: Vec<(usize, usize)> = Vec::new();
+        let mut full_rows: Vec<usize> = Vec::new();
+        for (i, a) in self.active.iter().enumerate() {
+            if a.config.is_greedy() {
+                continue;
+            }
+            // The same clamp the reference sampler applies, so the kernel is
+            // asked for exactly the candidate set `sampling::top_k` would build.
+            let k = a.config.top_k.clamp(1, vocab);
+            if device_topk && k <= cap {
+                topk_rows.push((i, k));
+            } else {
+                full_rows.push(i);
+            }
+        }
 
         // The transformer forward pass stays batched regardless: only token
         // selection diverges, after the logits exist.
-        let next: Vec<usize> = if sampled.is_empty() && self.model.device_argmax() {
-            // Unchanged greedy fast path: n * 4 bytes back, no logits move.
-            self.model
-                .decode_batch_tokens(&tokens, &positions, &tables, &lens)?
-        } else {
-            let vocab = self.model.cfg.vocab_size;
-            let (ids, rows) =
-                self.model
-                    .decode_batch_select(&tokens, &positions, &tables, &lens, &sampled)?;
-            let mut out = Vec::with_capacity(n);
-            let mut row_iter = rows.chunks_exact(vocab);
-            let mut next_sampled = sampled.iter().copied().peekable();
-            for (i, a) in self.active.iter_mut().enumerate() {
-                if next_sampled.peek() == Some(&i) {
-                    next_sampled.next();
-                    let row = row_iter.next().expect("one row per sampled request");
-                    out.push(sampling::sample(row, &a.config, &mut a.rng));
-                } else {
-                    out.push(ids[i]);
+        let (next, d2h): (Vec<usize>, usize) =
+            if topk_rows.is_empty() && full_rows.is_empty() && self.model.device_argmax() {
+                // Unchanged greedy fast path: n * 4 bytes back, no logits move.
+                let ids = self
+                    .model
+                    .decode_batch_tokens(&tokens, &positions, &tables, &lens)?;
+                let bytes = n * std::mem::size_of::<i32>();
+                (ids, bytes)
+            } else {
+                let sel = self.model.decode_batch_mixed(
+                    &tokens, &positions, &tables, &lens, &topk_rows, &full_rows,
+                )?;
+                let mut k_of_row = vec![0usize; n];
+                for &(r, k) in &topk_rows {
+                    k_of_row[r] = k;
                 }
-            }
-            out
-        };
+                let mut out = Vec::with_capacity(n);
+                let mut full_chunks = sel.full.chunks_exact(vocab);
+                let mut next_full = full_rows.iter().copied().peekable();
+                for (i, a) in self.active.iter_mut().enumerate() {
+                    if a.config.is_greedy() {
+                        out.push(sel.ids[i]);
+                    } else if next_full.peek() == Some(&i) {
+                        next_full.next();
+                        let row = full_chunks.next().expect("one row per full request");
+                        out.push(sampling::sample(row, &a.config, &mut a.rng));
+                    } else {
+                        // Already in canonical order, so the sampler consumes
+                        // these exactly as it consumes a host-built candidate
+                        // list -- same function, same arithmetic, same token.
+                        let k = k_of_row[i];
+                        let base = i * cap;
+                        let mut cands = Vec::with_capacity(k);
+                        for j in 0..k {
+                            let id = sel.cand_ids[base + j];
+                            if id < 0 {
+                                bail!("device top-k returned {j} candidates for row {i}, wanted {k}");
+                            }
+                            cands.push((id as usize, sel.cand_vals[base + j]));
+                        }
+                        out.push(sampling::sample_candidates(&cands, &a.config, &mut a.rng));
+                    }
+                }
+                (out, sel.d2h_bytes)
+            };
 
         for (a, tok) in self.active.iter_mut().zip(next) {
             a.next_token = tok;
             a.generated.push(tok);
             produced.push((a.id, tok));
         }
-        Ok(n)
+        Ok((n, d2h))
     }
 
     /// Remove finished requests and hand their pages back.

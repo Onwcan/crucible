@@ -36,6 +36,16 @@ const ARCH: &str = "compute_120";
 /// shared memory per block. 128 was chosen by measurement, not derivation.
 pub const ATTN_CHUNK: usize = 128;
 
+/// Candidates the top-k kernel can return per row. Must match `TOPK_MAX` in
+/// `kernels.cu`.
+///
+/// A request asking for more than this is not clamped -- clamping would change
+/// what it asked for -- it falls back to copying full logits and selecting on
+/// the host. 128 covers the default top-k of 40 and everything above it that
+/// anyone has a reason to use, and costs 8 bytes per slot per row: 16 KB per
+/// step at batch 16, against the 3.2 MB the full-logit path moves.
+pub const TOPK_MAX: usize = 128;
+
 /// Chunks needed to cover `capacity` positions.
 ///
 /// Derived from capacity rather than the current sequence length, because a
@@ -130,6 +140,7 @@ pub struct Gpu {
     /// Batched GEMV, indexed by log2 of the instantiated BMAX.
     gemv_batch_i8: [CudaFunction; 5],
     argmax_rows: CudaFunction,
+    topk_rows: CudaFunction,
     rope_rows: CudaFunction,
     cache_store_rows_paged: CudaFunction,
     attention_decode_paged: CudaFunction,
@@ -231,6 +242,7 @@ impl Gpu {
             attention_prefill: cu(module.load_function("attention_prefill_f32"))?,
             cache_store_paged: cu(module.load_function("cache_store_paged_f32"))?,
             argmax_rows: cu(module.load_function("argmax_rows_f32"))?,
+            topk_rows: cu(module.load_function("topk_rows_f32"))?,
             gemv_batch_i8: [
                 cu(module.load_function("gemv_batch_i8_b1"))?,
                 cu(module.load_function("gemv_batch_i8_b2"))?,
@@ -280,6 +292,41 @@ impl Gpu {
         let (r, c) = (rows as i32, cols as i32);
         let mut b = self.stream.launch_builder(&self.argmax_rows);
         b.arg(x).arg(out).arg(&r).arg(&c);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Row-wise top-k on the device.
+    ///
+    /// Writes `[rows, TOPK_MAX]` candidate values and ids, in the canonical
+    /// order `sampling::cmp_candidates` defines: higher logit first, ties to
+    /// the lower id. Only rows with `row_k[row] > 0` are touched, so a greedy
+    /// request costs one predicated block exit.
+    ///
+    /// `row_k` is a device buffer rather than a launch argument because this
+    /// runs inside the captured decode graph: which rows sample, and with what
+    /// k, has to be changeable between replays without recapturing.
+    pub fn topk_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        row_k: &CudaSlice<i32>,
+        out_vals: &mut CudaSlice<f32>,
+        out_ids: &mut CudaSlice<i32>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        // Must match TOPK_THREADS in the kernel. One block owns a whole row,
+        // so the block is wide: the scan is latency bound and 256 threads left
+        // 197 dependent iterations per pass.
+        const THREADS: u32 = 1024;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (r, c) = (rows as i32, cols as i32);
+        let mut b = self.stream.launch_builder(&self.topk_rows);
+        b.arg(x).arg(row_k).arg(out_vals).arg(out_ids).arg(&r).arg(&c);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1510,6 +1557,222 @@ pub fn validate() -> Result<()> {
     }
     if argmax_bad > 0 {
         anyhow::bail!("device argmax disagreed with the host rule in {argmax_bad} case(s)");
+    }
+    println!();
+
+    // Device top-k, against the reference sampler.
+    //
+    // Checked two ways, because agreeing on the candidate set is not enough:
+    // the host walks candidates in order, so a correct set in the wrong order
+    // still generates different text. So this compares the ordered (id, value)
+    // pairs, and then the token actually selected from them for a fixed RNG
+    // state. The rows below are the cases where the two implementations could
+    // plausibly disagree -- ties, NaN, infinities, signed zero, plateaus, and
+    // maxima at the row edges.
+    let mut plateau = vec![2.5f32; vocab]; // every logit identical: lowest ids win
+    plateau[vocab - 1] = 9.0; // ...except one, so rank 0 is at the far edge
+
+    let mut edges = vec![-5.0f32; vocab];
+    edges[0] = 7.0;
+    edges[vocab / 2] = 6.5;
+    edges[vocab - 1] = 6.0;
+
+    let mut ties = vec![-9.0f32; vocab];
+    for i in 0..64 {
+        ties[i * 700] = 3.0; // 64 exact ties: k must cut by id, not arbitrarily
+    }
+
+    let mut signed_zero = vec![-1.0f32; vocab];
+    signed_zero[10] = 0.0;
+    signed_zero[11] = -0.0; // IEEE-equal to the above, so ordered by id
+    signed_zero[12] = -0.0;
+
+    let mut infinities = vec![0.0f32; vocab];
+    infinities[5] = f32::INFINITY;
+    infinities[6] = f32::NEG_INFINITY;
+    infinities[7] = f32::INFINITY;
+    infinities[8] = f32::MAX;
+
+    let mut one_nan = dense.clone();
+    one_nan[31338] = nan; // next to the maximum
+
+    let mut many_nan = vec![nan; vocab];
+    many_nan[3] = 1.0;
+    many_nan[4] = 2.0; // only two real values, so k > 2 has to admit NaNs
+
+    let mut nan_and_inf = vec![nan; vocab];
+    nan_and_inf[100] = f32::NEG_INFINITY;
+    nan_and_inf[200] = f32::INFINITY;
+
+    let topk_cases: [(&str, &Vec<f32>); 11] = [
+        ("dense", &dense),
+        ("exact tie", &tied),
+        ("close top-2", &close),
+        ("all negative", &all_neg),
+        ("plateau", &plateau),
+        ("edges", &edges),
+        ("64 ties", &ties),
+        ("signed zero", &signed_zero),
+        ("infinities", &infinities),
+        ("one NaN", &one_nan),
+        ("many NaN", &many_nan),
+    ];
+    let topk_rows = topk_cases.len() + 2; // + all-NaN + NaN with infinities
+
+    let mut flat2: Vec<f32> = Vec::with_capacity(topk_rows * vocab);
+    for (_, v) in topk_cases.iter() {
+        flat2.extend_from_slice(v);
+    }
+    flat2.extend_from_slice(&all_nan);
+    flat2.extend_from_slice(&nan_and_inf);
+    let named: Vec<(&str, &[f32])> = topk_cases
+        .iter()
+        .map(|(n, v)| (*n, v.as_slice()))
+        .chain([("all NaN", all_nan.as_slice()), ("NaN + inf", nan_and_inf.as_slice())])
+        .collect();
+
+    let d_rows2 = gpu.to_device(&flat2)?;
+    let mut d_cv = gpu.alloc(topk_rows * TOPK_MAX)?;
+    let mut d_ci = gpu.to_device_i32(&vec![-1i32; topk_rows * TOPK_MAX])?;
+
+    // Compares the ordered (id, value) pairs against `sampling::top_k`, and the
+    // token those candidates select for fixed RNG states against what the same
+    // sampler picks from the full row.
+    let check = |v: &[f32], got: &[(usize, f32)], k: usize| -> bool {
+        let want = crate::sampling::top_k(v, k);
+        // Bit equality, not value equality: the kernel returns the logit it
+        // read, so a NaN has to come back as the same NaN.
+        if got.len() != want.len()
+            || !got.iter().zip(&want).all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits())
+        {
+            return false;
+        }
+        for (temp, seed) in [(0.8f32, 7u64), (1.0, 4242), (0.2, 1), (2.5, 99)] {
+            let cfg = crate::sampling::GenerationConfig {
+                max_tokens: 1,
+                temperature: temp,
+                top_k: k,
+                seed,
+            };
+            let mut ra = crate::sampling::Rng::new(seed);
+            let mut rb = crate::sampling::Rng::new(seed);
+            for _ in 0..8 {
+                if crate::sampling::sample(v, &cfg, &mut ra)
+                    != crate::sampling::sample_candidates(got, &cfg, &mut rb)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    let read_row = |cv: &[f32], ci: &[i32], row: usize, k: usize| -> Vec<(usize, f32)> {
+        let base = row * TOPK_MAX;
+        (0..k).map(|j| (ci[base + j] as usize, cv[base + j])).collect()
+    };
+
+    let ks = [1usize, 2, 5, 40, TOPK_MAX];
+    let mut topk_bad = 0usize;
+    let mut grid: Vec<Vec<bool>> = Vec::new();
+    for &k in &ks {
+        let d_k = gpu.to_device_i32(&vec![k as i32; topk_rows])?;
+        gpu.topk_rows(&d_rows2, &d_k, &mut d_cv, &mut d_ci, topk_rows, vocab)?;
+        gpu.sync()?;
+        let cv = gpu.to_host_n(&d_cv, topk_rows * TOPK_MAX)?;
+        let ci = gpu.to_host_i32_n(&d_ci, topk_rows * TOPK_MAX)?;
+        grid.push(
+            named.iter().enumerate()
+                .map(|(row, (_, v))| check(v, &read_row(&cv, &ci, row, k), k))
+                .collect(),
+        );
+    }
+    print!("{:<14}", "top-k case");
+    for k in ks {
+        print!("{:>8}", format!("k={k}"));
+    }
+    println!();
+    for (row, (name, _)) in named.iter().enumerate() {
+        print!("{name:<14}");
+        for c in grid.iter() {
+            if !c[row] {
+                topk_bad += 1;
+            }
+            print!("{:>8}", if c[row] { "ok" } else { "MISMATCH" });
+        }
+        println!();
+    }
+
+    // Every row a different k in one launch, which is what a mixed batch looks
+    // like -- and the case a kernel that quietly assumed a uniform k would pass
+    // every test above and still be wrong in production.
+    let mixed: Vec<i32> = (0..topk_rows).map(|r| ((r * 13) % TOPK_MAX + 1) as i32).collect();
+    let d_k = gpu.to_device_i32(&mixed)?;
+    gpu.topk_rows(&d_rows2, &d_k, &mut d_cv, &mut d_ci, topk_rows, vocab)?;
+    gpu.sync()?;
+    let cv = gpu.to_host_n(&d_cv, topk_rows * TOPK_MAX)?;
+    let ci = gpu.to_host_i32_n(&d_ci, topk_rows * TOPK_MAX)?;
+    let mut mixed_ok = true;
+    for (row, (_, v)) in named.iter().enumerate() {
+        let k = mixed[row] as usize;
+        if !check(v, &read_row(&cv, &ci, row, k), k) {
+            mixed_ok = false;
+        }
+        // Slots past k must be marked, not left holding an earlier step's row.
+        if ci[row * TOPK_MAX + k..(row + 1) * TOPK_MAX].iter().any(|&x| x != -1) {
+            mixed_ok = false;
+        }
+    }
+    // Rows the caller did not ask for must not be touched at all.
+    let skip: Vec<i32> = (0..topk_rows).map(|r| if r % 2 == 0 { 0 } else { 7 }).collect();
+    let d_k = gpu.to_device_i32(&skip)?;
+    let sentinel = vec![-42.0f32; topk_rows * TOPK_MAX];
+    let mut d_cv2 = gpu.to_device(&sentinel)?;
+    gpu.topk_rows(&d_rows2, &d_k, &mut d_cv2, &mut d_ci, topk_rows, vocab)?;
+    gpu.sync()?;
+    let cv2 = gpu.to_host_n(&d_cv2, topk_rows * TOPK_MAX)?;
+    let skipped_untouched = (0..topk_rows)
+        .filter(|r| r % 2 == 0)
+        .all(|r| cv2[r * TOPK_MAX..(r + 1) * TOPK_MAX].iter().all(|&x| x == -42.0));
+    if !mixed_ok || !skipped_untouched {
+        topk_bad += 1;
+    }
+    println!("{:<14}{:>8}{:>8}", "per-row k",
+             if mixed_ok { "ok" } else { "MISMATCH" },
+             if skipped_untouched { "ok" } else { "TOUCHED" });
+
+    // Random rows, because the adversarial cases above were all chosen by
+    // someone who already knew where the kernel might break.
+    let mut rng = crate::sampling::Rng::new(20260903);
+    let mut fuzz_bad = 0usize;
+    for trial in 0..8 {
+        let mut flat3: Vec<f32> = Vec::with_capacity(topk_rows * vocab);
+        for _ in 0..topk_rows {
+            for _ in 0..vocab {
+                // Heavy-tailed, so exact ties happen often enough to matter.
+                let u = rng.next_f32();
+                flat3.push(if u < 0.15 { (u * 40.0).round() * 0.25 } else { u * 24.0 - 12.0 });
+            }
+        }
+        let d3 = gpu.to_device(&flat3)?;
+        let k = [3usize, 7, 40, 128][trial % 4];
+        let d_k = gpu.to_device_i32(&vec![k as i32; topk_rows])?;
+        gpu.topk_rows(&d3, &d_k, &mut d_cv, &mut d_ci, topk_rows, vocab)?;
+        gpu.sync()?;
+        let cv = gpu.to_host_n(&d_cv, topk_rows * TOPK_MAX)?;
+        let ci = gpu.to_host_i32_n(&d_ci, topk_rows * TOPK_MAX)?;
+        for row in 0..topk_rows {
+            let v = &flat3[row * vocab..(row + 1) * vocab];
+            if !check(v, &read_row(&cv, &ci, row, k), k) {
+                fuzz_bad += 1;
+            }
+        }
+    }
+    println!("{:<14}{:>8}   {} random rows", "fuzz",
+             if fuzz_bad == 0 { "ok" } else { "MISMATCH" }, 8 * topk_rows);
+    topk_bad += fuzz_bad;
+
+    if topk_bad > 0 {
+        anyhow::bail!("device top-k disagreed with the reference in {topk_bad} case(s)");
     }
     println!();
 

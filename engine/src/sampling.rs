@@ -24,6 +24,27 @@
 //! down every other request in the batch. Comparisons here are NaN-safe and
 //! NaN never wins, matching the device argmax. That is a deliberate hardening,
 //! not an accident, and it is tested.
+//!
+//! # Candidate order is canonical, and that changed generated text once
+//!
+//! The candidate set used to come out of `select_nth_unstable_by` and be walked
+//! in whatever order that left behind: correct as a set, arbitrary as a
+//! sequence. Which token a given random threshold lands on depends on that
+//! sequence, so the arbitrary order was load-bearing without being defined
+//! anywhere.
+//!
+//! That became untenable once top-k extraction moved onto the GPU, where thread
+//! scheduling would otherwise decide the order. Candidates are therefore sorted
+//! into one **canonical order** -- higher logit first, ties to the lower token
+//! id -- which is a strict total order (token ids are unique, so nothing is
+//! ever tied) and so reproducible anywhere, host or device.
+//!
+//! This changed which token a given seed produces. The candidate *set* is
+//! identical and each candidate's probability is identical, so the distribution
+//! being sampled from did not change at all -- only which member of it a
+//! particular threshold selects. Seeds recorded before this change do not
+//! reproduce their old text; seeds recorded after it reproduce everywhere,
+//! which is the property actually worth having.
 
 /// xorshift64*, so sampling is reproducible without pulling in a rand crate.
 ///
@@ -127,6 +148,137 @@ pub fn argmax(logits: &[f32]) -> usize {
     best
 }
 
+/// The canonical order over `(token id, logit)` candidates.
+///
+/// Higher logit first; equal logits resolved to the lower token id. Because
+/// token ids are unique this is a *strict total order* -- no two candidates
+/// ever compare `Equal` -- which is the property that matters: a correct top-k
+/// set has exactly one canonical arrangement, so the host and the GPU can
+/// produce it independently and agree by construction rather than by luck.
+///
+/// Consistent with `argmax`: the first candidate under this order is the
+/// highest logit with the lowest index, which is exactly what `argmax` returns.
+pub fn cmp_candidates(a: (usize, f32), b: (usize, f32)) -> std::cmp::Ordering {
+    cmp_desc(a.1, b.1).then_with(|| a.0.cmp(&b.0))
+}
+
+/// Order-preserving map from a logit to an unsigned integer.
+///
+/// Bitwise throughout, with two cases that exist to match `cmp_desc`: NaN maps
+/// below every real value including -inf, and -0.0 maps to +0.0's key because
+/// IEEE says they are equal and the order must then fall through to the token
+/// id. Key 0 is reserved for NaN and nothing else can produce it -- that would
+/// need `0xFFFFFFFF`, itself a NaN.
+///
+/// The `topk_value_key` device function is this, line for line. Having one
+/// definition of the order in two languages is the price of computing it in two
+/// places; having two definitions would be the bug.
+/// Written with masks rather than branches: the sign of a logit is a coin
+/// flip, so a branch here is 50304 unpredictable jumps per row.
+fn value_key(v: f32) -> u32 {
+    let u = v.to_bits();
+    // -0.0 keys as +0.0.
+    let u = u & !((u == 0x8000_0000) as u32).wrapping_neg();
+    // Flip the sign bit for positives, invert everything for negatives.
+    let key = u ^ ((((u as i32) >> 31) as u32) | 0x8000_0000);
+    // NaN below everything, including -inf.
+    key & (((u & 0x7fff_ffff) <= 0x7f80_0000) as u32).wrapping_neg()
+}
+
+/// The canonical order as a single sortable integer, descending.
+///
+/// High half orders by value, low half by the complement of the token id, so
+/// one `u64` comparison decides what `cmp_candidates` decides. Selecting on
+/// these rather than on `(usize, f32)` pairs halves the bytes moved and turns
+/// each comparison into one instruction instead of a call through a closure --
+/// worth doing on a 50304-entry vocabulary, where selection is the dominant
+/// cost of the full-logit path.
+fn sort_key(v: f32, i: usize) -> u64 {
+    debug_assert!(i <= u32::MAX as usize, "token id must fit the key's low half");
+    ((value_key(v) as u64) << 32) | (u32::MAX - i as u32) as u64
+}
+
+/// The `k` best candidates of `logits`, in canonical order.
+///
+/// The reference implementation of what the device top-k kernel computes, and
+/// the fallback used when a request asks for more candidates than the kernel
+/// can hold.
+pub fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let mut keys: Vec<u64> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, v)| sort_key(*v, i))
+        .collect();
+    // top_k = 0 means "no limit" in most APIs; here it clamps to 1, matching
+    // the CLI. Values above the vocabulary clamp down to it.
+    let k = k.clamp(1, keys.len());
+    // Partial selection: the full vocabulary is 50304 entries and only k of
+    // them can be chosen, so a full sort would be wasted work. Keys are unique,
+    // so the split is exact -- there is no boundary tie left to resolve
+    // arbitrarily.
+    keys.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+    keys.truncate(k);
+    // ...and only then sort, which is k log k rather than n log n.
+    keys.sort_unstable_by(|a, b| b.cmp(a));
+    keys.into_iter()
+        .map(|key| {
+            let i = (u32::MAX - (key as u32)) as usize;
+            (i, logits[i])
+        })
+        .collect()
+}
+
+/// Select one token from a candidate set that is already in canonical order.
+///
+/// The only place temperature, the probability sum and the threshold walk are
+/// implemented. Whether the candidates were found by `top_k` on the host or by
+/// the top-k kernel on the device, the arithmetic that turns them into a token
+/// is this function and nothing else.
+pub fn sample_candidates(cands: &[(usize, f32)], cfg: &GenerationConfig, rng: &mut Rng) -> usize {
+    if cands.is_empty() {
+        return 0;
+    }
+    // Canonical order puts the best candidate first, so this is `argmax` over
+    // the whole row without needing the whole row.
+    let best = cands[0].0;
+
+    let max = cands
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, |m, v| if v > m { v } else { m });
+
+    // Accumulate in f64: with a low temperature the exponentials span many
+    // orders of magnitude and an f32 sum loses the tail entirely.
+    let mut weights: Vec<f32> = Vec::with_capacity(cands.len());
+    let mut sum = 0.0f64;
+    for (_, v) in cands {
+        let scaled = ((*v - max) / cfg.temperature).exp();
+        let w = if scaled.is_finite() { scaled } else { 0.0 };
+        weights.push(w);
+        sum += w as f64;
+    }
+
+    if !(sum > 0.0) {
+        // Every candidate underflowed or was NaN. Fall back to the best token
+        // rather than returning an arbitrary one.
+        return best;
+    }
+
+    let threshold = rng.next_f32() as f64 * sum;
+    let mut acc = 0.0f64;
+    for (i, (id, _)) in cands.iter().enumerate() {
+        acc += weights[i] as f64;
+        if acc >= threshold {
+            return *id;
+        }
+    }
+    // Reachable only through floating-point accumulation error.
+    cands.last().map(|(i, _)| *i).unwrap_or(0)
+}
+
 /// Select one token.
 ///
 /// `temperature <= 0` is greedy and does not touch `rng`, so a greedy request
@@ -139,46 +291,7 @@ pub fn sample(logits: &[f32], cfg: &GenerationConfig, rng: &mut Rng) -> usize {
     if logits.is_empty() {
         return 0;
     }
-
-    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    // top_k = 0 means "no limit" in most APIs; here it clamps to 1, matching
-    // the CLI. Values above the vocabulary clamp down to it.
-    let k = cfg.top_k.clamp(1, ranked.len());
-    // Partial selection: the full vocabulary is 50304 entries and only k of
-    // them can be chosen, so a full sort would be wasted work.
-    ranked.select_nth_unstable_by(k - 1, |a, b| cmp_desc(a.1, b.1));
-    ranked.truncate(k);
-
-    let max = ranked
-        .iter()
-        .map(|(_, v)| *v)
-        .fold(f32::NEG_INFINITY, |m, v| if v > m { v } else { m });
-
-    // Accumulate in f64: with a low temperature the exponentials span many
-    // orders of magnitude and an f32 sum loses the tail entirely.
-    let mut sum = 0.0f64;
-    for (_, v) in ranked.iter_mut() {
-        let scaled = ((*v - max) / cfg.temperature).exp();
-        *v = if scaled.is_finite() { scaled } else { 0.0 };
-        sum += *v as f64;
-    }
-
-    if !(sum > 0.0) {
-        // Every candidate underflowed or was NaN. Fall back to the best token
-        // rather than returning an arbitrary one.
-        return argmax(logits);
-    }
-
-    let threshold = rng.next_f32() as f64 * sum;
-    let mut acc = 0.0f64;
-    for (id, weight) in &ranked {
-        acc += *weight as f64;
-        if acc >= threshold {
-            return *id;
-        }
-    }
-    // Reachable only through floating-point accumulation error.
-    ranked.last().map(|(i, _)| *i).unwrap_or(0)
+    sample_candidates(&top_k(logits, cfg.top_k), cfg, rng)
 }
 
 /// Validate a configuration, returning a message a caller can act on.
@@ -440,5 +553,151 @@ mod tests {
         assert!(validate(&cfg(1000.0, 40, 1), vocab).is_err());
         // Clamping is documented, so an oversized top_k is accepted.
         assert!(validate(&cfg(0.8, 999_999, 1), vocab).is_ok());
+    }
+
+    // --- canonical candidate order ---
+    //
+    // These pin the contract the top-k kernel has to reproduce. If one of them
+    // starts failing, the GPU and the host have stopped agreeing about what
+    // "the top k candidates" means, which is a silent-divergence bug rather
+    // than a crash.
+
+    /// Brute-force top-k: sort everything, take k. Slow and obviously correct.
+    fn reference_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+        let mut all: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        all.sort_by(|a, b| cmp_candidates(*a, *b));
+        all.truncate(k.clamp(1, logits.len()));
+        all
+    }
+
+    fn same(a: &[(usize, f32)], b: &[(usize, f32)]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan()))
+            })
+    }
+
+    #[test]
+    fn the_packed_key_orders_exactly_as_the_comparator_does() {
+        // top_k selects on packed keys for speed; cmp_candidates is the
+        // definition. If they ever disagree, the fast path silently returns a
+        // different candidate set from the one the docs describe -- and from
+        // the one the GPU kernel, which uses the same key, returns.
+        let values = [
+            0.0f32, -0.0, 1.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
+            f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 3.4e38, -3.4e38, 1e-30, -1e-30,
+        ];
+        for (ia, a) in values.iter().enumerate() {
+            for (ib, b) in values.iter().enumerate() {
+                if ia == ib {
+                    continue;
+                }
+                let by_key = sort_key(*b, ib).cmp(&sort_key(*a, ia));
+                let by_cmp = cmp_candidates((ia, *a), (ib, *b));
+                assert_eq!(by_key, by_cmp, "{a} at {ia} vs {b} at {ib}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_matches_brute_force_on_random_rows() {
+        for seed in 0..40u64 {
+            let mut r = Rng::new(seed);
+            let logits: Vec<f32> = (0..1000).map(|_| r.next_f32() * 20.0 - 10.0).collect();
+            for k in [1usize, 2, 5, 40, 128, 999, 1000] {
+                let got = top_k(&logits, k);
+                let want = reference_top_k(&logits, k);
+                assert!(same(&got, &want), "seed {seed} k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_order_is_descending_by_value_then_ascending_by_id() {
+        let logits = vec![1.0, 3.0, 3.0, 2.0, 3.0];
+        let got = top_k(&logits, 4);
+        // Three-way tie at 3.0 resolves by id: 1, 2, 4. Then 2.0 at index 3.
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn ties_at_the_k_boundary_select_the_lower_id() {
+        // Four values tied at 5.0; k=2 must take ids 0 and 1, never 2 or 3.
+        let logits = vec![5.0, 5.0, 5.0, 5.0];
+        let got = top_k(&logits, 2);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn negative_zero_ties_with_positive_zero() {
+        // IEEE says -0.0 == 0.0, so these are tied and resolve by id. The
+        // device key mapping has to agree, which is why this is pinned here.
+        let logits = vec![-1.0, 0.0, -0.0, -2.0];
+        let got = top_k(&logits, 2);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 2]);
+        let flipped = vec![-1.0, -0.0, 0.0, -2.0];
+        let got = top_k(&flipped, 2);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn nan_sorts_below_negative_infinity() {
+        let logits = vec![f32::NAN, f32::NEG_INFINITY, f32::NAN, -1.0e38];
+        let got = top_k(&logits, 4);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn infinity_sorts_above_everything() {
+        let logits = vec![1.0e38, f32::INFINITY, 0.0, f32::INFINITY];
+        let got = top_k(&logits, 3);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 3, 0]);
+    }
+
+    #[test]
+    fn maxima_at_the_first_and_last_index_are_both_found() {
+        let mut logits = vec![0.0f32; 500];
+        logits[0] = 9.0;
+        logits[499] = 8.0;
+        let got = top_k(&logits, 2);
+        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![0, 499]);
+    }
+
+    #[test]
+    fn sample_candidates_agrees_with_sample_on_full_logits() {
+        // The device path calls sample_candidates with candidates the kernel
+        // found; the host path calls sample. Identical candidates must give
+        // identical tokens, or the two paths generate different text.
+        let logits: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.37).sin() * 6.0).collect();
+        for (temp, k) in [(0.8f32, 40usize), (1.0, 5), (0.3, 128), (2.0, 1)] {
+            let c = cfg(temp, k, 77);
+            let mut a = Rng::new(77);
+            let mut b = Rng::new(77);
+            let cands = top_k(&logits, k);
+            for step in 0..64 {
+                let via_full = sample(&logits, &c, &mut a);
+                let via_cands = sample_candidates(&cands, &c, &mut b);
+                assert_eq!(via_full, via_cands, "temp {temp} k {k} step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn sample_candidates_never_leaves_the_candidate_set() {
+        let logits: Vec<f32> = (0..300).map(|i| ((i as f32) * 1.1).cos() * 4.0).collect();
+        let cands = top_k(&logits, 7);
+        let ids: std::collections::HashSet<usize> = cands.iter().map(|c| c.0).collect();
+        for seed in 0..300u64 {
+            let mut rng = Rng::new(seed);
+            let picked = sample_candidates(&cands, &cfg(1.5, 7, seed), &mut rng);
+            assert!(ids.contains(&picked), "seed {seed} escaped the candidate set");
+        }
+    }
+
+    #[test]
+    fn an_all_nan_candidate_set_still_returns_a_valid_token() {
+        let cands = vec![(0usize, f32::NAN), (1, f32::NAN)];
+        let mut rng = Rng::new(3);
+        assert_eq!(sample_candidates(&cands, &cfg(0.8, 2, 3), &mut rng), 0);
     }
 }

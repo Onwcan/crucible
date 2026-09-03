@@ -1652,8 +1652,8 @@ worth less than one they can, so an omitted seed uses a fixed documented default
 
 Token selection lives in `sampling.rs`, shared by the CLI and the runtime. It
 was previously duplicated, which meant the same prompt and seed could produce
-different text depending on which entry point ran it. Unifying them changed two
-behaviours, both deliberate:
+different text depending on which entry point ran it. Unifying them changed
+three behaviours, all deliberate:
 
 - **Greedy ties now resolve to the lowest index.** The CLI used `max_by`, which
   returns the *last* maximum; the GPU argmax kernel returns the *first*. Two
@@ -1662,6 +1662,21 @@ behaviours, both deliberate:
   `partial_cmp().unwrap()`. In a CLI that is a crash; in a shared inference
   thread it would take down every other request in the batch. NaN now sorts
   lowest and never wins, matching the kernel.
+- **Candidate order is canonical.** The candidate list used to come out of
+  `select_nth_unstable_by` and be walked in whatever order that left behind:
+  correct as a set, arbitrary as a sequence. Since the walk order decides which
+  token a random threshold lands on, that arbitrary order was load-bearing
+  without being defined anywhere. It is now *higher logit first, ties to the
+  lower token id* — a strict total order, because token ids are unique. See
+  [device-side top-k](#device-side-top-k), which is why it had to be pinned
+  down.
+
+The last of these changed which token a given seed produces. The candidate set
+is identical and each candidate's probability is identical, so the distribution
+did not change at all — only which member of it a particular threshold selects.
+Seeds recorded before the change do not reproduce their old text; seeds recorded
+after it reproduce everywhere, host or device, which is the property worth
+having.
 
 ### Per-request RNG
 
@@ -1672,41 +1687,159 @@ reused by unrelated requests between steps. The invariant:
 > a request run alone with seed S produces exactly the same tokens when run
 > concurrently with unrelated requests.
 
-Verified by `gpu-sampling` across six requests mixing greedy and sampled,
-prompt lengths 15 to 511, temperatures 0.3 to 1.0, top-k 5 to 40 and four
+Verified by `gpu-sampling` across seven requests mixing greedy and sampled,
+prompt lengths 15 to 511, temperatures 0.3 to 1.0, top-k 5 to 500 and five
 different seeds — identical alone and batched, under simultaneous *and*
-staggered admission, and across a cancellation that reuses the same seed.
+staggered admission, and across a cancellation that reuses the same seed. The
+whole matrix runs twice, once on each selection path, so the fallback is held to
+the same guarantee and the two paths are pinned to each other.
 
 Greedy consumes no randomness, which is what lets a batch mix both without one
 perturbing the other.
 
-### Mixed batches, and what sampling costs
+### Mixed batches
 
 The forward pass stays batched regardless of decoding policy; only selection
 diverges after the logits exist. Greedy rows keep the device-argmax fast path
-and copy 4 bytes; sampled rows copy their own logits row. Rows are copied
-individually rather than as a block, because with one sampled request in a batch
-of sixteen a block copy would move 3.2 MB to use 200 KB of it.
+and copy 4 bytes. Sampled rows take their candidates from the device top-k
+kernel below, or — if they ask for more candidates than it holds — copy their
+own full logits row.
 
-159.66 W, 3090 MHz, prompts 32/128/256/512 cycled, 64 tokens, temperature 0.8,
-top-k 40:
+That choice is made per row, not per batch. One request asking for an unusually
+wide top-k must not drag the other fifteen onto the slow path with it, and
+`gpu-sampling` runs exactly that mixture: seven requests, six taking the device
+path and one, at `top_k` 500, not.
 
-| batch | greedy | all sampled | mixed 50/50 | D2H greedy | D2H sampled |
+### Device-side top-k
+
+Sampled decode was the slowest thing in the runtime, and the reason was
+measurable rather than mysterious. At batch 16, greedy ran at 7,913 tok/s and
+all-sampled at 3,931 — because every sampled row copied a 50,304-float logits
+row to the host so the host could pick 40 of them.
+
+| D2H per step | greedy | sampled, full logits | sampled, device top-k |
+|---:|---:|---:|---:|
+| batch 1 | 4 B | 201,220 B | 1,028 B |
+| batch 4 | 16 B | 804,880 B | 4,112 B |
+| batch 8 | 32 B | 1,609,760 B | 8,224 B |
+| batch 16 | 64 B | 3,219,520 B | 16,448 B |
+
+196x less at batch 16. The transfer was only half of it: the host then ran a
+selection over 50,304 entries per row per step, which measures 80 µs on its own.
+
+`topk_rows_f32` returns the `k` best `(value, id)` pairs per row instead, in
+canonical order, and the host samples from those. One block per row;
+`row_k[row] == 0` skips the row, which is how greedy requests pay nothing.
+
+**Radix select, not a heap.** Extracting the maximum `k` times is `k` passes
+over the row — at `k` = 40 that is 8 MB per row and it would dominate the step.
+A per-thread top-k in registers needs `k` slots per thread to be correct in the
+worst case, since one thread can own several of the global top-k, and that does
+not fit. Counting instead finds the exact threshold: one histogram pass per
+digit, narrowing the key from the top down, then one pass to collect everything
+at or above it. Three digits (11 + 11 + 10 bits) resolve the float key, and by
+then the k-th value is unique, so the common case is four passes and only the
+first touches DRAM.
+
+**Ties are where this gets interesting.** The key is 64 bits — the
+order-preserving map of the float in the high half, the complement of the token
+id in the low half — so descending order on it *is* the canonical order, and no
+two keys are ever equal. That is what makes the result independent of thread
+scheduling: a correct top-k set has exactly one canonical arrangement, so the
+kernel and the host reference agree by construction rather than by luck. When
+logits tie exactly, the index half of the key decides, and the kernel keeps
+narrowing into it rather than taking whichever ids a thread happened to see
+first.
+
+Two special cases exist only to match the host comparator: NaN maps below
+everything including -inf, and -0.0 maps to +0.0's key, because IEEE says they
+are equal and the order must then fall through to the id. Both are done on the
+bit pattern, so `--use_fast_math` cannot move a value across a boundary.
+
+The host reference computes the same key, with masks rather than branches on
+both sides — the sign of a logit is a coin flip, and the branchy version of that
+function measured 3.7x slower over a 50304-entry row. Having one definition of
+the order in two languages is the price of computing it in two places; having
+two definitions would be the bug.
+
+#### Buffers and graph integration
+
+`row_k` (`[max_batch]` i32), `cand_vals` and `cand_ids` (`[max_batch, 128]`
+each) are allocated once with the rest of the batch scratch — 16 KB at batch 16,
+nothing per step. The kernel writes from inside the captured decode graph, so
+candidates are ready the moment replay ends.
+
+Which rows sample, and with what `k`, lives in `row_k` — a device buffer, so it
+can change every step without recapturing anything. Only *whether any row
+samples at all* selects a graph, which is one bit, so there are two graphs per
+batch size instead of one. A single graph carrying the launch unconditionally
+also works — `row_k` already makes it a no-op — but it measured a consistent 1%
+off batch-1 greedy, and greedy not paying for sampling is the point. For the
+same reason `row_k` is only uploaded when it changes: an all-greedy run would
+otherwise pay a host-to-device copy per step that the engine did not make
+before.
+
+#### Fallback
+
+`top_k` above 128 falls back to the full-logit path, which stays as the
+reference the kernel is validated against and can be forced on with
+`CRUCIBLE_DEVICE_TOPK=0`. 128 covers the default of 40 and everything above it
+with a reason to exist; requests are *not* clamped to it, because clamping would
+quietly answer a different question than the one asked.
+
+#### What it costs, and what it buys
+
+152.44 W, 3090 MHz, prompts 32/128/256/512 cycled, 64 tokens, temperature 0.8,
+top-k 40, 5 interleaved trials. Every sampled mode ran both ways within the same
+trial, so drift cannot masquerade as a difference between them:
+
+| batch | greedy | sampled, full logits | sampled, device top-k | mixed, full | mixed, device |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 1,520 t/s | 1,296 (0.85x) | — | 4 B | 201 KB |
-| 4 | 3,046 t/s | 2,151 (0.71x) | 2,541 (0.83x) | 16 B | 805 KB |
-| 8 | 5,273 t/s | 3,061 (0.58x) | 3,918 (0.74x) | 32 B | 1.6 MB |
-| 16 | 8,358 t/s | 3,960 (0.47x) | 5,389 (0.64x) | 64 B | 3.2 MB |
+| 1 | 1,536 t/s | 1,224 (0.80x) | **1,466 (0.95x)** | — | — |
+| 4 | 3,031 t/s | 2,178 (0.72x) | **2,868 (0.95x)** | 2,537 (0.84x) | 2,895 (0.96x) |
+| 8 | 5,228 t/s | 3,097 (0.59x) | **5,030 (0.96x)** | 3,915 (0.75x) | 5,018 (0.96x) |
+| 16 | 7,913 t/s | 3,931 (0.50x) | **7,781 (0.98x)** | 5,180 (0.65x) | 7,528 (0.95x) |
 
-Greedy is unchanged from before sampling existed (8,358 against 8,366 at batch
-16). The cost of sampling is the transfer, and it tracks the byte count almost
-exactly: 15% at batch 1, 53% at batch 16 all-sampled. At batch 1 the "mixed"
-column is empty because a single row cannot be half sampled.
+Sampling used to cost half the throughput at batch 16. It now costs 2%. The
+ratios in bold are against greedy; against the full-logit path the same rows are
+1.20x, 1.32x, 1.62x and 1.98x. At batch 1 the mixed columns are empty because a
+single row cannot be half sampled.
 
-**Whether a device-side top-k is worth building is now a measured question
-rather than a guess.** It would cut 3.2 MB/step to roughly 5 KB at batch 16, and
-that is the only remaining term. It is deliberately not built here: a correct
-sampled path first, then the measurement, then the decision.
+The selection stage on its own, at `k` = 40 (`gpu-topk-bench`, 150.45 W):
+
+| sampled rows | kernel | candidate D2H | full-logit D2H | host top-k | new total | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 24.9 µs | 41.6 µs | 38.7 µs | 79.9 µs | 66 µs | 1.8x |
+| 4 | 23.1 µs | 61.1 µs | 153.4 µs | 318.2 µs | 84 µs | 5.6x |
+| 8 | 23.5 µs | 36.6 µs | 312.4 µs | 581.4 µs | 60 µs | 14.9x |
+| 16 | 24.4 µs | 38.8 µs | 635.6 µs | 1,249.1 µs | 63 µs | 29.8x |
+
+The kernel is flat in both dimensions: one block per row, and 16 blocks fit on
+60 SMs, so sixteen rows cost what one row costs. Flat in `k` too, from 5 to 128
+— the work is the passes over the row, not the size of the answer. The
+candidate transfer is two blocks of `rows * 128` regardless of `k`, small enough
+that its 37–62 µs is transfer-call overhead rather than bytes.
+
+**No dispatch threshold was needed.** The plan allowed for one, on the
+suspicion that the kernel might lose to a single 201 KB copy at small batch. It
+does not: the device path is ahead at one sampled row — 1.20x end to end, 1.8x
+in isolation — and pulls further ahead from there. Shipping a crossover the
+measurements do not show would have been shipping a guess.
+
+#### Greedy did not regress
+
+Interleaved against the previous commit, five rounds with the order alternating,
+149.0–165.6 W, `gpu-serve-bench` medians:
+
+| batch | before | after |
+|---:|---:|---:|
+| 1 | 1,613 t/s | 1,618 t/s |
+| 4 | 3,038 t/s | 3,038 t/s |
+| 8 | 5,193 t/s | 5,192 t/s |
+| 16 | 7,790 t/s | 7,849 t/s |
+
++0.3%, 0.0%, 0.0%, +0.8% — well inside the benchmark's own run-to-run spread,
+with signs in both directions.
 
 ## Terminal client
 
@@ -2031,7 +2164,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
 - [x] Ratatui TUI client — streaming chat, cancellation, live telemetry
 - [x] Per-request sampling — temperature, top-k, deterministic seeds, through
       HTTP/SSE and the TUI, with the greedy fast path preserved
-- [ ] Device-side top-k — measured at 3.2 MB/step of logits transfer at batch 16
+- [x] Device-side top-k — 196x less D2H; sampled decode 1.20x to 1.98x faster
+      and now within 2% of greedy, with greedy itself unchanged
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

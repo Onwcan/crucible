@@ -1251,6 +1251,255 @@ extern "C" __global__ void argmax_rows_f32(
 }
 
 // ===========================================================================
+// Row-wise top-k extraction
+//
+// Device argmax fixed the greedy path: one id per request instead of a 201 KB
+// logits row. A sampled request still needed the whole row, because top-k and
+// the threshold walk ran on the host -- so a batch of 16 sampled requests moved
+// 3.2 MB per step to use 16 * 40 * 4 bytes of it, and measured 3960 tok/s
+// against greedy's 8358. This kernel closes that gap: it returns the k best
+// (value, id) pairs per row, and the host samples from those.
+//
+// ---------------------------------------------------------------------------
+// Canonical order
+// ---------------------------------------------------------------------------
+//
+// The host walks the candidate list in order, so the order decides which token
+// a given random threshold selects. Letting thread scheduling decide it would
+// make generation non-reproducible. The order is therefore defined:
+//
+//     higher logit first; equal logits resolved to the LOWER token id
+//
+// Because token ids are unique, that is a strict total order -- no two
+// candidates are ever tied -- so the top-k set has exactly one valid
+// arrangement and the kernel cannot disagree with the host reference by
+// accident. It is expressed as a single 64-bit key, descending:
+//
+//     [63:32] order-preserving map of the float
+//     [31:0]  complement of the token id, so lower ids sort first
+//
+// The float map has to reproduce the host comparator exactly, which means two
+// special cases: NaN sorts below everything including -inf (the host's cmp_desc
+// treats NaN as smallest, and the argmax kernel never lets NaN win), and -0.0
+// must key identically to +0.0 (IEEE says they are equal, so the host resolves
+// them by id). Both are done on the bit pattern rather than with float
+// comparisons, so --use_fast_math cannot change the answer.
+//
+// ---------------------------------------------------------------------------
+// Why radix select rather than a heap or a sorting network
+// ---------------------------------------------------------------------------
+//
+// Extracting the max k times is k passes over 50304 floats -- at k=40 that is
+// 8 MB per row and it dominates the step. A per-thread top-k in registers needs
+// k slots per thread to be correct in the worst case (one thread can own
+// several of the global top-k), which does not fit. Radix select instead finds
+// the exact threshold by counting: one histogram pass per digit, narrowing the
+// key from the top down, then one pass to collect everything at or above it.
+//
+// The common case costs 4 passes: three digits resolve the 32-bit float key
+// (11 + 11 + 10 bits), and by then the k-th value is unique so the index half
+// of the key is never examined. The index digits exist for exact ties, where
+// "the k lowest ids among equal logits" has to be selected rather than
+// whichever ids a thread happened to see first. Only the first pass touches
+// DRAM; the rest hit L2.
+// ===========================================================================
+
+// Candidate capacity per row. Requests asking for more than this fall back to
+// the full-logit path on the host, which stays as the reference implementation.
+// 128 covers the default top-k of 40 and every value anyone has reason to use;
+// the cost of the choice is the D2H block, 8 bytes per slot per row, so at
+// batch 16 the whole candidate transfer is 16 KB against 3.2 MB.
+#define TOPK_MAX 128
+// Wide blocks because the row scan is latency bound, not compute bound: one
+// block owns a whole 50304-float row, and at 256 threads that is 197 dependent
+// iterations per pass.
+#define TOPK_THREADS 1024
+// Threads taking part in the bucket scan, independent of block width. The scan
+// finishes serially in one thread, so widening the block must not lengthen it.
+#define TOPK_PARTS 256
+// 2^11, the widest digit used. Buckets are scanned in TOPK_PARTS chunks, so
+// every digit width must divide evenly: 2048/256 = 8 and 1024/256 = 4.
+#define TOPK_BUCKETS 2048
+
+// Order-preserving map from a float to an unsigned int.
+//
+// Bitwise throughout: no float comparison, so flush-to-zero and fast-math
+// cannot move a value across a boundary. Key 0 is reserved for NaN and no
+// other input can produce it -- that would need u == 0xFFFFFFFF, itself a NaN.
+//
+// Masks rather than branches, matching the host `value_key` instruction for
+// instruction: the sign of a logit is a coin flip, and on the host the branchy
+// version measured 3.7x slower over a 50304-entry row.
+__device__ __forceinline__ unsigned int topk_value_key(float v)
+{
+    unsigned int u = __float_as_uint(v);
+    u &= ~(unsigned int)(-(int)(u == 0x80000000u));        // -0.0 keys as +0.0
+    const unsigned int key = u ^ (((unsigned int)((int)u >> 31)) | 0x80000000u);
+    return key & (unsigned int)(-(int)((u & 0x7fffffffu) <= 0x7f800000u));
+}
+
+__device__ __forceinline__ unsigned long long topk_key64(float v, int i)
+{
+    return ((unsigned long long)topk_value_key(v) << 32)
+         | (unsigned long long)(0xFFFFFFFFu - (unsigned int)i);
+}
+
+// One block per row; grid is (rows), so requests never interact.
+//
+// row_k <= 0 skips the row entirely, which is how greedy requests avoid paying
+// for this. The launch stays in the decode graph unconditionally and reads
+// row_k from a device buffer, so which rows sample -- and with what k -- can
+// change every step without recapturing anything.
+extern "C" __global__ void topk_rows_f32(
+    const float* __restrict__ x,        // [rows, cols]
+    const int* __restrict__ row_k,      // [rows], <= 0 to skip
+    float* __restrict__ out_vals,       // [rows, TOPK_MAX]
+    int* __restrict__ out_ids,          // [rows, TOPK_MAX]
+    const int rows,
+    const int cols)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    int k = row_k[row];
+    if (k <= 0) return;
+    if (k > cols) k = cols;
+    if (k > TOPK_MAX) k = TOPK_MAX;
+
+    const float* r = x + (size_t)row * cols;
+    const int tid = threadIdx.x;
+
+    __shared__ int hist[TOPK_BUCKETS];
+    __shared__ int part[TOPK_PARTS];
+    __shared__ int grp[WARP_SIZE];
+    __shared__ unsigned long long s_bucket;
+    __shared__ int s_above;
+    __shared__ int s_done;
+    __shared__ float cand_v[TOPK_MAX];
+    __shared__ int cand_i[TOPK_MAX];
+    __shared__ int cand_n;
+
+    // Bits of the 64-bit key still undecided, narrowed one digit at a time.
+    unsigned long long prefix = 0ULL;
+    // Elements whose key is strictly above the current prefix. Always < k.
+    int above = 0;
+    int shift = 0;
+
+    for (int d = 0; d < 6; ++d) {
+        // Digits are 11/11/10 over each 32-bit half: the value key first, then
+        // the index complement, which is only reached when logits tie exactly.
+        const int half = d / 3, j = d % 3;
+        const int width = (j == 2) ? 10 : 11;
+        shift = (1 - half) * 32 + ((j == 0) ? 21 : (j == 1) ? 10 : 0);
+        const int nb = 1 << width;
+        const int above_shift = shift + width;
+        // d == 0 covers the whole key, and shifting a 64-bit value by 64 is
+        // undefined rather than zero.
+        const bool match_all = (above_shift >= 64);
+
+        __syncthreads();
+        for (int b = tid; b < nb; b += TOPK_THREADS) hist[b] = 0;
+        __syncthreads();
+
+        for (int i = tid; i < cols; i += TOPK_THREADS) {
+            const unsigned long long kk = topk_key64(r[i], i);
+            if (match_all || (kk >> above_shift) == prefix) {
+                atomicAdd(&hist[(int)((kk >> shift) & (unsigned long long)(nb - 1))], 1);
+            }
+        }
+        __syncthreads();
+
+        // Finding the boundary bucket is a suffix scan, and it ends in one
+        // thread walking down until the running count reaches k. That walk is
+        // serial and dependent, so its length is what matters: three levels
+        // bring 2048 buckets down to at most 31 + 7 + 7 steps, where a flat
+        // scan over the 256 chunk totals alone measured longer than the whole
+        // histogram pass it was summarising.
+        const int per = nb / TOPK_PARTS;
+        if (tid < TOPK_PARTS) {
+            int sum = 0;
+            for (int b = 0; b < per; ++b) sum += hist[tid * per + b];
+            part[tid] = sum;
+        }
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            const int wide = TOPK_PARTS / WARP_SIZE;
+            int sum = 0;
+            for (int b = 0; b < wide; ++b) sum += part[tid * wide + b];
+            grp[tid] = sum;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const int wide = TOPK_PARTS / WARP_SIZE;
+            int acc = above;
+            int g = WARP_SIZE - 1;
+            for (; g > 0; --g) {
+                if (acc + grp[g] >= k) break;
+                acc += grp[g];
+            }
+            int chunk = (g + 1) * wide - 1;
+            for (; chunk > g * wide; --chunk) {
+                if (acc + part[chunk] >= k) break;
+                acc += part[chunk];
+            }
+            int b = (chunk + 1) * per - 1;
+            for (; b > chunk * per; --b) {
+                if (acc + hist[b] >= k) break;
+                acc += hist[b];
+            }
+            s_above = acc;
+            s_bucket = (unsigned long long)b;
+            // Done when the boundary bucket contributes exactly the shortfall.
+            // At the last digit the key is fully determined and unique, so the
+            // bucket holds one element and this always holds; asserting it
+            // there keeps the loop terminating on a defined threshold.
+            s_done = (acc + hist[b] == k || d == 5) ? 1 : 0;
+        }
+        __syncthreads();
+
+        above = s_above;
+        prefix = (prefix << width) | s_bucket;
+        if (s_done) break;
+    }
+
+    // Everything at or above the threshold, which is now exactly k elements.
+    const unsigned long long thresh = prefix << shift;
+    if (tid == 0) cand_n = 0;
+    __syncthreads();
+    for (int i = tid; i < cols; i += TOPK_THREADS) {
+        if (topk_key64(r[i], i) >= thresh) {
+            const int p = atomicAdd(&cand_n, 1);
+            if (p < TOPK_MAX) {
+                cand_v[p] = r[i];
+                cand_i[p] = i;
+            }
+        }
+    }
+    __syncthreads();
+    const int n_cand = cand_n < TOPK_MAX ? cand_n : TOPK_MAX;
+
+    // Collection order is whatever the atomics produced, so rank each candidate
+    // against the others. Keys are unique, so ranks are a permutation and this
+    // writes the canonical order regardless of how the block was scheduled.
+    // n_cand <= TOPK_MAX <= TOPK_THREADS, so one thread per candidate.
+    if (tid < n_cand) {
+        const unsigned long long mine = topk_key64(cand_v[tid], cand_i[tid]);
+        int rank = 0;
+        for (int j = 0; j < n_cand; ++j) {
+            if (topk_key64(cand_v[j], cand_i[j]) > mine) ++rank;
+        }
+        out_vals[(size_t)row * TOPK_MAX + rank] = cand_v[tid];
+        out_ids[(size_t)row * TOPK_MAX + rank] = cand_i[tid];
+    }
+    // Unused slots are marked, so a host reading past k sees it immediately
+    // rather than sampling stale candidates from an earlier step.
+    for (int p = n_cand + tid; p < TOPK_MAX; p += TOPK_THREADS) {
+        out_vals[(size_t)row * TOPK_MAX + p] = NEG_INF;
+        out_ids[(size_t)row * TOPK_MAX + p] = -1;
+    }
+}
+
+// ===========================================================================
 // Batched GEMV for small-M decode
 //
 // Y[batch, rows] = X[batch, cols] @ W[rows, cols]^T, int8 weights with per-row

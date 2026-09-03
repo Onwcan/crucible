@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use cudarc::driver::{CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{attn_chunks, Gpu, Proj2, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{attn_chunks, Gpu, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::paged::{PagePool, SequencePages, PAGE_TOKENS};
 use crate::quant::QuantTensor;
@@ -162,6 +162,40 @@ struct BatchScratch {
     /// Persistent so it can be written from inside a captured graph and read
     /// back afterwards.
     argmax_ids: CudaSlice<i32>,
+
+    /// Candidates to extract for each slot; 0 means "greedy, skip this row".
+    ///
+    /// Uploaded with the rest of the per-step metadata. A device buffer rather
+    /// than a kernel argument precisely so the sampling composition of a batch
+    /// can change between graph replays: a graph bakes in launch arguments, but
+    /// not the contents of the buffers they point at.
+    row_k: CudaSlice<i32>,
+    /// `[max_batch, TOPK_MAX]` candidate logits and ids, canonically ordered.
+    ///
+    /// Written from inside the graph, like `argmax_ids`, so a sampled step's
+    /// transfer is these two small blocks rather than a full logits row per
+    /// sampled request.
+    cand_vals: CudaSlice<f32>,
+    cand_ids: CudaSlice<i32>,
+}
+
+/// What one decode step brought back from the device.
+///
+/// Three shapes, because one batch can want all three at once: every row gets
+/// an argmax id, rows sampling within the kernel's candidate capacity get
+/// candidates, and rows asking for more candidates than it can hold get their
+/// full logits row.
+pub struct DecodeSelection {
+    /// Argmax token id for every row. Always populated.
+    pub ids: Vec<usize>,
+    /// `[n, TOPK_MAX]` candidate values; only requested rows are meaningful.
+    pub cand_vals: Vec<f32>,
+    /// `[n, TOPK_MAX]` candidate ids; `-1` past a row's k.
+    pub cand_ids: Vec<i32>,
+    /// `[full_rows.len(), vocab_size]` logits, in the order `full_rows` gave.
+    pub full: Vec<f32>,
+    /// Bytes this step actually copied device to host.
+    pub d2h_bytes: usize,
 }
 
 pub struct GpuModel {
@@ -196,6 +230,13 @@ pub struct GpuModel {
     seq_lens: CudaSlice<i32>,
     host_tables: Vec<i32>,
     host_lens: Vec<i32>,
+    /// Last value uploaded to the batch scratch's `row_k`.
+    ///
+    /// Kept so an unchanged value is not re-uploaded. Every other per-step
+    /// buffer genuinely changes each step; this one is constant across a run
+    /// of same-shaped steps, and an all-greedy run would otherwise pay a
+    /// host-to-device copy per step that the engine did not make before.
+    host_row_k: Vec<i32>,
     table_stride: usize,
     max_batch: usize,
     /// The single-request sequence, when running paged through `forward`.
@@ -217,6 +258,14 @@ pub struct GpuModel {
     /// and an inactive row would write into physical page 0, corrupting
     /// whichever request owns it. Sixteen small graphs are cheaper than that
     /// proof.
+    ///
+    /// Two per batch size: one whose kernel sequence ends at the argmax, and
+    /// one that also extracts sampling candidates. A single graph carrying the
+    /// top-k launch unconditionally would work -- `row_k` already makes it a
+    /// no-op for greedy rows -- but it measured a consistent 1% off batch-1
+    /// greedy, which is a launch this engine used not to make. Two graphs cost
+    /// a few milliseconds of capture and leave the greedy path executing
+    /// exactly the sequence it executed before sampling existed.
     batch_graphs: Vec<Option<CudaGraph>>,
     use_batch_graph: bool,
     /// Wall time spent capturing, and how many shapes were captured.
@@ -224,6 +273,14 @@ pub struct GpuModel {
     graphs_captured: usize,
     /// Take token ids from the device instead of copying full logits back.
     use_device_argmax: bool,
+    /// Extract sampling candidates on the device instead of copying full logits
+    /// back for sampled rows.
+    ///
+    /// `CRUCIBLE_DEVICE_TOPK=0` turns it off, which routes every sampled row
+    /// through the full-logit path. That path stays as the reference the device
+    /// kernel is A/B'd against, so this switch is a measurement tool, not a
+    /// deprecated branch waiting to be deleted.
+    use_device_topk: bool,
     capacity: usize,
     cache_len: usize,
     hidden: usize,
@@ -369,6 +426,7 @@ impl GpuModel {
             page_tables: gpu.to_device_i32(&[0i32])?,
             seq_lens: gpu.to_device_i32(&[0i32])?,
             host_tables: vec![0i32; 1],
+            host_row_k: vec![0i32; 1],
             host_lens: vec![0i32; 1],
             table_stride: 1,
             max_batch: 0,
@@ -383,6 +441,7 @@ impl GpuModel {
             graph_capture_secs: 0.0,
             graphs_captured: 0,
             use_device_argmax: std::env::var("CRUCIBLE_DEVICE_ARGMAX").as_deref() != Ok("0"),
+            use_device_topk: std::env::var("CRUCIBLE_DEVICE_TOPK").as_deref() != Ok("0"),
             params: gpu.to_device_i32(&vec![0i32; PARAM_COUNT])?,
             host_params: vec![0i32; PARAM_COUNT],
             graph: None,
@@ -449,6 +508,7 @@ impl GpuModel {
         self.v_pool = self.gpu.alloc(n_pages * page_floats)?;
         self.host_tables = vec![0i32; max_batch * self.table_stride];
         self.host_lens = vec![0i32; max_batch];
+        self.host_row_k = vec![0i32; max_batch];
         self.page_tables = self.gpu.to_device_i32(&self.host_tables.clone())?;
         self.seq_lens = self.gpu.to_device_i32(&self.host_lens.clone())?;
         self.seq = SequencePages::new();
@@ -466,10 +526,13 @@ impl GpuModel {
             up: self.gpu.alloc(max_batch * self.hidden)?,
             logits: self.gpu.alloc(max_batch * self.cfg.vocab_size)?,
             argmax_ids: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
+            row_k: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
+            cand_vals: self.gpu.alloc(max_batch * TOPK_MAX)?,
+            cand_ids: self.gpu.to_device_i32(&vec![-1i32; max_batch * TOPK_MAX])?,
         });
         // Buffer addresses just changed, so every captured graph is stale.
         self.invalidate_batch_graphs();
-        self.batch_graphs = (0..max_batch).map(|_| None).collect();
+        self.batch_graphs = (0..2 * max_batch).map(|_| None).collect();
         self.use_paged = true;
         // A captured contiguous-path graph would replay contiguous kernels.
         self.graph = None;
@@ -539,6 +602,27 @@ impl GpuModel {
         self.use_device_argmax
     }
 
+    /// Whether sampled rows may take their candidates from the device.
+    ///
+    /// Off routes them through full logits and a host top-k, which is the A/B
+    /// control. Deliberately does *not* invalidate captured graphs: the top-k
+    /// launch is in the graph either way, and `row_k` -- a device buffer -- is
+    /// what decides whether it does anything. That keeps the switch free to
+    /// flip between interleaved benchmark trials, at the cost of leaving one
+    /// predicated block exit per row in the control measurement.
+    pub fn set_device_topk(&mut self, on: bool) {
+        self.use_device_topk = on;
+    }
+
+    pub fn device_topk(&self) -> bool {
+        self.use_device_topk
+    }
+
+    /// Candidates the device path can return for one row.
+    pub fn topk_capacity(&self) -> usize {
+        TOPK_MAX
+    }
+
     /// Drop every captured decode graph.
     ///
     /// Called whenever something a graph baked in could have changed: buffer
@@ -573,10 +657,10 @@ impl GpuModel {
     /// figure: that one syncs between stages, which suppresses the overlap a
     /// replay gets for free and so over-estimates kernel time.
     pub fn time_graph_replay(&mut self, n: usize, iters: usize) -> Result<f64> {
-        if n == 0 || n > self.batch_graphs.len() {
+        if n == 0 || 2 * n > self.batch_graphs.len() {
             bail!("no graph slot for batch {n}");
         }
-        let Some(g) = &self.batch_graphs[n - 1] else {
+        let Some(g) = &self.batch_graphs[Self::graph_slot(n, false)] else {
             bail!("no captured graph for batch {n}; run a step at that size first");
         };
         // Warm, then time.
@@ -685,12 +769,18 @@ impl GpuModel {
     /// Must run outside graph capture: these are host-to-device copies from
     /// temporary buffers, and capturing one would freeze a host pointer that is
     /// gone by the next replay.
+    ///
+    /// `row_k` names how many candidates the top-k kernel should extract for
+    /// each slot, zero meaning "skip this row". It is uploaded every step, not
+    /// only when something samples: a stale value would make the kernel extract
+    /// candidates for whichever request last occupied the slot.
     fn upload_batch(
         &mut self,
         tokens: &[usize],
         positions: &[usize],
         tables: &[i32],
         lens: &[i32],
+        row_k: &[i32],
     ) -> Result<()> {
         let n = tokens.len();
         if !self.use_paged {
@@ -724,6 +814,10 @@ impl GpuModel {
             host_pos[i] = positions[i] as i32;
             host_len[i] = lens[i];
         }
+        let mut host_k = vec![0i32; self.max_batch];
+        for (i, &k) in row_k.iter().enumerate().take(n) {
+            host_k[i] = k;
+        }
         self.host_tables.copy_from_slice(tables);
         let ht = self.host_tables.clone();
         self.gpu.write_i32(&mut self.page_tables, &ht)?;
@@ -731,6 +825,10 @@ impl GpuModel {
         let b = self.batch.as_mut().expect("paging allocates batch scratch");
         self.gpu.write_i32(&mut b.tokens, &host_tok)?;
         self.gpu.write_i32(&mut b.positions, &host_pos)?;
+        if host_k != self.host_row_k {
+            self.gpu.write_i32(&mut b.row_k, &host_k)?;
+            self.host_row_k = host_k;
+        }
         Ok(())
     }
 
@@ -755,8 +853,8 @@ impl GpuModel {
         if n == 0 {
             return Ok(Vec::new());
         }
-        self.upload_batch(tokens, positions, tables, lens)?;
-        self.run_decode_batch(n)?;
+        self.upload_batch(tokens, positions, tables, lens, &[])?;
+        self.run_decode_batch(n, false)?;
         let rows = n * self.cfg.vocab_size;
         return self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows);
     }
@@ -777,8 +875,8 @@ impl GpuModel {
         if n == 0 {
             return Ok(Vec::new());
         }
-        self.upload_batch(tokens, positions, tables, lens)?;
-        self.run_decode_batch(n)?;
+        self.upload_batch(tokens, positions, tables, lens, &[])?;
+        self.run_decode_batch(n, false)?;
         let ids = self
             .gpu
             .to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
@@ -788,14 +886,13 @@ impl GpuModel {
     /// One decode step returning argmax ids for every request plus full logits
     /// for the rows named in `rows`.
     ///
-    /// The compute is identical to the other two entry points -- same graph,
-    /// same kernels, one batched forward pass. Only what comes back differs.
-    ///
-    /// Rows are copied individually rather than as one `[batch, vocab]` block
-    /// because the sampled rows are usually a minority: with one sampled
-    /// request in a batch of sixteen, copying the block would move 3.2 MB to
-    /// use 200 KB of it. Each row is contiguous, so a per-row copy is a plain
-    /// range and needs no gather kernel.
+    /// The reference path sampling is validated against, and the fallback for a
+    /// request whose top-k exceeds the device kernel's capacity. Rows come back
+    /// individually rather than as one `[batch, vocab]` block because sampled
+    /// rows are usually a minority: with one sampled request in a batch of
+    /// sixteen, copying the block would move 3.2 MB to use 200 KB of it. Each
+    /// row is contiguous, so a per-row copy is a plain range and needs no
+    /// gather kernel.
     ///
     /// Returns `(ids, rows_concatenated)` where the second value holds
     /// `rows.len() * vocab_size` floats in the order given.
@@ -816,8 +913,59 @@ impl GpuModel {
                 bail!("row {r} outside a batch of {n}");
             }
         }
-        self.upload_batch(tokens, positions, tables, lens)?;
-        self.run_decode_batch(n)?;
+        let sel = self.decode_batch_mixed(tokens, positions, tables, lens, &[], rows)?;
+        Ok((sel.ids, sel.full))
+    }
+
+    /// One decode step returning whatever each row's sampling policy needs.
+    ///
+    /// `topk_rows` names `(row, k)` pairs to extract candidates for on the
+    /// device; `full_rows` names rows whose whole logits row must come back,
+    /// which is where a request wanting more candidates than `TOPK_MAX` goes.
+    /// Every other row is greedy and costs its four argmax bytes.
+    ///
+    /// The forward pass is identical either way -- same kernels, one batched
+    /// pass. What differs is one kernel at the end and what crosses PCIe after
+    /// it, which is the entire point: the candidate blocks are two copies of
+    /// `n * TOPK_MAX` elements regardless of how many rows sampled, where the
+    /// full-logit path is one 201 KB copy per sampled row.
+    pub fn decode_batch_mixed(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+        tables: &[i32],
+        lens: &[i32],
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
+    ) -> Result<DecodeSelection> {
+        let n = tokens.len();
+        if n == 0 {
+            return Ok(DecodeSelection {
+                ids: Vec::new(),
+                cand_vals: Vec::new(),
+                cand_ids: Vec::new(),
+                full: Vec::new(),
+                d2h_bytes: 0,
+            });
+        }
+        for &r in full_rows {
+            if r >= n {
+                bail!("row {r} outside a batch of {n}");
+            }
+        }
+        let mut row_k = vec![0i32; n];
+        for &(r, k) in topk_rows {
+            if r >= n {
+                bail!("row {r} outside a batch of {n}");
+            }
+            if k == 0 || k > TOPK_MAX {
+                bail!("top-k of {k} outside the device kernel's capacity 1..={TOPK_MAX}");
+            }
+            row_k[r] = k as i32;
+        }
+
+        self.upload_batch(tokens, positions, tables, lens, &row_k)?;
+        self.run_decode_batch(n, !topk_rows.is_empty())?;
 
         let vocab = self.cfg.vocab_size;
         let b = self.batch.as_ref().expect("paging allocates batch scratch");
@@ -827,12 +975,29 @@ impl GpuModel {
             .into_iter()
             .map(|v| v as usize)
             .collect();
+        let mut d2h = n * std::mem::size_of::<i32>();
 
-        let mut out = Vec::with_capacity(rows.len() * vocab);
-        for &r in rows {
-            out.extend(self.gpu.to_host_range(&b.logits, r * vocab, vocab)?);
+        // One copy each for values and ids, covering every active row rather
+        // than only the sampled ones. Copying the block is cheaper than issuing
+        // a separate transfer per sampled row: at batch 16 the whole thing is
+        // 16 KB, and each extra transfer costs more in launch and
+        // synchronisation than the bytes it saves.
+        let (cand_vals, cand_ids) = if topk_rows.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let vals = self.gpu.to_host_n(&b.cand_vals, n * TOPK_MAX)?;
+            let cids = self.gpu.to_host_i32_n(&b.cand_ids, n * TOPK_MAX)?;
+            d2h += n * TOPK_MAX * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>());
+            (vals, cids)
+        };
+
+        let mut full = Vec::with_capacity(full_rows.len() * vocab);
+        for &r in full_rows {
+            full.extend(self.gpu.to_host_range(&b.logits, r * vocab, vocab)?);
         }
-        Ok((ids, out))
+        d2h += full_rows.len() * vocab * std::mem::size_of::<f32>();
+
+        Ok(DecodeSelection { ids, cand_vals, cand_ids, full, d2h_bytes: d2h })
     }
 
     /// Bytes copied device-to-host by one step on each path.
@@ -844,31 +1009,39 @@ impl GpuModel {
         }
     }
 
+    /// Where batch size `n` keeps its graph, with and without top-k.
+    ///
+    /// Which rows sample and with what k lives in `row_k`, a device buffer, so
+    /// it can change every step. Only *whether any row samples at all* selects
+    /// a graph, and that is one bit.
+    fn graph_slot(n: usize, topk: bool) -> usize {
+        (n - 1) * 2 + topk as usize
+    }
+
     /// Capture-or-replay the decode graph for `n` active requests.
-    fn run_decode_batch(&mut self, n: usize) -> Result<()> {
+    fn run_decode_batch(&mut self, n: usize, topk: bool) -> Result<()> {
         // Capture-or-replay. Everything before this is host-to-device
         // metadata, which must stay outside the graph: memcpy_htod from a
         // temporary Vec would be captured as a node holding a dangling host
         // pointer.
-        if self.use_batch_graph && n <= self.batch_graphs.len() {
-            if self.batch_graphs[n - 1].is_none() {
+        let slot = Self::graph_slot(n, topk);
+        if self.use_batch_graph && slot < self.batch_graphs.len() {
+            if self.batch_graphs[slot].is_none() {
                 let t0 = std::time::Instant::now();
                 self.gpu.begin_capture()?;
-                let queued = self.queue_decode_batch(n);
+                let queued = self.queue_decode_batch(n, topk);
                 // End capture unconditionally: leaving the stream in capture
                 // mode would break every later launch.
                 let graph = self.gpu.end_capture();
                 queued?;
-                self.batch_graphs[n - 1] = Some(graph?);
+                self.batch_graphs[slot] = Some(graph?);
                 self.graph_capture_secs += t0.elapsed().as_secs_f64();
                 self.graphs_captured += 1;
             }
-            let g = self.batch_graphs[n - 1]
-                .as_ref()
-                .expect("just captured above");
+            let g = self.batch_graphs[slot].as_ref().expect("just captured above");
             self.gpu.graph_launch(g)?;
         } else {
-            self.queue_decode_batch(n)?;
+            self.queue_decode_batch(n, topk)?;
         }
         Ok(())
     }
@@ -884,7 +1057,7 @@ impl GpuModel {
     /// Nothing here depends on which request occupies a slot, only on slot
     /// position, so the scheduler reordering slots with `swap_remove` cannot
     /// invalidate a graph.
-    fn queue_decode_batch(&mut self, n: usize) -> Result<()> {
+    fn queue_decode_batch(&mut self, n: usize, topk: bool) -> Result<()> {
         let cfg = self.cfg.clone();
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
@@ -958,6 +1131,17 @@ impl GpuModel {
         // the full-logit path ignores the result, and a single graph per batch
         // size then serves both paths.
         self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, n, cfg.vocab_size)?;
+        // Candidate extraction only when some row wants it, so an all-greedy
+        // step executes exactly the sequence it did before sampling existed.
+        // *Which* rows want it, and with what k, still comes from `row_k` -- a
+        // device buffer written per step -- so a batch whose sampling
+        // composition changes between steps needs no recapture. Only the
+        // presence of the launch is baked in, and that is what the two graphs
+        // per batch size are for.
+        if topk {
+            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids,
+                               n, cfg.vocab_size)?;
+        }
         Ok(())
     }
 

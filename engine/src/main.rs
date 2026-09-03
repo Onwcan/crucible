@@ -163,14 +163,10 @@ enum Command {
         #[arg(long)]
         kv_pages: Option<usize>,
     },
-    /// Check that a request's sampled output does not depend on who it is
-    /// batched with.
+    /// What sampling costs, against the greedy fast path, both ways.
     ///
-    /// The invariant: a request run alone with seed S must produce exactly the
-    /// same tokens when run concurrently with unrelated requests. If another
-    /// request's presence changes the sequence, the RNG is keyed on the wrong
-    /// thing.
-    /// What sampling costs, against the greedy fast path.
+    /// Each sampled mode runs with device top-k and with the full-logit path it
+    /// replaces, interleaved within a trial.
     #[cfg(feature = "cuda")]
     GpuSampleBench {
         model: PathBuf,
@@ -185,6 +181,30 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         trials: usize,
     },
+    /// Microbenchmark the top-k extraction kernel against the full-logit path.
+    ///
+    /// No model needed: this is the selection stage in isolation, on synthetic
+    /// logits of the production shape.
+    #[cfg(feature = "cuda")]
+    GpuTopkBench {
+        #[arg(long, default_value = "1,4,8,16")]
+        rows: String,
+        #[arg(long, default_value = "5,10,20,40,128")]
+        top_k: String,
+        #[arg(long, default_value_t = 50304)]
+        vocab: usize,
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+        #[arg(long, default_value_t = 5)]
+        trials: usize,
+    },
+    /// Check that a request's sampled output does not depend on who it is
+    /// batched with, or on which selection path served it.
+    ///
+    /// The invariant: a request run alone with seed S must produce exactly the
+    /// same tokens when run concurrently with unrelated requests. If another
+    /// request's presence changes the sequence, the RNG is keyed on the wrong
+    /// thing.
     #[cfg(feature = "cuda")]
     GpuSampling {
         model: PathBuf,
@@ -376,6 +396,10 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuSampleBench { model, quant, batches, lengths, steps, trials } => {
             gpu_sample_bench(model, &quant, &batches, &lengths, steps, trials)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuTopkBench { rows, top_k, vocab, iters, trials } => {
+            gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
         }
         #[cfg(feature = "cuda")]
         Command::GpuSampling { model, quant, steps, max_batch } => {
@@ -1048,23 +1072,31 @@ fn gpu_sample_bench(
     println!("sampling   temperature 0.8, top-k 40");
     println!();
 
-    // greedy / sampled / half sampled, interleaved so drift cannot masquerade
-    // as a cost difference.
-    let modes: [(&str, fn(usize) -> bool); 3] = [
-        ("greedy", |_| false),
-        ("sampled", |_| true),
-        ("mixed", |i| i % 2 == 1),
+    // greedy / sampled / half sampled, each sampled mode run both ways --
+    // device top-k and the full-logit path it replaces. All five interleaved
+    // within a trial, so thermal drift cannot masquerade as a cost difference
+    // between them.
+    let modes: [(&str, fn(usize) -> bool, bool); 5] = [
+        ("greedy", |_| false, true),
+        ("sampled", |_| true, false),
+        ("sampled+tk", |_| true, true),
+        ("mixed", |i| i % 2 == 1, false),
+        ("mixed+tk", |i| i % 2 == 1, true),
     ];
 
-    let header = format!("{:>6}  {:>9}  {:>11}  {:>11}  {:>10}  {:>12}",
-                         "batch", "mode", "aggregate", "per-request", "step ms", "D2H/step");
+    let header = format!("{:>6}  {:>11}  {:>11}  {:>11}  {:>9}  {:>11}  {:>8}",
+                         "batch", "mode", "aggregate", "per-request", "step ms",
+                         "D2H/step", "vs greedy");
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
     for &n in &sizes {
-        let mut baseline = 0.0f64;
-        for (label, is_sampled) in modes {
+        let mut greedy_agg = 0.0f64;
+        let mut full_agg: std::collections::HashMap<&str, f64> = Default::default();
+        for (label, is_sampled, device_topk) in modes {
+            rt.model_mut().set_device_topk(device_topk);
             let mut secs = Vec::new();
+            let mut d2h_seen = 0usize;
             for _ in 0..trials {
                 for i in 0..n {
                     let config = if is_sampled(i) {
@@ -1087,7 +1119,12 @@ fn gpu_sample_bench(
                 let t0 = Instant::now();
                 let mut done = 0;
                 while !rt.is_idle() {
-                    rt.step()?;
+                    let info = rt.step()?;
+                    // The first full-width step is representative; later ones
+                    // shrink as requests retire.
+                    if done == 0 {
+                        d2h_seen = info.d2h_bytes;
+                    }
                     done += 1;
                     if done > steps * 4 + 16 {
                         anyhow::bail!("runtime did not drain");
@@ -1101,30 +1138,196 @@ fn gpu_sample_bench(
             let decode_steps = (steps - 1) as f64;
             let agg = n as f64 * decode_steps / t;
             if label == "greedy" {
-                baseline = agg;
+                greedy_agg = agg;
             }
-            let sampled_rows = (0..n).filter(|i| is_sampled(*i)).count();
-            // Ids always come back; sampled rows add one logits row each.
-            let d2h = n * 4 + sampled_rows * vocab * 4;
-            println!("{n:>6}  {label:>9}  {agg:>9.0} t/s  {:>9.0} t/s  {:>10.2}  {d2h:>10} B{}",
+            if !device_topk {
+                full_agg.insert(label, agg);
+            }
+            // Measured, not derived: the point of the change is this number.
+            let against_full = label
+                .strip_suffix("+tk")
+                .and_then(|base| full_agg.get(base))
+                .map(|f| format!("   {:.2}x vs full-logit", agg / f))
+                .unwrap_or_default();
+            println!("{n:>6}  {label:>11}  {agg:>9.0} t/s  {:>9.0} t/s  {:>9.2}  {d2h_seen:>9} B  {:>7}{}",
                      agg / n as f64,
                      t / decode_steps * 1000.0,
-                     if label == "greedy" { String::new() }
-                     else { format!("   {:.2}x", agg / baseline) });
+                     if label == "greedy" { "-".to_string() }
+                     else { format!("{:.2}x", agg / greedy_agg) },
+                     against_full);
         }
         println!();
     }
+    rt.model_mut().set_device_topk(true);
 
-    println!("D2H/step is what each mode copies back: 4 bytes per request for the");
-    println!("argmax id, plus a full logits row for every sampled request.");
+    println!("D2H/step is what the first full-width decode step actually copied back.");
+    println!("+tk rows take candidates from the device top-k kernel; the rows without");
+    println!("it copy a full {vocab}-float logits row per sampled request, which is the");
+    println!("path the kernel replaces and which stays available as the reference.");
+    Ok(())
+}
+
+/// Time the selection stage on its own: kernel, transfer, and the host work
+/// each path leaves behind.
+///
+/// Separate from the end-to-end benchmark because the end-to-end number folds
+/// the transformer in with it, and a 2% change in selection cost disappears
+/// inside that. This one measures only what changed.
+#[cfg(feature = "cuda")]
+fn gpu_topk_bench(
+    rows: &str,
+    top_k: &str,
+    vocab: usize,
+    iters: usize,
+    trials: usize,
+) -> Result<()> {
+    use llm_engine::gpu::{Gpu, TOPK_MAX};
+    use llm_engine::sampling::{self, GenerationConfig, Rng};
+    use std::time::Instant;
+
+    let counts: Vec<usize> = rows
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let ks: Vec<usize> = top_k
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0 && *v <= TOPK_MAX)
+        .collect();
+    let max_rows = *counts.iter().max().unwrap_or(&1);
+
+    let gpu = Gpu::new(0)?;
+    println!("gpu        {}", envelope());
+    println!("workload   vocab {vocab}, {iters} iterations, median of {trials}");
+    println!();
+
+    // Continuous, in the range a real lm_head produces. Deliberately not the
+    // tie-heavy distribution the correctness fuzz uses: exact ties are the
+    // interesting case for correctness and a misleading one for timing, since
+    // they change how much work the host comparison-based selection does.
+    let mut rng = Rng::new(20260903);
+    let host: Vec<f32> = (0..max_rows * vocab)
+        .map(|_| rng.next_f32() * 22.0 - 11.0)
+        .collect();
+    let d_logits = gpu.to_device(&host)?;
+    let mut d_cv = gpu.alloc(max_rows * TOPK_MAX)?;
+    let mut d_ci = gpu.to_device_i32(&vec![-1i32; max_rows * TOPK_MAX])?;
+
+    // Median of `trials`, each an `iters`-long run. Interleaving is not needed
+    // here the way it is end-to-end: these are microseconds apart, so drift
+    // cannot separate them.
+    let median = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+
+    // Bring the clocks up before measuring anything. The GPU idles between
+    // runs, and the first configuration in the table would otherwise be timed
+    // during the boost ramp -- which showed up as one 286 us outlier in a
+    // column that is otherwise flat at 23.
+    {
+        let warm = gpu.to_device_i32(&vec![40i32; max_rows])?;
+        for _ in 0..2000 {
+            gpu.topk_rows(&d_logits, &warm, &mut d_cv, &mut d_ci, max_rows, vocab)?;
+        }
+        gpu.sync()?;
+    }
+
+    let header = format!("{:>6} {:>6} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9}",
+                         "rows", "k", "kernel us", "cand D2H", "full D2H",
+                         "host topk", "new us", "speedup");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    for &n in &counts {
+        for &k in &ks {
+            let d_k = gpu.to_device_i32(&vec![k as i32; n])?;
+
+            // Kernel alone.
+            gpu.topk_rows(&d_logits, &d_k, &mut d_cv, &mut d_ci, n, vocab)?;
+            gpu.sync()?;
+            let kernel = median((0..trials).map(|_| {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    gpu.topk_rows(&d_logits, &d_k, &mut d_cv, &mut d_ci, n, vocab).unwrap();
+                }
+                gpu.sync().unwrap();
+                t0.elapsed().as_secs_f64() / iters as f64
+            }).collect::<Vec<_>>());
+
+            // Candidate transfer: two blocks covering every active row.
+            let cand_d2h = median((0..trials).map(|_| {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    gpu.to_host_n(&d_cv, n * TOPK_MAX).unwrap();
+                    gpu.to_host_i32_n(&d_ci, n * TOPK_MAX).unwrap();
+                }
+                t0.elapsed().as_secs_f64() / iters as f64
+            }).collect::<Vec<_>>());
+
+            // The path this replaces: one full logits row per sampled request.
+            let full_d2h = median((0..trials).map(|_| {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    for r in 0..n {
+                        gpu.to_host_range(&d_logits, r * vocab, vocab).unwrap();
+                    }
+                }
+                t0.elapsed().as_secs_f64() / iters as f64
+            }).collect::<Vec<_>>());
+
+            // ...and the host selection it forced, which is the larger half.
+            let cfg = GenerationConfig { max_tokens: 1, temperature: 0.8, top_k: k, seed: 1 };
+            let host_topk = median((0..trials).map(|_| {
+                let iters_h = iters.min(20);
+                let t0 = Instant::now();
+                for _ in 0..iters_h {
+                    for r in 0..n {
+                        let row = &host[r * vocab..(r + 1) * vocab];
+                        let mut rg = Rng::new(1);
+                        std::hint::black_box(sampling::sample(row, &cfg, &mut rg));
+                    }
+                }
+                t0.elapsed().as_secs_f64() / iters_h as f64
+            }).collect::<Vec<_>>());
+
+            let new = kernel + cand_d2h;
+            let old = full_d2h + host_topk;
+            println!("{n:>6} {k:>6} {:>10.1}u {:>10.1}u {:>10.1}u {:>10.1}u {:>8.1}u {:>8.2}x",
+                     kernel * 1e6, cand_d2h * 1e6, full_d2h * 1e6, host_topk * 1e6,
+                     new * 1e6, old / new);
+        }
+    }
+
+    // What a greedy-only step pays for the launch being in the graph at all.
+    println!();
+    let zero = gpu.to_device_i32(&vec![0i32; max_rows])?;
+    for &n in &counts {
+        let skip = median((0..trials).map(|_| {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                gpu.topk_rows(&d_logits, &zero, &mut d_cv, &mut d_ci, n, vocab).unwrap();
+            }
+            gpu.sync().unwrap();
+            t0.elapsed().as_secs_f64() / iters as f64
+        }).collect::<Vec<_>>());
+        println!("rows {n:>2}: {:.2} us for an all-greedy launch (every block exits on row_k)",
+                 skip * 1e6);
+    }
+    println!();
+    println!("cand D2H is two blocks of rows*{TOPK_MAX} regardless of k; full D2H is one");
+    println!("{vocab}-float row per sampled request. host topk is the selection the");
+    println!("full-logit path then has to do, which the kernel removes as well.");
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
 fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Result<()> {
+    use llm_engine::gpu::TOPK_MAX;
     use llm_engine::gpu_model::{GpuModel, Precision};
     use llm_engine::paged::PAGE_TOKENS;
-    use llm_engine::runtime::{Request, Runtime};
+    use llm_engine::runtime::{Completion, Request, Runtime};
     use llm_engine::sampling::GenerationConfig;
 
     let cfg = Config::from_file(dir.join("config.json"))?;
@@ -1135,6 +1338,11 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
     // Deliberately heterogeneous in every dimension at once: prompt length,
     // decoding policy, temperature, top-k and seed. A bug that only shows up
     // when two sampled requests share a batch would survive a uniform test.
+    //
+    // The last request asks for more candidates than the device kernel holds,
+    // so it takes the full-logit path while its neighbours take the device one.
+    // That mixture inside a single batch is the case a per-batch dispatch would
+    // get wrong.
     let specs: Vec<(usize, GenerationConfig)> = vec![
         (15, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 1 }),
         (16, GenerationConfig { max_tokens: steps, temperature: 0.7, top_k: 40, seed: 11 }),
@@ -1142,6 +1350,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
         (63, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 2 }),
         (129, GenerationConfig { max_tokens: steps, temperature: 0.3, top_k: 20, seed: 33 }),
         (511, GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 10, seed: 44 }),
+        (33, GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 500, seed: 55 }),
     ];
     let prompts: Vec<Vec<usize>> = specs
         .iter()
@@ -1153,20 +1362,16 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
         .map(|(len, _)| (len + steps + 2).div_ceil(PAGE_TOKENS) + 1)
         .sum();
 
-    let load = |mb: usize, pg: usize| -> Result<Runtime> {
+    let load = |mb: usize, pg: usize, device_topk: bool| -> Result<Runtime> {
         let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
         m.enable_paging(pg, mb)?;
+        m.set_device_topk(device_topk);
         Runtime::new(m)
     };
 
-    println!("steps        {steps} tokens per request");
-    println!("pool         {pages} pages");
-    println!();
-
-    // --- each request alone -------------------------------------------------
-    let mut alone: Vec<Vec<usize>> = Vec::new();
-    {
-        let mut rt = load(1, pages)?;
+    let run_alone = |device_topk: bool| -> Result<Vec<Vec<usize>>> {
+        let mut out = Vec::new();
+        let mut rt = load(1, pages, device_topk)?;
         for (i, prompt) in prompts.iter().enumerate() {
             rt.submit(Request {
                 id: i as u64,
@@ -1176,114 +1381,148 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
             rt.run_to_completion(steps * 4 + 16)?;
             let mut c = rt.completed();
             c.sort_by_key(|x| x.id);
-            alone.push(c.pop().expect("one completion").tokens);
+            out.push(c.pop().expect("one completion").tokens);
         }
-    }
+        Ok(out)
+    };
 
-    // --- all together -------------------------------------------------------
-    let mut rt = load(max_batch, pages)?;
-    for (i, prompt) in prompts.iter().enumerate() {
-        rt.submit(Request {
-            id: i as u64,
-            prompt: prompt.clone(),
-            config: specs[i].1.clone(),
-        });
-    }
-    rt.run_to_completion(steps * 8 + 32)?;
-    let mut together = rt.completed();
-    together.sort_by_key(|c| c.id);
+    println!("steps        {steps} tokens per request");
+    println!("pool         {pages} pages");
+    println!("capacity     device top-k holds {} candidates per row", TOPK_MAX);
+    println!();
 
-    println!("{:>4}  {:>7}  {:>12}  {:>6}  {:>5}  {:>14}",
-             "req", "prompt", "mode", "top-k", "seed", "vs alone");
-    println!("{}", "-".repeat(60));
     let mut failures = 0usize;
-    for c in &together {
-        let (len, gc) = &specs[c.id as usize];
-        let want = &alone[c.id as usize];
-        let ok = &c.tokens == want;
+
+    // --- the two selection paths must generate the same text ----------------
+    //
+    // This is the claim the whole optimisation rests on. The device kernel and
+    // the host reference find the same candidates in the same order, so a
+    // request cannot tell which one served it.
+    let alone = run_alone(true)?;
+    let alone_full = run_alone(false)?;
+    println!("device top-k against the full-logit reference, each request alone");
+    for i in 0..specs.len() {
+        let ok = alone[i] == alone_full[i];
         if !ok {
             failures += 1;
         }
-        let mode = if gc.is_greedy() {
-            "greedy".to_string()
-        } else {
-            format!("temp {:.1}", gc.temperature)
-        };
-        println!("{:>4}  {len:>7}  {mode:>12}  {:>6}  {:>5}  {:>14}",
-                 c.id, gc.top_k, gc.seed, if ok { "identical" } else { "MISMATCH" });
+        println!("  request {i}: {}",
+                 if ok { "identical tokens" } else { "MISMATCH" });
     }
 
-    // --- staggered admission, forcing slot reordering -----------------------
-    println!();
-    println!("staggered admission (forces swap_remove reordering)");
-    let mut staggered: Vec<llm_engine::runtime::Completion> = Vec::new();
-    let mut pending: Vec<(usize, usize)> =
-        (0..prompts.len()).map(|i| (i * 3, i)).collect();
-    let mut t = 0usize;
-    while t < steps * 12 {
-        while let Some(pos) = pending.iter().position(|(at, _)| *at == t) {
-            let (_, i) = pending.remove(pos);
+    // Everything below is checked on both paths against the same reference, so
+    // the fallback is held to the isolation guarantee too.
+    for device_topk in [true, false] {
+        let path = if device_topk { "device top-k" } else { "full logits" };
+        println!();
+        println!("=== {path} ===");
+        let mut rt = load(max_batch, pages, device_topk)?;
+
+        // --- all together ---------------------------------------------------
+        for (i, prompt) in prompts.iter().enumerate() {
             rt.submit(Request {
                 id: i as u64,
-                prompt: prompts[i].clone(),
+                prompt: prompt.clone(),
                 config: specs[i].1.clone(),
             });
         }
-        if rt.is_idle() && pending.is_empty() {
-            break;
+        rt.run_to_completion(steps * 8 + 32)?;
+        let mut together = rt.completed();
+        together.sort_by_key(|c| c.id);
+
+        println!("{:>4}  {:>7}  {:>12}  {:>6}  {:>5}  {:>14}",
+                 "req", "prompt", "mode", "top-k", "seed", "vs alone");
+        println!("{}", "-".repeat(60));
+        for c in &together {
+            let (len, gc) = &specs[c.id as usize];
+            let want = &alone[c.id as usize];
+            let ok = &c.tokens == want;
+            if !ok {
+                failures += 1;
+            }
+            let mode = if gc.is_greedy() {
+                "greedy".to_string()
+            } else {
+                format!("temp {:.1}", gc.temperature)
+            };
+            println!("{:>4}  {len:>7}  {mode:>12}  {:>6}  {:>5}  {:>14}",
+                     c.id, gc.top_k, gc.seed, if ok { "identical" } else { "MISMATCH" });
         }
+
+        // --- staggered admission, forcing slot reordering -------------------
+        println!();
+        println!("staggered admission (forces swap_remove reordering)");
+        let mut staggered: Vec<Completion> = Vec::new();
+        let mut pending: Vec<(usize, usize)> =
+            (0..prompts.len()).map(|i| (i * 3, i)).collect();
+        let mut t = 0usize;
+        while t < steps * 12 {
+            while let Some(pos) = pending.iter().position(|(at, _)| *at == t) {
+                let (_, i) = pending.remove(pos);
+                rt.submit(Request {
+                    id: i as u64,
+                    prompt: prompts[i].clone(),
+                    config: specs[i].1.clone(),
+                });
+            }
+            if rt.is_idle() && pending.is_empty() {
+                break;
+            }
+            rt.step()?;
+            staggered.extend(rt.completed());
+            t += 1;
+        }
+        staggered.sort_by_key(|c| c.id);
+        for c in &staggered {
+            let want = &alone[c.id as usize];
+            let ok = &c.tokens == want;
+            if !ok {
+                failures += 1;
+            }
+            println!("{:>4}  {:>14}", c.id, if ok { "identical" } else { "MISMATCH" });
+        }
+
+        // --- cancellation must not disturb a later identical request --------
+        println!();
+        println!("cancellation does not perturb a later request with the same seed");
+        let victim = 1usize;
+        rt.submit(Request {
+            id: 900,
+            prompt: prompts[victim].clone(),
+            config: specs[victim].1.clone(),
+        });
         rt.step()?;
-        staggered.extend(rt.completed());
-        t += 1;
-    }
-    staggered.sort_by_key(|c| c.id);
-    for c in &staggered {
-        let want = &alone[c.id as usize];
-        let ok = &c.tokens == want;
+        rt.step()?;
+        rt.cancel(900)?;
+        let _ = rt.completed();
+        rt.submit(Request {
+            id: 901,
+            prompt: prompts[victim].clone(),
+            config: specs[victim].1.clone(),
+        });
+        rt.run_to_completion(steps * 4 + 16)?;
+        let after = rt.completed().pop().expect("one completion").tokens;
+        let ok = after == alone[victim];
         if !ok {
             failures += 1;
         }
-        println!("{:>4}  {:>14}", c.id, if ok { "identical" } else { "MISMATCH" });
+        println!("  request after a cancelled twin: {}",
+                 if ok { "identical to running alone" } else { "MISMATCH" });
+
+        println!();
+        println!("pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+        if rt.free_pages() != rt.model().page_pool().n_pages() {
+            anyhow::bail!("pages leaked on the {path} path");
+        }
     }
 
-    // --- cancellation must not disturb a later identical request ------------
-    println!();
-    println!("cancellation does not perturb a later request with the same seed");
-    let victim = 1usize;
-    rt.submit(Request {
-        id: 900,
-        prompt: prompts[victim].clone(),
-        config: specs[victim].1.clone(),
-    });
-    rt.step()?;
-    rt.step()?;
-    rt.cancel(900)?;
-    let _ = rt.completed();
-    rt.submit(Request {
-        id: 901,
-        prompt: prompts[victim].clone(),
-        config: specs[victim].1.clone(),
-    });
-    rt.run_to_completion(steps * 4 + 16)?;
-    let after = rt.completed().pop().expect("one completion").tokens;
-    let ok = after == alone[victim];
-    if !ok {
-        failures += 1;
-    }
-    println!("  request after a cancelled twin: {}",
-             if ok { "identical to running alone" } else { "MISMATCH" });
-
-    println!();
-    println!("pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
-    if rt.free_pages() != rt.model().page_pool().n_pages() {
-        anyhow::bail!("pages leaked");
-    }
     if failures > 0 {
         anyhow::bail!("{failures} request(s) changed output when batched");
     }
     println!();
     println!("Every request produced identical tokens alone and batched, under");
-    println!("simultaneous and staggered admission and across a cancellation.");
+    println!("simultaneous and staggered admission and across a cancellation, on");
+    println!("both the device top-k path and the full-logit path it replaces.");
     Ok(())
 }
 

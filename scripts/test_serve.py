@@ -201,6 +201,20 @@ def main() -> None:
           streamed == json.loads(s1)["text"],
           f"\n    stream={streamed!r}\n    plain ={json.loads(s1)['text']!r}")
 
+    # A top_k above the device kernel's candidate capacity falls back to the
+    # full-logit path inside the runtime. That is invisible over HTTP by design,
+    # so what is checked here is that it still works and still reproduces.
+    big1 = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24,
+                                       "temperature": 0.8, "top_k": 500, "seed": 4242})[1]
+    big2 = post(args, "/v1/generate", {"prompt": "Once upon a time", "max_tokens": 24,
+                                       "temperature": 0.8, "top_k": 500, "seed": 4242})[1]
+    check("a top_k beyond the device kernel still reproduces",
+          json.loads(big1)["text"] == json.loads(big2)["text"],
+          f"{json.loads(big1)['text']!r} vs {json.loads(big2)['text']!r}")
+    check("a wider top_k changes the output",
+          json.loads(big1)["text"] != json.loads(s1)["text"],
+          "top_k 500 matched top_k 40 exactly")
+
     print("\nsampling parameter validation")
     for body, why in [
         ({"prompt": "hi", "max_tokens": 8, "temperature": -1.0}, "negative temperature"),
