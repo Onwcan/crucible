@@ -326,11 +326,12 @@ async fn submit(
     st: &AppState,
     req: &GenerateRequest,
     tokenizer: &Tokenizer,
-) -> std::result::Result<mpsc::Receiver<StreamItem>, (StatusCode, String)> {
+) -> std::result::Result<(mpsc::Receiver<StreamItem>, usize), (StatusCode, String)> {
     let ids = tokenizer
         .encode(&req.prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("could not tokenise prompt: {e}")))?;
     let prompt: Vec<usize> = ids.into_iter().map(|v| v as usize).collect();
+    let prompt_tokens = prompt.len();
 
     validate(prompt.len(), req.max_tokens, &st.limits)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -362,21 +363,58 @@ async fn submit(
             "inference runtime is not running".into(),
         ),
     })?;
-    Ok(rx)
+    Ok((rx, prompt_tokens))
+}
+
+/// Why a compatibility submission failed.
+///
+/// Protocol-neutral by design. Both adapters need the same five failures and
+/// each renders them into its own envelope with its own status codes -- OpenAI
+/// answers a full queue with 429, Anthropic with 529, and neither should have
+/// to know that about the other. Making this an OpenAI error type and having
+/// Anthropic translate it would make one protocol's vocabulary the interface
+/// the other is written against.
+#[derive(Debug, Clone)]
+pub(crate) enum SubmitError {
+    /// The prompt could not be tokenised.
+    Tokenise(String),
+    /// The request is malformed in a way unrelated to size.
+    Invalid(String),
+    /// Prompt, budget or their sum exceeds what this server will serve.
+    TooLarge(String),
+    /// Sampling parameters the runtime rejected.
+    Sampling(String),
+    /// The bounded queue is full.
+    QueueFull(String),
+    /// The inference thread is not running.
+    Unavailable(String),
+}
+
+impl SubmitError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            SubmitError::Tokenise(m)
+            | SubmitError::Invalid(m)
+            | SubmitError::TooLarge(m)
+            | SubmitError::Sampling(m)
+            | SubmitError::QueueFull(m)
+            | SubmitError::Unavailable(m) => m,
+        }
+    }
 }
 
 /// Tokenise, validate and submit on behalf of a compatibility handler.
 ///
-/// The same three steps `submit` does, with two differences: it takes the
-/// generation parameters directly rather than through the native request DTO,
-/// and it reports failures in the OpenAI error shape. It goes through the same
-/// bounded queue to the same inference thread -- a compatibility request has no
+/// The same three steps `submit` does, differing only in taking generation
+/// parameters directly rather than through the native request DTO, and in
+/// reporting failures in a form neither protocol owns. It goes through the same
+/// bounded queue to the same inference thread: a compatibility request has no
 /// privileged path and no separate scheduler.
 ///
-/// Returns the token channel and the prompt's token count, which the caller
-/// needs for `usage.prompt_tokens` and which must come from the tokenizer
-/// rather than from the string's length.
-pub(crate) async fn submit_openai(
+/// Returns the token channel and the prompt's token count, which callers need
+/// for usage accounting and which must come from the tokenizer rather than from
+/// the string's length.
+pub(crate) async fn submit_compat(
     st: &AppState,
     tokenizer: &Tokenizer,
     prompt: &str,
@@ -384,20 +422,18 @@ pub(crate) async fn submit_openai(
     temperature: Option<f32>,
     top_k: Option<usize>,
     seed: Option<u64>,
-) -> std::result::Result<(mpsc::Receiver<StreamItem>, usize), crate::openai::ApiError> {
-    use crate::openai::ApiError;
-
-    let ids = tokenizer.encode(prompt).map_err(|e| {
-        ApiError::invalid(format!("Could not tokenise the prompt: {e}"), Some("prompt"))
-    })?;
+) -> std::result::Result<(mpsc::Receiver<StreamItem>, usize), SubmitError> {
+    let ids = tokenizer
+        .encode(prompt)
+        .map_err(|e| SubmitError::Tokenise(format!("Could not tokenise the prompt: {e}")))?;
     let tokens: Vec<usize> = ids.into_iter().map(|v| v as usize).collect();
     let prompt_tokens = tokens.len();
 
     if let Err(msg) = validate(prompt_tokens, max_tokens, &st.limits) {
         return Err(if is_size_failure(prompt_tokens, max_tokens, &st.limits) {
-            ApiError::context_length(msg)
+            SubmitError::TooLarge(msg)
         } else {
-            ApiError::invalid(msg, Some("prompt"))
+            SubmitError::Invalid(msg)
         });
     }
 
@@ -408,10 +444,10 @@ pub(crate) async fn submit_openai(
     // README rather than left for a user to discover.
     let sampling = temperature.is_some_and(|t| t > 0.0);
     if top_k.is_some() && !sampling {
-        return Err(ApiError::invalid(
-            "'top_k' has no effect without a positive 'temperature'; omit it for              greedy decoding."
+        return Err(SubmitError::Sampling(
+            "top_k has no effect without a positive temperature; omit it for \
+             greedy decoding."
                 .to_string(),
-            Some("top_k"),
         ));
     }
     let config = GenerationConfig {
@@ -424,7 +460,7 @@ pub(crate) async fn submit_openai(
         seed: seed.unwrap_or(DEFAULT_SEED),
     };
     if let Err(msg) = sampling::validate(&config, st.vocab) {
-        return Err(ApiError::invalid(msg, Some("temperature")));
+        return Err(SubmitError::Sampling(msg));
     }
 
     let (tx, rx) = mpsc::channel(st.limits.max_new_tokens.min(512) + 8);
@@ -435,15 +471,50 @@ pub(crate) async fn submit_openai(
         events: tx,
     };
     st.jobs.try_send(job).map_err(|e| match e {
-        mpsc::error::TrySendError::Full(_) => ApiError::rate_limited(format!(
+        mpsc::error::TrySendError::Full(_) => SubmitError::QueueFull(format!(
             "The server queue is full ({} waiting). Retry shortly.",
             st.limits.max_queue
         )),
         mpsc::error::TrySendError::Closed(_) => {
-            ApiError::unavailable("The inference runtime is not running.")
+            SubmitError::Unavailable("The inference runtime is not running.".into())
         }
     })?;
     Ok((rx, prompt_tokens))
+}
+
+/// `GET /v1/models`, which both compatibility protocols claim.
+///
+/// Their schemas are incompatible -- OpenAI returns `{object, data:[{id,
+/// object, created, owned_by}]}`, Anthropic returns `{data:[{id, type,
+/// display_name, created_at, ...}], has_more, first_id, last_id}` -- so one
+/// body cannot satisfy both and the request has to say which it wants.
+///
+/// `anthropic-version` is the discriminator. The Anthropic SDK sends it on
+/// every request and the OpenAI SDK never does, so the signal is reliable, and
+/// absence keeps the pre-existing OpenAI behaviour byte for byte. Both SDKs are
+/// tested against this endpoint for that reason.
+async fn models_list(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if crate::anthropic::wants_anthropic(&headers) {
+        if let Err(e) = crate::anthropic::check_version(&headers) {
+            return e.into_response();
+        }
+        return crate::anthropic::models_list(State(st)).await;
+    }
+    crate::openai::models_list(State(st)).await
+}
+
+async fn models_get(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(model): axum::extract::Path<String>,
+) -> Response {
+    if crate::anthropic::wants_anthropic(&headers) {
+        if let Err(e) = crate::anthropic::check_version(&headers) {
+            return e.into_response();
+        }
+        return crate::anthropic::models_get(&st, &model).await;
+    }
+    crate::openai::models_get(State(st), axum::extract::Path(model)).await
 }
 
 async fn generate(
@@ -451,8 +522,8 @@ async fn generate(
     tokenizer: axum::Extension<Arc<Tokenizer>>,
     Json(req): Json<GenerateRequest>,
 ) -> Response {
-    let mut rx = match submit(&st, &req, &tokenizer).await {
-        Ok(rx) => rx,
+    let (mut rx, prompt_tokens) = match submit(&st, &req, &tokenizer).await {
+        Ok(v) => v,
         Err((code, msg)) => return (code, Json(ErrorBody { error: msg })).into_response(),
     };
 
@@ -486,7 +557,11 @@ async fn generate(
         text,
         tokens_generated: generated,
         finish_reason: reason.as_str().into(),
-        prompt_tokens: req.prompt.len(),
+        // The tokenizer's count, not the string's length. This was
+        // `req.prompt.len()`, which reported characters under a name that says
+        // tokens -- 23 for a seven-token prompt -- and disagreed with what
+        // every compatibility surface reports for the same text.
+        prompt_tokens,
     })
     .into_response()
 }
@@ -496,8 +571,8 @@ async fn generate_stream(
     tokenizer: axum::Extension<Arc<Tokenizer>>,
     Json(req): Json<GenerateRequest>,
 ) -> Response {
-    let rx = match submit(&st, &req, &tokenizer).await {
-        Ok(rx) => rx,
+    let (rx, _) = match submit(&st, &req, &tokenizer).await {
+        Ok(v) => v,
         Err((code, msg)) => return (code, Json(ErrorBody { error: msg })).into_response(),
     };
 
@@ -813,14 +888,19 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/generate", post(generate))
         .route("/v1/generate/stream", post(generate_stream))
-        // OpenAI-compatible surface. Adapters over the handlers above: same
-        // queue, same inference thread, same scheduler.
-        .route("/v1/models", get(crate::openai::models_list))
-        .route("/v1/models/:model", get(crate::openai::models_get))
+        // Compatibility surfaces. Adapters over the handlers above: same
+        // queue, same inference thread, same scheduler, no privileged path.
+        .route("/v1/models", get(models_list))
+        .route("/v1/models/:model", get(models_get))
         .route("/v1/completions", post(crate::openai::completions::completions))
         .route(
             "/v1/chat/completions",
             post(crate::openai::chat::chat_completions),
+        )
+        .route("/v1/messages", post(crate::anthropic::messages::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::anthropic::messages::count_tokens),
         )
         .layer(axum::Extension(tokenizer))
         .with_state(state);
@@ -841,7 +921,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     println!("  max queue    {}", limits.max_queue);
     println!("  context      {}", limits.context);
     println!("  sampling     greedy");
-    println!("  model id     {model_id}  (OpenAI-compatible endpoints)");
+    println!("  model id     {model_id}  (OpenAI- and Anthropic-compatible endpoints)");
     println!("  listening    http://{addr}");
     if !opts.host.is_loopback() {
         println!();

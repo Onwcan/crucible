@@ -11,6 +11,9 @@
 //! tell a wrong kernel from a merely slow one.
 
 pub mod cache;
+// Conversation -> prompt text. Protocol-neutral, and shared by every
+// compatibility adapter so that equivalent conversations cannot diverge.
+pub mod chat_template;
 pub mod config;
 #[cfg(feature = "cuda")]
 pub mod gpu;
@@ -26,8 +29,11 @@ pub mod protocol;
 pub mod sampling;
 pub mod ops;
 pub mod quant;
-// OpenAI-compatible wire types and handlers. Gated with the service, since it
-// is an adapter over it and has no meaning without one.
+// Compatibility adapters. Gated with the service, since each is an adapter over
+// it and has no meaning without one. Siblings, not layers: neither is built on
+// the other, and what they share lives in `chat_template`.
+#[cfg(feature = "cuda")]
+pub mod anthropic;
 #[cfg(feature = "cuda")]
 pub mod openai;
 #[cfg(feature = "cuda")]

@@ -142,6 +142,10 @@ def main() -> None:
     r = json.loads(body)
     check("non-streaming returns 200", status == 200, str(status))
     check("non-streaming produced tokens", r.get("tokens_generated") == 24, str(r))
+    # prompt_tokens is the tokenizer's count, not the string's length. It used
+    # to report characters, which disagreed with every compatibility surface.
+    check("prompt_tokens counts tokens, not characters",
+          0 < r.get("prompt_tokens", 0) < len("The capital of France is"), str(r))
     check("finish_reason is length", r.get("finish_reason") == "length", str(r))
     nonstream_text = r["text"]
 

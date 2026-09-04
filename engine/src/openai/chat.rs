@@ -16,42 +16,12 @@
 //!
 //! # Serialization
 //!
-//! Messages become one plain-text transcript. The rules, chosen for the GPT-2
-//! BPE vocabulary this model was trained with:
-//!
-//! ```text
-//! System: you are terse
-//!
-//! User: hello
-//!
-//! Assistant: hi
-//!
-//! User: and again
-//!
-//! Assistant:
-//! ```
-//!
-//! - **No pseudo-special tokens.** No `<|im_start|>`, no `<|system|>`. Those
-//!   are not in the GPT-2 vocabulary, so they would tokenise into several
-//!   unrelated pieces the model has never seen in that arrangement. Plain
-//!   English role labels tokenise as ordinary words that do occur in dialogue
-//!   on the web, which is the only prior this model actually has.
-//! - **Blank line between turns**, which is how transcripts are separated in
-//!   the training distribution.
-//! - **The trailing prime has no space after the colon.** GPT-2 merges a
-//!   leading space into the following token -- `" hi"` is one token, `"hi"` is
-//!   another -- so ending the prompt with `"Assistant: "` would force the model
-//!   to emit a space token and then a word token that almost never follows one.
-//!   Ending with `"Assistant:"` lets it emit `" hi"` as the single token the
-//!   distribution expects. This is the one detail here that is genuinely about
-//!   GPT-2 rather than about taste.
-//! - **A trailing assistant message is a continuation**, not a new turn: the
-//!   transcript ends with its content and the model carries on from there.
-//!   That is what upstream calls prefix continuation and it costs nothing to
-//!   support honestly.
-//!
-//! One function does this, used by the streaming and non-streaming handlers
-//! alike, so the two cannot disagree about what was sent to the model.
+//! Messages become turns and the turns become one plain-text transcript. The
+//! transcript itself is built by `chat_template`, which the Anthropic adapter
+//! also uses: two copies of that logic would let the same conversation produce
+//! different text depending on which wire format a client happened to speak.
+//! What lives here is only the OpenAI-specific half -- which roles exist, what
+//! content shapes are legal, what to refuse.
 
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -64,26 +34,9 @@ use super::types::{
     ChatResponseMessage, MessageContent, Usage,
 };
 use super::{check_model, json_is_empty, new_id, reject_if_set, unix_now, ApiError};
-use crate::server::{finish_reason_str, submit_openai, AppState, StreamItem};
+use crate::chat_template::{self, Role, Turn};
+use crate::server::{finish_reason_str, submit_compat, AppState, StreamItem};
 use crate::tokenizer::Tokenizer;
-
-/// Roles this adapter can place in a transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    System,
-    User,
-    Assistant,
-}
-
-impl Role {
-    fn label(self) -> &'static str {
-        match self {
-            Role::System => "System:",
-            Role::User => "User:",
-            Role::Assistant => "Assistant:",
-        }
-    }
-}
 
 /// Map an incoming role name.
 ///
@@ -153,7 +106,7 @@ pub fn serialize(messages: &[ChatMessage]) -> Result<String, ApiError> {
         ));
     }
 
-    let mut turns: Vec<(Role, String)> = Vec::with_capacity(messages.len());
+    let mut turns: Vec<Turn> = Vec::with_capacity(messages.len());
     for (i, m) in messages.iter().enumerate() {
         if m.tool_calls.as_ref().is_some_and(|v| !json_is_empty(v))
             || m.function_call.as_ref().is_some_and(|v| !json_is_empty(v))
@@ -163,26 +116,9 @@ pub fn serialize(messages: &[ChatMessage]) -> Result<String, ApiError> {
                 format!("Message {i} carries tool calls, which this server does not implement."),
             ));
         }
-        turns.push((role_of(&m.role)?, content_text(m, i)?));
+        turns.push(Turn::new(role_of(&m.role)?, content_text(m, i)?));
     }
-
-    let mut out = String::new();
-    for (role, text) in &turns {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(role.label());
-        if !text.is_empty() {
-            out.push(' ');
-            out.push_str(text);
-        }
-    }
-    // A trailing assistant turn is a continuation of that turn, so it is not
-    // followed by a fresh prime.
-    if turns.last().map(|(r, _)| *r) != Some(Role::Assistant) {
-        out.push_str("\n\nAssistant:");
-    }
-    Ok(out)
+    Ok(chat_template::serialize(&turns))
 }
 
 /// Everything a chat request must be checked for before it can be served.
@@ -292,7 +228,7 @@ pub(crate) async fn chat_completions(
         Err(e) => return e.into_response(),
     };
 
-    let submitted = submit_openai(
+    let submitted = submit_compat(
         &st,
         &tokenizer,
         &prep.prompt,
@@ -304,7 +240,7 @@ pub(crate) async fn chat_completions(
     .await;
     let (mut rx, prompt_tokens) = match submitted {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     let id = new_id("chatcmpl");

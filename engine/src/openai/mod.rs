@@ -211,6 +211,26 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Render a submission failure into this protocol's envelope.
+///
+/// The status codes are OpenAI's, not Crucible's: a full queue is 429 here and
+/// 529 on the Anthropic surface, because that is what each client library
+/// expects to retry on. Same failure, two vocabularies.
+impl From<crate::server::SubmitError> for ApiError {
+    fn from(e: crate::server::SubmitError) -> Self {
+        use crate::server::SubmitError as S;
+        let msg = e.message().to_string();
+        match e {
+            S::Tokenise(_) => ApiError::invalid(msg, Some("prompt")),
+            S::Invalid(_) => ApiError::invalid(msg, Some("prompt")),
+            S::TooLarge(_) => ApiError::context_length(msg),
+            S::Sampling(_) => ApiError::invalid(msg, Some("temperature")),
+            S::QueueFull(_) => ApiError::rate_limited(msg),
+            S::Unavailable(_) => ApiError::unavailable(msg),
+        }
+    }
+}
+
 // --- identifiers ------------------------------------------------------------
 
 static SEQ: AtomicU64 = AtomicU64::new(0);

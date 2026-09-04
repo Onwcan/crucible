@@ -2202,6 +2202,240 @@ Unchanged from the native service: loopback by default, no authentication, no
 TLS, bounded request sizes, bounded queue, no user-supplied model path. Local
 development. The `api_key` an SDK insists on is ignored.
 
+## Anthropic-compatible API
+
+Point an Anthropic client at Crucible and it works:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key="not-used")
+
+print(client.messages.create(
+    model="crucible-120m",
+    max_tokens=64,
+    messages=[{"role": "user", "content": "Hello"}],
+).content[0].text)
+```
+
+Verified against the official `anthropic` Python package (1.3.0), whose types
+are generated from Anthropic's own spec. Supported API version:
+**`anthropic-version: 2023-06-01`**, which is what the SDK sends. An absent
+header is accepted; a *different* version is a 400, because answering it with
+2023-06-01 semantics would claim to implement changes this adapter has never
+seen.
+
+**A compatibility subset, and not Claude.** The model behind it is the same
+120M-parameter base LM as everywhere else in this repository — no instruction
+tuning, no RLHF, no tool training, not a reasoning model. The protocol is
+Anthropic's; the capabilities are Crucible's.
+
+### A sibling adapter, not a wrapper
+
+```text
+native handlers    ─┐
+OpenAI adapter     ─┼─> one bounded queue ─> one inference thread
+Anthropic adapter  ─┘                        one scheduler, one paged KV, one GPU
+```
+
+`anthropic/` is not built on `openai/`. The two protocols disagree about where
+the system prompt lives, whether `max_tokens` is required, how content is
+shaped and what streaming looks like; routing one through the other would make
+OpenAI's DTOs the interface Anthropic is written against.
+
+What they genuinely share — turning a conversation into prompt text — was
+extracted into `chat_template.rs` and is shared *there*. That is a correctness
+property rather than tidiness: an Anthropic conversation and the equivalent
+OpenAI one must reach the same prompt, and with one implementation they cannot
+drift. The tests check it end to end, and the benchmark prints both surfaces'
+prompt token counts side by side.
+
+### Endpoints
+
+| endpoint | notes |
+|---|---|
+| `POST /v1/messages` | streaming and non-streaming |
+| `POST /v1/messages/count_tokens` | exact, not an estimate |
+| `GET /v1/models`, `GET /v1/models/{id}` | see the collision below |
+
+```bash
+curl -s localhost:8080/v1/messages \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"crucible-120m","max_tokens":32,
+       "messages":[{"role":"user","content":"Explain CUDA graphs."}]}'
+```
+
+```bash
+curl -sN localhost:8080/v1/messages \
+  -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"crucible-120m","max_tokens":16,"stream":true,
+       "system":"Be terse.","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### Streaming
+
+Anthropic's protocol is a sequence of *typed* events with no `[DONE]` sentinel —
+`message_stop` terminates it — so none of the OpenAI chunk framing is reused:
+
+```text
+event: message_start        {"message": {...,"usage":{"input_tokens":7,"output_tokens":0}}}
+event: content_block_start  {"index":0,"content_block":{"type":"text","text":""}}
+event: content_block_delta  {"index":0,"delta":{"type":"text_delta","text":" Hello"}}
+...
+event: content_block_stop   {"index":0}
+event: message_delta        {"delta":{"stop_reason":"max_tokens",...},"usage":{"output_tokens":12}}
+event: message_stop         {"type":"message_stop"}
+```
+
+Deltas go through the same `IncrementalDecoder` the native stream uses, so a
+character whose UTF-8 bytes span several model tokens arrives whole. Concatenated
+deltas equal the non-streaming `content[0].text` byte for byte, and that is
+tested on CJK output where every character is three tokens.
+
+### Sampling: there is no standard knob any more
+
+`temperature`, `top_p` and `top_k` **do not appear anywhere in the current
+SDK's Messages types** — not in `message_create_params`, not under `types/` at
+all. The SDK itself rejects them:
+
+```text
+TypeError: Messages.create() got an unexpected keyword argument 'temperature'
+```
+
+So this endpoint takes no standard sampling parameter and **decodes greedily**.
+A raw-HTTP request that sends `temperature`, `top_p` or `top_k` gets a 400
+pointing at the extensions below, rather than being quietly given greedy output.
+
+Crucible's sampler is still reachable, under names nobody can mistake for
+Anthropic fields:
+
+| extension | effect |
+|---|---|
+| `crucible_temperature` | positive value enables sampling |
+| `crucible_top_k` | candidate count |
+| `crucible_seed` | deterministic seed |
+
+The official SDK never sends these and never needs to. The native API and the
+TUI remain the places where Crucible's own sampling controls are first-class.
+
+### Supported and unsupported
+
+Supported: `model` (required), `max_tokens` (required), `messages`, `system` as
+a string or text blocks, `stream`. Message content may be a string or text
+blocks. Roles are `user` and `assistant`; `system` inside `messages` is refused
+with a pointer at the top-level field. Consecutive same-role messages and a
+trailing assistant message (prefill) both work. `metadata` and `service_tier`
+are accepted and inert.
+
+Refused with a 400 naming the field, unless empty: `stop_sequences`, `tools`,
+`tool_choice`, `thinking`, `output_config`, `container`, `cache_control`, and
+any non-text content block (images, documents, tool results, thinking blocks).
+
+`stop_sequences` is refused rather than approximated. Generating past the
+sequence and trimming afterwards would leave the KV cache, the RNG stream and
+the output-token count describing text the client never received.
+
+### Stop reasons
+
+`max_tokens`, always, and truthfully. Generation ends when the budget runs out
+and for no other reason: this checkpoint has no trained end-of-turn token, so
+`end_turn` would assert a semantic it never acquired, and `stop_sequence`,
+`tool_use`, `pause_turn` and `refusal` all describe machinery that does not
+exist here. `stop_sequence` is always `null`.
+
+### Usage and token counting
+
+`input_tokens` and `output_tokens`, from the tokenizer. `input_tokens` counts
+the *serialized transcript* — system prompt, role labels, separators, assistant
+prime — because that is what the model processed. The cache and server-tool
+counters the schema allows are omitted rather than zero-filled.
+
+`count_tokens` is exact, not an estimate, because it runs the same conversation
+builder, the same template and the same tokenizer that `/v1/messages` runs.
+There is deliberately no second counting implementation to drift. Three
+independent paths agree on every tested conversation:
+
+```text
+count_tokens               7
+usage.input_tokens         7
+tokenize "User: Hello\n\nAssistant:"   7
+```
+
+### The `/v1/models` collision
+
+Both protocols claim `GET /v1/models` with incompatible schemas — OpenAI
+returns `{object, data:[{id, object, created, owned_by}]}`, Anthropic returns
+`{data:[{id, type, display_name, created_at}], has_more, first_id, last_id}` —
+so one body cannot satisfy both.
+
+`anthropic-version` is the discriminator: present means Anthropic, absent keeps
+the existing OpenAI behaviour byte for byte. The Anthropic SDK sends the header
+on every request and the OpenAI SDK never does, so the signal is reliable, and
+**both SDKs are tested against this endpoint** for exactly that reason. The
+model id is the same on both sides.
+
+### Errors
+
+Anthropic's envelope, built separately from OpenAI's:
+
+```json
+{"type": "error",
+ "error": {"type": "invalid_request_error", "message": "..."},
+ "request_id": "req_..."}
+```
+
+| status | type | when |
+|---|---|---|
+| 400 | `invalid_request_error` | malformed JSON, missing field, unsupported parameter or content, context overflow |
+| 404 | `not_found_error` | unknown model id |
+| 529 | `overloaded_error` | the bounded queue is full |
+| 500 | `api_error` | inference failed, or the runtime is not running |
+
+A full queue is **529 here and 429 on the OpenAI surface**: same condition, two
+vocabularies, each the one its client library retries on. Anthropic's 429 means
+a quota was exceeded, and this server has no quotas, so using it would be
+describing a state that does not exist.
+
+Every response and every error carries a `request-id` header, which the SDK
+exposes as `message._request_id`. After a stream has begun there is no status
+line left, so a mid-stream failure arrives as an Anthropic `error` event.
+
+### Overhead
+
+Same server, same prompts, same budget, four surfaces interleaved (169.88 W,
+3090 MHz, 64 tokens, median of 3):
+
+| clients | native | completions | chat | messages |
+|---:|---:|---:|---:|---:|
+| 1 | 1,427 t/s | 1,415 (0.992x) | 1,409 (0.987x) | 1,374 (0.963x) |
+| 4 | 3,373 t/s | 3,329 (0.987x) | 3,348 (0.993x) | 3,283 (0.973x) |
+| 8 | 4,365 t/s | 4,317 (0.989x) | 4,362 (0.999x) | 4,295 (0.984x) |
+| 16 | 5,288 t/s | 5,192 (0.982x) | 5,212 (0.986x) | 5,163 (0.976x) |
+
+The Messages surface runs 1.6–3.7% below native, a little further back than the
+OpenAI ones. That is per-request framing, not per-token cost: an Anthropic
+stream sends five framing events around the deltas where an OpenAI stream sends
+two, and the effect is largest at concurrency 1 where framing is the largest
+share of a request. The median inter-token interval is identical across all four
+surfaces at every concurrency (0.60–0.62 / 0.78 / 1.02–1.03 / 1.43 ms).
+
+Template cost is reported separately from protocol cost, and the two
+conversation surfaces agree exactly — which is the shared serializer, measured:
+
+```text
+  5 raw ->  11 chat,  11 messages (+6)   'The capital of France is'
+ 12 raw ->  18 chat,  18 messages (+6)   'In a distant galaxy, a small crew...'
+  8 raw ->  14 chat,  14 messages (+6)   'The history of the printing press begins in'
+ 11 raw ->  17 chat,  17 messages (+6)   'Q: Why is the sky blue?\nA:'
+```
+
+### Security boundary
+
+Unchanged: loopback by default, no authentication, no TLS, bounded request
+sizes, bounded queue, no user-supplied model path. **API keys are ignored** —
+the SDK requires an `api_key` argument, any placeholder satisfies it, nothing is
+validated and nothing is logged. Localhost binding is the security boundary.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -2350,9 +2584,11 @@ engine/            # Rust inference engine
   src/paged.rs       # page pool, per-sequence page tables, CPU-testable
   src/runtime.rs     # continuous-batching scheduler
   src/sampling.rs    # token selection, shared by the CLI and the runtime
+  src/chat_template.rs # conversation -> prompt, shared by both adapters
   src/protocol.rs    # native wire types, usable without the engine
   src/server.rs      # axum service, one GPU-owning thread
   src/openai/        # OpenAI-compatible adapter over that service
+  src/anthropic/     # Anthropic-compatible Messages adapter, a sibling
   src/tui/           # Ratatui client, native protocol only
   src/gpu.rs         # CUDA backend, NVRTC compilation, validation
   src/gpu_model.rs   # full forward pass on device
@@ -2363,9 +2599,10 @@ scripts/
   export_hf.py       # checkpoint -> HuggingFace Llama, logit-verified
   bench_compare.py   # interleaved comparison against llama.cpp / vLLM
   bench_serve.py     # TTFT and inter-token latency under concurrency
-  bench_openai.py    # native vs OpenAI-compatible surfaces, interleaved
+  bench_compat.py    # native vs every compatibility surface, interleaved
   test_serve.py      # native HTTP behaviour against a running server
   test_openai.py     # OpenAI compatibility, raw HTTP and official SDK
+  test_anthropic.py  # Anthropic compatibility, raw HTTP and official SDK
   smoke_tui.py       # drives the TUI in a pty against a running server
 runs/              # per-run log.csv + best.pt checkpoint
 figures/           # ablation plots
@@ -2396,14 +2633,20 @@ cd engine && cargo test --features cuda        # unit + mock-server tests
 ./target/release/llm-engine gpu-validate       # every kernel against the CPU reference
 python ../scripts/test_serve.py --port 8080    # native HTTP
 python ../scripts/test_openai.py --port 8080 --sdk /path/to/python
+python ../scripts/test_anthropic.py --port 8080 --sdk /path/to/python
 python ../scripts/smoke_tui.py --binary ./target/release/llm-engine --port 8080
 ```
 
-`test_openai.py` runs twice over: once against raw HTTP, checking payloads field
-by field against the published schema, and once through the official `openai`
-package. An SDK will paper over a wrong `object` value or a missing `logprobs`
-key; raw HTTP will not. Passing `--sdk` is optional and the SDK half is skipped
-without it.
+`test_openai.py` and `test_anthropic.py` each run twice over: once against raw
+HTTP, checking payloads field by field against the published schema, and once
+through the official SDK. An SDK will paper over a wrong `object` value, a
+missing `logprobs` key or a mis-named stream event; raw HTTP will not. Passing
+`--sdk` is optional and the SDK half is skipped without it.
+
+Both suites also check what shape tests cannot: streamed text equal to
+non-streamed across split UTF-8, cross-protocol prompt equivalence, seeded
+determinism, disconnect cancellation, and that requests from every protocol
+share decode steps in one scheduler.
 
 ## Roadmap
 
@@ -2440,6 +2683,8 @@ without it.
       and now within 2% of greedy, with greedy itself unchanged
 - [x] OpenAI-compatible API — models, completions and chat completions,
       streaming and not, over the same scheduler; 0.98x to 1.00x of native
+- [x] Anthropic-compatible Messages API — messages, streaming and not, exact
+      count_tokens, over the same scheduler; 0.96x to 0.98x of native
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

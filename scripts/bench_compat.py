@@ -1,30 +1,32 @@
 """
-What the OpenAI compatibility layer costs.
+What the compatibility layers cost.
 
-The adapter parses a different request shape and emits a different chunk shape
+Each adapter parses a different request shape and emits a different event shape
 over the same token stream. This measures whether that costs anything the
-runtime can feel, by running the native streaming endpoint and the compatible
+runtime can feel, by running the native streaming endpoint and every compatible
 one against the same server, with the same prompts and the same generation
 config, interleaved.
 
-Three surfaces are compared:
+Four surfaces are compared:
 
     native      POST /v1/generate/stream
     completions POST /v1/completions      (stream=true)
     chat        POST /v1/chat/completions (stream=true)
+    messages    POST /v1/messages         (stream=true)
 
-Chat is reported separately from the other two for a reason. It serialises
-messages into a transcript, so its prompt is longer than the raw text the other
-two send -- more prefill, more attention, a slower first token. That is the
-chat *template's* cost, not the HTTP layer's, and the two must not be added
-together and blamed on compatibility. The prompt token counts are printed so the
-difference is visible rather than asserted.
+The two conversation surfaces are reported separately from the other two for a
+reason. They serialise messages into a transcript, so their prompt is longer
+than the raw text the other two send -- more prefill, more attention, a slower
+first token. That is the *template's* cost, not the HTTP layer's, and the two
+must not be added together and blamed on compatibility. The prompt token counts
+are printed so the difference is visible rather than asserted, and chat and
+messages should agree exactly: they share one serializer.
 
 Standard library only, like bench_serve.py: measuring an HTTP server with a
 third-party HTTP client invites the two to share assumptions.
 
 Usage:
-    python scripts/bench_openai.py --port 8080 --concurrency 1,4,8,16
+    python scripts/bench_compat.py --port 8080 --concurrency 1,4,8,16
 """
 from __future__ import annotations
 
@@ -66,20 +68,26 @@ class Result:
 
 def stream_request(args, surface: str, prompt: str, max_tokens: int) -> Result:
     """One streaming request, timed from the client's side."""
+    headers = {"Content-Type": "application/json"}
     if surface == "native":
         path = "/v1/generate/stream"
         body = {"prompt": prompt, "max_tokens": max_tokens}
     elif surface == "completions":
         path = "/v1/completions"
         body = {"model": MODEL, "prompt": prompt, "max_tokens": max_tokens, "stream": True}
-    else:
+    elif surface == "chat":
         path = "/v1/chat/completions"
         body = {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens, "stream": True}
+    else:
+        path = "/v1/messages"
+        body = {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens, "stream": True}
+        headers["anthropic-version"] = "2023-06-01"
 
     c = http.client.HTTPConnection(args.host, args.port, timeout=300)
     start = time.perf_counter()
-    c.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+    c.request("POST", path, json.dumps(body), headers)
     r = c.getresponse()
     ttft = None
     tokens = 0
@@ -92,11 +100,15 @@ def stream_request(args, surface: str, prompt: str, max_tokens: int) -> Result:
         payload = line[5:].strip()
         if payload == "[DONE]":
             break
-        # Count only chunks that carry generated text, so the surfaces are
-        # counted alike: the chat stream opens with a role-only chunk, which is
-        # protocol overhead rather than a token.
+        # Count only events that carry generated text, so the surfaces are
+        # counted alike: the chat stream opens with a role-only chunk and the
+        # Anthropic stream with message_start and content_block_start, which
+        # are protocol framing rather than tokens.
         if surface == "native":
             counts = True
+        elif surface == "messages":
+            obj = json.loads(payload)
+            counts = obj.get("type") == "content_block_delta"
         else:
             obj = json.loads(payload)
             ch = obj.get("choices") or []
@@ -149,6 +161,16 @@ def run(args, surface: str, concurrency: int) -> dict:
 
 def prompt_tokens(args, surface: str, prompt: str) -> int:
     """What each surface actually submits, so prefill differences are visible."""
+    c = http.client.HTTPConnection(args.host, args.port, timeout=60)
+    if surface == "messages":
+        # count_tokens exists precisely for this and costs no generation.
+        c.request("POST", "/v1/messages/count_tokens",
+                  json.dumps({"model": MODEL,
+                              "messages": [{"role": "user", "content": prompt}]}),
+                  {"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        data = json.loads(c.getresponse().read())
+        c.close()
+        return data["input_tokens"]
     if surface == "chat":
         body = {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1}
@@ -156,7 +178,6 @@ def prompt_tokens(args, surface: str, prompt: str) -> int:
     else:
         body = {"model": MODEL, "prompt": prompt, "max_tokens": 1}
         path = "/v1/completions"
-    c = http.client.HTTPConnection(args.host, args.port, timeout=60)
     c.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
     data = json.loads(c.getresponse().read())
     c.close()
@@ -179,10 +200,16 @@ def main() -> None:
     print()
 
     print("prompt tokens actually submitted, per surface")
+    shared = True
     for prompt in PROMPTS:
         raw = prompt_tokens(args, "completions", prompt)
         chat = prompt_tokens(args, "chat", prompt)
-        print(f"  {raw:>3} raw -> {chat:>3} chat (+{chat - raw})   {prompt[:44]!r}")
+        msgs = prompt_tokens(args, "messages", prompt)
+        shared = shared and chat == msgs
+        print(f"  {raw:>3} raw -> {chat:>3} chat, {msgs:>3} messages (+{chat - raw})   "
+              f"{prompt[:40]!r}")
+    print(f"  chat and messages agree on every prompt: {shared}"
+          "   (they share one serializer)")
     print()
 
     header = (f"{'clients':>8}  {'surface':>12}  {'aggregate':>12}  {'TTFT ms':>9}  "
@@ -192,7 +219,7 @@ def main() -> None:
 
     for n in levels:
         base = None
-        for surface in ("native", "completions", "chat"):
+        for surface in ("native", "completions", "chat", "messages"):
             runs = [run(args, surface, n) for _ in range(args.trials)]
             agg = statistics.median(r["aggregate"] for r in runs)
             ttft = statistics.median(r["ttft_ms"] for r in runs)
@@ -204,10 +231,10 @@ def main() -> None:
                   f"{ratio:>10}")
         print()
 
-    print("TTFT includes prefill, so chat's is higher by the cost of its longer")
-    print("serialized prompt -- see the token counts above. gap is the median")
-    print("inter-token interval once generation is under way, which is where the")
-    print("per-chunk serialisation cost would show up if it were material.")
+    print("TTFT includes prefill, so the conversation surfaces carry the cost of")
+    print("their longer serialized prompt -- see the token counts above. gap is the")
+    print("median inter-token interval once generation is under way, which is where")
+    print("per-event serialisation cost would show up if it were material.")
 
 
 if __name__ == "__main__":

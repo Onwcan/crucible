@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use super::types::{CompletionChoice, CompletionRequest, CompletionResponse, PromptField, Usage};
 use super::{check_model, json_is_empty, new_id, reject_if_set, unix_now, ApiError};
-use crate::server::{finish_reason_str, submit_openai, AppState, StreamItem};
+use crate::server::{finish_reason_str, submit_compat, AppState, StreamItem};
 use crate::tokenizer::Tokenizer;
 
 struct Prepared {
@@ -125,7 +125,7 @@ pub(crate) async fn completions(
         Err(e) => return e.into_response(),
     };
 
-    let submitted = submit_openai(
+    let submitted = submit_compat(
         &st,
         &tokenizer,
         &prep.prompt,
@@ -137,7 +137,7 @@ pub(crate) async fn completions(
     .await;
     let (mut rx, prompt_tokens) = match submitted {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     let id = new_id("cmpl");
