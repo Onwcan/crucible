@@ -162,6 +162,13 @@ enum Command {
         /// KV pages. Defaults to enough for max_batch full-context sequences.
         #[arg(long)]
         kv_pages: Option<usize>,
+        /// Public model id for the OpenAI-compatible endpoints.
+        ///
+        /// Published by /v1/models and echoed in every compatibility response.
+        /// Set it when serving a checkpoint other than the 120M one, so clients
+        /// are not told they are talking to a model that is not loaded.
+        #[arg(long, default_value = llm_engine::openai::DEFAULT_MODEL_ID)]
+        model_id: String,
     },
     /// What sampling costs, against the greedy fast path, both ways.
     ///
@@ -367,6 +374,7 @@ fn main() -> Result<()> {
             max_prompt_tokens,
             max_new_tokens,
             kv_pages,
+            model_id,
         } => {
             use llm_engine::paged::PAGE_TOKENS;
             use llm_engine::server::{serve, Limits, ServeOptions};
@@ -384,6 +392,7 @@ fn main() -> Result<()> {
                 tokenizer,
                 quant,
                 kv_pages: pages,
+                model_id,
                 limits: Limits {
                     max_batch,
                     max_queue,

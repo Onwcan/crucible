@@ -1956,6 +1956,252 @@ run at 1.5 s rather than spinning.
 - No model selector, settings screen, or multi-server management.
 - No mouse support; every action has a key.
 
+## OpenAI-compatible API
+
+Point an OpenAI client at Crucible and it works:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-used")
+
+print(client.chat.completions.create(
+    model="crucible-120m",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=32,
+).choices[0].message.content)
+```
+
+Verified against the official `openai` Python package (3.8.0) and against the
+published OpenAPI specification, version 2.3.0. There is no authentication: the
+SDK requires an `api_key` argument, any placeholder satisfies it, and the server
+ignores whatever is sent.
+
+**This is a compatibility subset, not an implementation of the OpenAI API.**
+What is implemented is what Crucible actually does. Everything else returns a
+4xx naming the parameter, rather than being accepted and ignored -- a server
+that accepts `top_p` and then samples with top-k has told the client something
+false about its own output, and the client has no way to find out.
+
+### An adapter, not a second engine
+
+```text
+OpenAI request -> DTO -> native job -> [one runtime, one scheduler] -> tokens -> OpenAI chunks
+```
+
+The handlers in `openai/` build the same job `/v1/generate` builds and push it
+through the same bounded queue to the same inference thread. There is no path
+from them to `GpuModel`, no second scheduler, and no separate queue. A
+compatibility request batches with native requests and with the TUI, and is
+subject to the same backpressure and the same cancellation.
+
+The native endpoints are unchanged, and the TUI still speaks the native
+protocol. It is Crucible's own client; making it depend on somebody else's
+schema would be backwards.
+
+### Endpoints
+
+| endpoint | notes |
+|---|---|
+| `GET /v1/models` | one entry, the loaded checkpoint |
+| `GET /v1/models/{model}` | 404 for anything else |
+| `POST /v1/completions` | streaming and non-streaming |
+| `POST /v1/chat/completions` | streaming and non-streaming |
+
+```bash
+curl -s localhost:8080/v1/completions -H 'content-type: application/json' \
+  -d '{"model":"crucible-120m","prompt":"The capital of France is","max_tokens":12}'
+```
+
+```bash
+curl -sN localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"crucible-120m","stream":true,"max_tokens":16,
+       "messages":[{"role":"user","content":"Hello"}]}'
+```
+
+The model id is `crucible-120m`, fixed, and appears identically in
+`/v1/models`, in every response and in every stream chunk. It is not the model
+directory: a filesystem path is not something to publish in a field clients
+paste into config files. Serving a different checkpoint should pass
+`--model-id`.
+
+### Supported parameters
+
+| parameter | behaviour |
+|---|---|
+| `model` | validated; a different model is 404, never silently served |
+| `prompt` / `messages` | required |
+| `max_tokens`, `max_completion_tokens` | both accepted; disagreeing values are an error |
+| `temperature` | absent or 0 is greedy — see below |
+| `seed` | per-request deterministic sampling |
+| `stream` | SSE, terminated with `data: [DONE]` |
+| `stream_options.include_usage` | adds the final usage-only chunk |
+| `top_k` | **a Crucible extension**, not an OpenAI field |
+
+**`temperature` omitted means greedy**, which is a deliberate divergence:
+OpenAI's default is 1.0. Crucible's native API has always been greedy by
+default, and matching it means the same prompt produces the same text on every
+surface — which is what makes the cross-endpoint determinism tests above
+possible. A client that wants sampling asks for it.
+
+`seed` without a temperature is accepted rather than refused: greedy decoding
+already delivers the reproducibility the field is asking for. `top_k` without a
+positive temperature is refused, because it is Crucible's own extension and a
+caller who set it has misunderstood something.
+
+### Explicitly unsupported
+
+Each returns 400 with the offending parameter named, unless it is at its no-op
+value (`n: 1`, `top_p: 1.0`, `stop: null`, penalties at 0, `tools: []`), which
+is accepted so ordinary clients that always send defaults still work.
+
+| parameter | why |
+|---|---|
+| `top_p` | Crucible samples with top-k; nucleus sampling is not implemented |
+| `frequency_penalty`, `presence_penalty` | repetition penalties not implemented |
+| `logit_bias` | not implemented |
+| `logprobs`, `top_logprobs` | the engine does not return probabilities; zeros would be a fabrication |
+| `stop` | see below |
+| `n > 1`, `best_of` | one choice per request |
+| `tools`, `tool_choice`, `functions`, `function_call` | this model has no tool-calling training and would never emit a valid call |
+| `response_format` | structured output needs constrained decoding |
+| `echo`, `suffix` | not implemented |
+| images, audio, `modalities` | text only; a non-text content part is refused, never stringified into the prompt |
+| `tool` / `function` message roles | representing a tool result would mean inventing a convention the model never saw |
+
+`stop` is refused rather than faked. Implementing it by generating past the stop
+sequence and trimming afterwards would leave the KV cache, the RNG stream and
+the token accounting describing text the client never received. It belongs in
+the scheduler, matching across token boundaries, and that is a runtime feature
+rather than an adapter one.
+
+### The chat template, and what it does not imply
+
+**The 120M checkpoint is a base language model.** It was trained on FineWeb-Edu,
+it has never been instruction-tuned, and it ships no trained chat template.
+Chat Completions here is protocol compatibility, not a capability claim: the
+model will continue a transcript-shaped prompt with something transcript-shaped,
+which is not the same as following instructions.
+
+Since no real template exists, this one is defined explicitly rather than
+guessed:
+
+```text
+System: be terse
+
+User: hello
+
+Assistant: hi
+
+User: and again
+
+Assistant:
+```
+
+- **No pseudo-special tokens.** `<|im_start|>` and friends are not in the GPT-2
+  vocabulary, so they would tokenise into several unrelated pieces the model has
+  never seen arranged that way. Plain English role labels tokenise as ordinary
+  words that do occur in dialogue on the web, which is the only prior this model
+  has.
+- **The trailing prime has no space after the colon.** GPT-2 merges a leading
+  space into the following token — `" hi"` is one token, `"hi"` is another — so
+  ending with `"Assistant: "` would force a space token followed by a
+  word-without-space token, a pairing the training distribution almost never
+  contains. This is the one detail here that is genuinely about GPT-2 rather
+  than about taste. It is also why replies begin with a space: that space is
+  part of the model's first token, and trimming it would mean the chat endpoint
+  no longer matched the native one for the same prompt.
+- **A trailing assistant message is a continuation**, not a new turn.
+- One function does this, shared by the streaming and non-streaming handlers, so
+  the two cannot disagree about what was sent to the model.
+
+### Finish reasons
+
+`length` — always, and truthfully. Generation stops when the token budget runs
+out and for no other reason: this checkpoint has no trained stop token, and stop
+sequences are not implemented. Reporting `stop` would assert a natural ending
+that never happened.
+
+A cancelled request has already lost its connection, so it receives no final
+chunk and no `[DONE]`. Fabricating a successful ending for a client that is gone
+would only corrupt anything replaying the stream from a log.
+
+### Usage
+
+`prompt_tokens`, `completion_tokens` and `total_tokens`, from the tokenizer
+rather than from string lengths. For chat, `prompt_tokens` counts the
+*serialized transcript* actually submitted, which is what the model processed.
+The `prompt_tokens_details` and `completion_tokens_details` sub-objects are
+omitted rather than zero-filled: reporting `cached_tokens: 0` would assert that
+prompt caching exists here and happened not to help.
+
+On streams, usage appears only when `stream_options.include_usage` is set, in a
+final chunk with an empty `choices` array, exactly as the schema describes.
+
+### Errors
+
+The OpenAI envelope, with all four inner fields always present:
+
+```json
+{"error": {"message": "...", "type": "invalid_request_error",
+           "param": "top_p", "code": "unsupported_parameter"}}
+```
+
+| status | when |
+|---|---|
+| 400 | malformed JSON, missing field, unsupported parameter, `context_length_exceeded` |
+| 404 | unknown model id |
+| 429 | the bounded queue is full |
+| 503 | the inference thread is not running |
+| 500 | inference failed mid-request |
+
+Native endpoints keep their own error shape. Rust error text never reaches a
+client verbatim.
+
+### Overhead
+
+Same server, same prompts, same generation config, three surfaces interleaved
+(168.78 W, 3090 MHz, 64 tokens, median of 3):
+
+| clients | surface | aggregate | TTFT ms | inter-token ms | vs native |
+|---:|---|---:|---:|---:|---:|
+| 1 | native | 1,419 t/s | 7.5 | 0.61 | — |
+| 1 | completions | 1,420 t/s | 7.4 | 0.60 | 1.001x |
+| 1 | chat | 1,425 t/s | 7.5 | 0.60 | 1.004x |
+| 4 | native | 3,376 t/s | 27.6 | 0.78 | — |
+| 4 | completions | 3,340 t/s | 27.0 | 0.78 | 0.989x |
+| 4 | chat | 3,351 t/s | 27.9 | 0.78 | 0.993x |
+| 8 | native | 4,434 t/s | 52.4 | 1.02 | — |
+| 8 | completions | 4,350 t/s | 53.0 | 1.02 | 0.981x |
+| 8 | chat | 4,395 t/s | 53.3 | 1.02 | 0.991x |
+| 16 | native | 5,336 t/s | 104.1 | 1.42 | — |
+| 16 | completions | 5,266 t/s | 103.5 | 1.42 | 0.987x |
+| 16 | chat | 5,266 t/s | 104.7 | 1.42 | 0.987x |
+
+0.981x to 1.004x — inside run-to-run noise, with the inter-token interval
+identical to three significant figures at every concurrency. The adapter is
+serialisation and nothing else.
+
+Chat's extra cost is prompt length, not protocol, and the two are reported
+separately for that reason. Its transcript wrapper adds **exactly 6 tokens**
+(`User: ` … `\n\nAssistant:`) to every prompt measured:
+
+```text
+  5 raw ->  11 chat   'The capital of France is'
+ 12 raw ->  18 chat   'In a distant galaxy, a small crew of engineers...'
+  8 raw ->  14 chat   'The history of the printing press begins in'
+ 11 raw ->  17 chat   'Q: Why is the sky blue?\nA:'
+```
+
+At these lengths that is invisible in TTFT. On a long conversation it would not
+be, and it would still be the template's cost rather than HTTP's.
+
+### Security boundary
+
+Unchanged from the native service: loopback by default, no authentication, no
+TLS, bounded request sizes, bounded queue, no user-supplied model path. Local
+development. The `api_key` an SDK insists on is ignored.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -2103,6 +2349,11 @@ engine/            # Rust inference engine
   src/cache.rs       # KV cache for incremental decode
   src/paged.rs       # page pool, per-sequence page tables, CPU-testable
   src/runtime.rs     # continuous-batching scheduler
+  src/sampling.rs    # token selection, shared by the CLI and the runtime
+  src/protocol.rs    # native wire types, usable without the engine
+  src/server.rs      # axum service, one GPU-owning thread
+  src/openai/        # OpenAI-compatible adapter over that service
+  src/tui/           # Ratatui client, native protocol only
   src/gpu.rs         # CUDA backend, NVRTC compilation, validation
   src/gpu_model.rs   # full forward pass on device
   src/quant.rs       # int8 weight quantisation
@@ -2111,6 +2362,11 @@ scripts/
   bench_bandwidth.py # memory bandwidth and the decode ceiling it implies
   export_hf.py       # checkpoint -> HuggingFace Llama, logit-verified
   bench_compare.py   # interleaved comparison against llama.cpp / vLLM
+  bench_serve.py     # TTFT and inter-token latency under concurrency
+  bench_openai.py    # native vs OpenAI-compatible surfaces, interleaved
+  test_serve.py      # native HTTP behaviour against a running server
+  test_openai.py     # OpenAI compatibility, raw HTTP and official SDK
+  smoke_tui.py       # drives the TUI in a pty against a running server
 runs/              # per-run log.csv + best.pt checkpoint
 figures/           # ablation plots
 ```
@@ -2132,6 +2388,22 @@ equivalent.
 
 `test_causality` verifies that editing token *t* leaves every output before *t*
 bit-identical, which catches a broken mask that a falling loss curve would hide.
+
+The engine has its own suites, which need a GPU and a running server:
+
+```bash
+cd engine && cargo test --features cuda        # unit + mock-server tests
+./target/release/llm-engine gpu-validate       # every kernel against the CPU reference
+python ../scripts/test_serve.py --port 8080    # native HTTP
+python ../scripts/test_openai.py --port 8080 --sdk /path/to/python
+python ../scripts/smoke_tui.py --binary ./target/release/llm-engine --port 8080
+```
+
+`test_openai.py` runs twice over: once against raw HTTP, checking payloads field
+by field against the published schema, and once through the official `openai`
+package. An SDK will paper over a wrong `object` value or a missing `logprobs`
+key; raw HTTP will not. Passing `--sdk` is optional and the SDK half is skipped
+without it.
 
 ## Roadmap
 
@@ -2166,6 +2438,8 @@ bit-identical, which catches a broken mask that a falling loss curve would hide.
       HTTP/SSE and the TUI, with the greedy fast path preserved
 - [x] Device-side top-k — 196x less D2H; sampled decode 1.20x to 1.98x faster
       and now within 2% of greedy, with greedy itself unchanged
+- [x] OpenAI-compatible API — models, completions and chat completions,
+      streaming and not, over the same scheduler; 0.98x to 1.00x of native
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

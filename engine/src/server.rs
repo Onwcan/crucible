@@ -28,6 +28,16 @@
 //! Local development service: bound to loopback unless told otherwise, no auth,
 //! no TLS. Input sizes are validated and queues bounded, because those protect
 //! the runtime rather than the network.
+//!
+//! # Two wire protocols, one runtime
+//!
+//! This module serves Crucible's native protocol. `openai` serves an
+//! OpenAI-compatible subset by translating into the same `Job` and reading back
+//! the same `StreamItem` stream -- it is a second *protocol*, never a second
+//! engine. The plumbing it needs (`AppState`, `StreamItem`, `submit_openai`) is
+//! `pub(crate)` for that reason and for no other; there is deliberately no way
+//! for a compatibility handler to reach `GpuModel`, the scheduler or a queue of
+//! its own.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -79,6 +89,9 @@ pub struct ServeOptions {
     pub quant: String,
     pub limits: Limits,
     pub kv_pages: usize,
+    /// Public identifier for the served checkpoint, used by the
+    /// OpenAI-compatible endpoints.
+    pub model_id: String,
 }
 
 // --- wire types -------------------------------------------------------------
@@ -86,7 +99,7 @@ pub struct ServeOptions {
 // --- inference thread plumbing ---------------------------------------------
 
 /// What a handler sends to the inference thread.
-struct Job {
+pub(crate) struct Job {
     id: u64,
     prompt: Vec<usize>,
     config: GenerationConfig,
@@ -95,7 +108,7 @@ struct Job {
 
 /// What the inference thread sends back per request.
 #[derive(Debug)]
-enum StreamItem {
+pub(crate) enum StreamItem {
     Token { id: usize, text: String },
     Done { reason: FinishReason, generated: usize, tail: String },
     Failed(String),
@@ -120,16 +133,22 @@ struct Stats {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     jobs: mpsc::Sender<Job>,
     stats: Arc<Mutex<Stats>>,
     next_id: Arc<AtomicU64>,
-    limits: Limits,
+    pub(crate) limits: Limits,
     vocab: usize,
     health: Arc<HealthBody>,
     started: Instant,
     /// Set when the inference thread dies, so /health can report it.
     fatal: Arc<Mutex<Option<String>>>,
+    /// The public model id, as published by `/v1/models` and echoed in every
+    /// compatibility response.
+    pub(crate) model_id: Arc<str>,
+    /// Unix time the checkpoint was written, for the `created` field of the
+    /// model object. Stable across restarts, unlike server start time.
+    pub(crate) model_created: i64,
 }
 
 /// What the inference thread reports once the model is resident.
@@ -191,6 +210,33 @@ pub fn validate(
         ));
     }
     Ok(())
+}
+
+/// Whether a validation failure was about size rather than shape.
+///
+/// The compatibility layer needs to answer with `context_length_exceeded`
+/// rather than a generic invalid-value code, and sniffing the message string
+/// for that would break the first time somebody rewords it.
+pub(crate) fn is_size_failure(prompt_tokens: usize, max_tokens: usize, limits: &Limits) -> bool {
+    max_tokens > limits.max_new_tokens
+        || prompt_tokens > limits.max_prompt_tokens
+        || prompt_tokens + max_tokens > limits.context
+}
+
+/// The finish reason as the OpenAI schema spells it.
+///
+/// `Length` is the only value a client can actually observe. Generation stops
+/// when the token budget runs out and nothing else: this model has no trained
+/// stop token, and stop sequences are not implemented, so reporting `stop`
+/// would assert a natural ending that never happened. A cancelled request has
+/// already lost its connection, so its finish reason is never delivered --
+/// mapping it here keeps the function total rather than describing a case a
+/// client can see.
+pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Length => "length",
+        FinishReason::Cancelled => "length",
+    }
 }
 
 // --- handlers ---------------------------------------------------------------
@@ -317,6 +363,87 @@ async fn submit(
         ),
     })?;
     Ok(rx)
+}
+
+/// Tokenise, validate and submit on behalf of a compatibility handler.
+///
+/// The same three steps `submit` does, with two differences: it takes the
+/// generation parameters directly rather than through the native request DTO,
+/// and it reports failures in the OpenAI error shape. It goes through the same
+/// bounded queue to the same inference thread -- a compatibility request has no
+/// privileged path and no separate scheduler.
+///
+/// Returns the token channel and the prompt's token count, which the caller
+/// needs for `usage.prompt_tokens` and which must come from the tokenizer
+/// rather than from the string's length.
+pub(crate) async fn submit_openai(
+    st: &AppState,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+) -> std::result::Result<(mpsc::Receiver<StreamItem>, usize), crate::openai::ApiError> {
+    use crate::openai::ApiError;
+
+    let ids = tokenizer.encode(prompt).map_err(|e| {
+        ApiError::invalid(format!("Could not tokenise the prompt: {e}"), Some("prompt"))
+    })?;
+    let tokens: Vec<usize> = ids.into_iter().map(|v| v as usize).collect();
+    let prompt_tokens = tokens.len();
+
+    if let Err(msg) = validate(prompt_tokens, max_tokens, &st.limits) {
+        return Err(if is_size_failure(prompt_tokens, max_tokens, &st.limits) {
+            ApiError::context_length(msg)
+        } else {
+            ApiError::invalid(msg, Some("prompt"))
+        });
+    }
+
+    // Crucible's sampling semantics, unchanged: absent or non-positive
+    // temperature is greedy. That differs from OpenAI's documented default of
+    // 1.0 and is deliberate -- it keeps this endpoint and the native one
+    // answering the same prompt with the same text, and it is documented in the
+    // README rather than left for a user to discover.
+    let sampling = temperature.is_some_and(|t| t > 0.0);
+    if top_k.is_some() && !sampling {
+        return Err(ApiError::invalid(
+            "'top_k' has no effect without a positive 'temperature'; omit it for              greedy decoding."
+                .to_string(),
+            Some("top_k"),
+        ));
+    }
+    let config = GenerationConfig {
+        max_tokens,
+        temperature: temperature.unwrap_or(0.0),
+        top_k: top_k.unwrap_or(DEFAULT_TOP_K),
+        // A seed given without a positive temperature is accepted and unused:
+        // greedy decoding already satisfies the reproducibility the field asks
+        // for, so refusing it would break clients that always send one.
+        seed: seed.unwrap_or(DEFAULT_SEED),
+    };
+    if let Err(msg) = sampling::validate(&config, st.vocab) {
+        return Err(ApiError::invalid(msg, Some("temperature")));
+    }
+
+    let (tx, rx) = mpsc::channel(st.limits.max_new_tokens.min(512) + 8);
+    let job = Job {
+        id: st.next_id.fetch_add(1, Ordering::Relaxed),
+        prompt: tokens,
+        config,
+        events: tx,
+    };
+    st.jobs.try_send(job).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => ApiError::rate_limited(format!(
+            "The server queue is full ({} waiting). Retry shortly.",
+            st.limits.max_queue
+        )),
+        mpsc::error::TrySendError::Closed(_) => {
+            ApiError::unavailable("The inference runtime is not running.")
+        }
+    })?;
+    Ok((rx, prompt_tokens))
 }
 
 async fn generate(
@@ -622,6 +749,18 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let model_dir = opts.model_dir.clone();
     let quant = opts.quant.clone();
 
+    let model_id: Arc<str> = Arc::from(opts.model_id.as_str());
+    crate::openai::validate_model_id(&model_id).map_err(|e| anyhow::anyhow!(e))?;
+    // The checkpoint's own timestamp, so `created` survives a restart. Model
+    // objects are cached by clients; a value that moved every boot would look
+    // like a different model each time.
+    let model_created = std::fs::metadata(model_dir.join("config.json"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     let worker = {
         let tokenizer = tokenizer.clone();
         let stats = stats.clone();
@@ -665,6 +804,8 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         health: health_body,
         started: Instant::now(),
         fatal,
+        model_id: model_id.clone(),
+        model_created,
     };
 
     let app = Router::new()
@@ -672,6 +813,15 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/generate", post(generate))
         .route("/v1/generate/stream", post(generate_stream))
+        // OpenAI-compatible surface. Adapters over the handlers above: same
+        // queue, same inference thread, same scheduler.
+        .route("/v1/models", get(crate::openai::models_list))
+        .route("/v1/models/:model", get(crate::openai::models_get))
+        .route("/v1/completions", post(crate::openai::completions::completions))
+        .route(
+            "/v1/chat/completions",
+            post(crate::openai::chat::chat_completions),
+        )
         .layer(axum::Extension(tokenizer))
         .with_state(state);
 
@@ -691,6 +841,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     println!("  max queue    {}", limits.max_queue);
     println!("  context      {}", limits.context);
     println!("  sampling     greedy");
+    println!("  model id     {model_id}  (OpenAI-compatible endpoints)");
     println!("  listening    http://{addr}");
     if !opts.host.is_loopback() {
         println!();

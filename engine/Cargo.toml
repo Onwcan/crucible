@@ -32,6 +32,11 @@ cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-version-from-b
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "io-util"], optional = true }
 axum = { version = "0.7", optional = true }
 tokio-stream = { version = "0.1", optional = true }
+# Lets the OpenAI-compatible SSE handlers be written as one lazily-polled
+# stream. The alternative -- a spawned task feeding a channel -- only notices a
+# disconnected client on its next send, which would delay cancellation by a
+# token relative to the native endpoint.
+async-stream = { version = "0.3", optional = true }
 
 # Terminal client. Deliberately independent of the cuda feature: the TUI speaks
 # only HTTP, so it must build and its tests must run without a GPU present.
@@ -44,7 +49,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"], 
 
 [features]
 default = ["tui"]
-cuda = ["dep:cudarc", "dep:tokio", "dep:axum", "dep:tokio-stream"]
+cuda = ["dep:cudarc", "dep:tokio", "dep:axum", "dep:tokio-stream", "dep:async-stream"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:reqwest", "dep:futures-util", "dep:tokio"]
 
 [profile.release]

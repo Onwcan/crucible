@@ -26,6 +26,10 @@ pub mod protocol;
 pub mod sampling;
 pub mod ops;
 pub mod quant;
+// OpenAI-compatible wire types and handlers. Gated with the service, since it
+// is an adapter over it and has no meaning without one.
+#[cfg(feature = "cuda")]
+pub mod openai;
 #[cfg(feature = "cuda")]
 pub mod runtime;
 #[cfg(feature = "cuda")]
