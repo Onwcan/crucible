@@ -1823,9 +1823,50 @@ impl GpuModel {
         self.prefill_body(tokens, pos_offset)
     }
 
+    /// One chunk of a prompt, written into pages the caller owns.
+    ///
+    /// Identical compute to `prefill_request` -- same kernels, same paged
+    /// writes -- except that a chunk which is not the last one skips the
+    /// lm_head projection, since only the final position's logits become a
+    /// token. `pos_offset` is how many of this request's tokens are already
+    /// cached, which the RoPE tables, the cache stores and the attention kernel
+    /// all consume: attention for chunk row `r` runs over `0 ..= pos_offset + r`,
+    /// so a chunk sees the whole prefix and its own causal history, and nothing
+    /// is recomputed.
+    pub fn prefill_chunk(
+        &mut self,
+        tokens: &[usize],
+        table: &[i32],
+        pos_offset: usize,
+        want_logits: bool,
+    ) -> Result<Vec<f32>> {
+        if !self.use_paged {
+            bail!("prefill_chunk requires paging; call enable_paging first");
+        }
+        self.upload_slot0(table, pos_offset + tokens.len())?;
+        self.prefill_body_opt(tokens, pos_offset, want_logits)
+    }
+
     /// The prefill compute itself. Assumes page tables are already uploaded
     /// when paged, and touches neither `self.seq` nor `self.cache_len`.
+    ///
+    /// `want_logits` exists for chunked prefill. Only the final chunk of a
+    /// prompt produces the token the request starts from, so every earlier
+    /// chunk would otherwise pay an lm_head projection over the whole
+    /// vocabulary and a 201 KB device-to-host copy for a result nobody reads --
+    /// and that copy is also the only synchronisation in the function, so
+    /// skipping it lets the chunk queue behind the next one instead of
+    /// stalling the thread.
     fn prefill_body(&mut self, tokens: &[usize], pos_offset: usize) -> Result<Vec<f32>> {
+        self.prefill_body_opt(tokens, pos_offset, true)
+    }
+
+    fn prefill_body_opt(
+        &mut self,
+        tokens: &[usize],
+        pos_offset: usize,
+        want_logits: bool,
+    ) -> Result<Vec<f32>> {
         let cfg = self.cfg.clone();
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
@@ -1901,6 +1942,9 @@ impl GpuModel {
 
         // Only the last position's logits are needed, so this stays a GEMV over
         // one row rather than a [T, vocab] matrix.
+        if !want_logits {
+            return Ok(Vec::new());
+        }
         {
             let p = &self.prefill_scratch;
             let last_row = p.x.slice((t - 1) * d..t * d);

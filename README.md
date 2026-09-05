@@ -2436,6 +2436,164 @@ sizes, bounded queue, no user-supplied model path. **API keys are ignored** —
 the SDK requires an `api_key` argument, any placeholder satisfies it, nothing is
 validated and nothing is logged. Localhost binding is the security boundary.
 
+## Prefill scheduling, and why chunking it did not pay
+
+Admission used to prefill a whole prompt inline, so a scheduler step that
+admitted a long prompt did the entire prefill before decoding anything. Every
+stream already running felt that as one gap.
+
+Measured, with established streams decoding and one prompt arriving partway
+through (168.65 W enforced, 3090 MHz max SM clock, medians over three trials,
+gaps windowed to exclude the established streams' own admission):
+
+| existing streams | arriving prompt | their median gap | worst gap | stall |
+|---:|---:|---:|---:|---:|
+| 1 | 33 tok | 0.86 ms | 7.52 ms | 8.8x |
+| 1 | 535 tok | 0.87 ms | 14.59 ms | 16.8x |
+| 1 | 941 tok | 0.86 ms | 28.63 ms | **33.3x** |
+| 4 | 33 tok | 0.93 ms | 7.90 ms | 8.5x |
+| 4 | 535 tok | 0.92 ms | 15.16 ms | 16.4x |
+| 4 | 941 tok | 0.94 ms | 29.43 ms | **31.4x** |
+
+The stall tracks prompt length, which is the signature of head-of-line blocking
+rather than of general load. Sixteen requests arriving together showed the same
+thing from the other side: a 137.7 ms median time-to-first-token, because
+sixteen prompts prefilled serially before a single decode step ran.
+
+### The scheduler now treats prefill as work, not as part of admission
+
+```text
+admit    pending -> prefilling   (page allocation only, no GPU work)
+decode   one step for every request that already has a token
+prefill  at most one bounded chunk for the oldest prefilling request
+retire   whoever finished
+```
+
+`Prefilling` is an explicit state holding the request's pages, its prompt and
+how much of it is consumed. Admission no longer touches the GPU, so accepting a
+941-token prompt costs the same as accepting a 5-token one. Decode runs before
+prefill because decode latency is what is being protected, and prefill always
+runs afterwards, so neither class can starve the other — there is no ratio to
+tune, the interleave is one to one. Chunks go to the oldest prefilling request
+until its prompt is done; round-robin would delay every waiting prompt's first
+token instead of one of them.
+
+Chunks write straight into the request's own pages. Attention for chunk row `r`
+covers `0 ..= done + r` — the whole cached prefix plus this chunk's causal
+history — which the paged prefill kernel already supported through its
+`pos_offset` argument, so no kernel changed. Nothing is recomputed, nothing is
+staged and copied, and one `SequencePages` mapping serves prefill, decode,
+completion and cancellation alike.
+
+### It is correct, and it is off by default
+
+Correctness first, because a policy that is wrong is not worth benchmarking.
+`gpu-prefill-check` compares generated token ids, chunked against monolithic:
+
+- 18 prompt lengths straddling every 16-token page boundary (1, 15, 16, 17, 31,
+  32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512), greedy and
+  sampled, at chunk sizes 32/64/128/256 — **identical in all 144 comparisons**;
+- chunk sizes that align with neither pages nor the prompt (7, 13, 17, 100, 251,
+  300 against a 251-token prompt) — identical;
+- a request run alone versus prefilled alongside five other prompts — identical,
+  so output does not depend on other requests' timing;
+- cancellation before the first chunk, after one, midway and one chunk from the
+  end — every page returned, the pool reusable, the next request served.
+
+Then the measurement that decides the default. A 941-token prompt arriving into
+one established stream, each policy on its own server, 159-166 W enforced and
+3090 MHz max SM clock throughout:
+
+| policy | worst gap | its TTFT | burst-16 TTFT | burst-16 aggregate |
+|---|---:|---:|---:|---:|
+| **monolithic** | 29.1 ms | **31.1 ms** | 143.6 ms | **3,733 tok/s** |
+| chunk 256 | 27.7 ms | 53.6 ms | **101.8 ms** | 2,940 tok/s |
+| chunk 128 | 21.1 ms | 83.8 ms | 166.7 ms | 2,329 tok/s |
+| chunk 64 | 19.5 ms | 140.6 ms | 237.1 ms | 1,693 tok/s |
+| chunk 32 | 17.5 ms | 261.1 ms | 236.4 ms | 1,083 tok/s |
+
+**No chunk size wins.** The stall shrinks by at most 1.7x, and buying that costs
+8.4x the time-to-first-token and two thirds of the throughput. Chunk 256 is the
+one row with something to show -- the best burst time-to-first-token in the
+table -- and it barely moves the stall it exists to fix, 29.1 ms to 27.7 ms.
+
+### Why: prefill costs 6.8 ms before it looks at a token
+
+TTFT on an idle server, which is prefill plus one decode step (171.76 W,
+3090 MHz):
+
+```text
+  prompt tokens     1     8    17    33    67   134   201   268   401   535   732   941
+  TTFT ms         7.33  7.24  7.32  7.28  7.59  7.99  9.15 10.11 12.46 15.55 22.61 31.01
+```
+
+**Flat at ~7.3 ms from 1 token to 134**, then linear at about 28.5 us per token.
+That plateau is the fixed cost of issuing a prefill at all — roughly 170 eager
+kernel launches through twelve layers, with no captured CUDA graph, the same
+launch overhead the decode path once had and solved there with graphs. Net of
+the one decode step TTFT also contains, the prefill itself costs about 6.6 ms
+before it looks at a token, so the break-even chunk is around **230 tokens**:
+below that, a chunk's fixed cost exceeds the marginal cost of the tokens it
+carries.
+
+That is enough to explain the whole table. A 941-token prompt at chunk 128 is
+eight chunks: 8 x 6.6 ms of overhead added to ~27 ms of real work predicts 84 ms,
+and 83.8 ms is what was measured. At chunk 256 it predicts 58 ms against 53.6 ms
+measured.
+
+And it explains why no size works. To shrink the stall a chunk has to be small,
+and small chunks are all fixed cost; to stay efficient a chunk has to be large,
+and a 256-token chunk already costs 13.9 ms, half of the 29.1 ms monolithic
+prefill it was meant to break up. The window where chunking both shrinks the
+stall and keeps the throughput is empty.
+
+**What would make it pay is removing that fixed cost, not working around it** —
+capturing a CUDA graph for the prefill path as the decode path already does.
+The target is specific: collapse the ~6.6 ms, after which a 128-token chunk
+would cost about 3.6 ms instead of 10.2 ms, the break-even chunk would fall from
+~230 tokens to a few dozen, and the arithmetic above flips. That is kernel-path
+work, it is not attempted here, and this measurement is the evidence that would
+justify it.
+
+One methodological note, since it nearly produced a wrong number. An earlier
+version of this curve was taken with the laptop in a power-saving profile and
+showed 74.3 ms at 941 tokens with a jump between 67 and 134 tokens. The
+enforced power limit read 160 W throughout, so the cap was not the problem: the
+GPU was idle between requests and clocked down to 180 MHz, and the curve was
+measuring boost ramp rather than prefill. The interruption and sweep numbers
+were unaffected, because there the GPU is already busy. `enforced.power.limit`
+alone does not establish an envelope.
+
+### What shipped
+
+The scheduler restructuring, because it is correct, it is the necessary
+foundation, and it fixes real defects on its own: admission no longer blocks on
+GPU work, a client that disconnects mid-prompt is now cancellable and gets its
+pages back immediately, and prefill has metrics (`prefilling_requests`,
+`prefill_chunks`, `prefill_tokens`, `last_prefill_chunk_tokens`) counted from
+scheduler state without a single GPU synchronisation.
+
+The chunking *policy* is off. `CRUCIBLE_CHUNKED_PREFILL=1`, or
+`--prefill-chunk-tokens N`, turns it on for anyone who would rather trade
+throughput for a smaller worst-case gap, and it doubles as the A/B control every
+comparison above was paired against.
+
+Established decode is unaffected — `decode_active` is byte-identical and the
+step loop adds two calls that return immediately when nothing is prefilling.
+Measured across three runs at 152–164 W enforced, 3090 MHz: batch 16 at
+7,932 / 8,205 / 7,974 tok/s against 7,849 before, batch 1 at 1,521 / 1,543 /
+1,576 against 1,618, inside the benchmark's own 3.5–4.9% run-to-run spread.
+
+### Limitations
+
+Prompt pages are still reserved in full at admission rather than progressively:
+the request either fits or waits, which keeps allocator exhaustion a single
+decision made before anything is written. Prefill remains one request at a time;
+batching chunks from several requests into one GEMM is a different idea and is
+not justified while the fixed per-call cost dominates. And the head-of-line
+stall this milestone set out to remove is still there when chunking is off,
+which is the honest state of it.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -2603,6 +2761,7 @@ scripts/
   test_serve.py      # native HTTP behaviour against a running server
   test_openai.py     # OpenAI compatibility, raw HTTP and official SDK
   test_anthropic.py  # Anthropic compatibility, raw HTTP and official SDK
+  bench_prefill_stall.py # what an established stream feels when a prompt arrives
   smoke_tui.py       # drives the TUI in a pty against a running server
 runs/              # per-run log.csv + best.pt checkpoint
 figures/           # ablation plots
@@ -2685,6 +2844,12 @@ share decode steps in one scheduler.
       streaming and not, over the same scheduler; 0.98x to 1.00x of native
 - [x] Anthropic-compatible Messages API — messages, streaming and not, exact
       count_tokens, over the same scheduler; 0.96x to 0.98x of native
+- [x] Prefill as scheduled work — explicit prefilling state, non-blocking
+      admission, cancellation mid-prompt, prefill metrics
+- [ ] Prefill CUDA graphs — measured at 6.8 ms of fixed launch cost per call,
+      which is what makes chunked prefill unprofitable today
+- [~] Chunked prefill — implemented and verified identical to monolithic, but
+      measured slower on every metric but worst-case gap, so it ships off
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

@@ -85,6 +85,19 @@ pub struct Metrics {
     pub greedy_requests: u64,
     #[serde(default)]
     pub sampled_requests: u64,
+    /// Requests holding pages and still working through their prompt.
+    ///
+    /// Prefill is scheduled work now, so it has a queue depth of its own.
+    /// All four come from the scheduler's own state once per step rather than
+    /// from the GPU, so none of them costs a synchronisation.
+    #[serde(default)]
+    pub prefilling_requests: usize,
+    #[serde(default)]
+    pub prefill_chunks: u64,
+    #[serde(default)]
+    pub prefill_tokens: u64,
+    #[serde(default)]
+    pub last_prefill_chunk_tokens: usize,
 }
 
 impl Metrics {

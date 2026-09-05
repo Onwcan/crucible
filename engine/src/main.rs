@@ -81,10 +81,6 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         warm: usize,
     },
-    /// Cross-entropy on held-out tokens, per precision.
-    ///
-    /// The honest way to price quantisation: speed is easy to measure and easy
-    /// to be pleased by, but it is only worth having if quality holds.
     /// Check the paged KV cache against the contiguous one.
     ///
     /// Paging changes where keys and values live, not what is computed, so the
@@ -104,29 +100,6 @@ enum Command {
         #[arg(long)]
         graph: bool,
     },
-    /// Check batched decode and the continuous-batching scheduler against
-    /// independent single-request execution.
-    ///
-    /// The only result that matters is that a request's output does not depend
-    /// on who it was batched with. Heterogeneous lengths are the point: padding
-    /// everything to the longest sequence would pass a same-length test and
-    /// still be wrong.
-    /// Concurrent-decode throughput against N independent single-request runs.
-    ///
-    /// Aggregate throughput and per-request throughput are different claims and
-    /// are reported separately: batching raises the first while lowering the
-    /// second, and calling that a latency improvement would be wrong.
-    /// Stage breakdown of a batched decode step, at several batch sizes.
-    /// Batched GEMV against the tiled GEMM, per projection shape and batch.
-    ///
-    /// Also checks the two agree numerically before reporting any timing: a
-    /// faster kernel that computes something else is not a result.
-    /// Eager versus graph replay on identical inputs, across graph-cache
-    /// transitions and slot permutations.
-    /// Run the HTTP inference service.
-    ///
-    /// Binds loopback unless `--host` says otherwise: this service has no
-    /// authentication, so reaching the network must be a deliberate act.
     /// Terminal client for a running Crucible server.
     ///
     /// Speaks HTTP and SSE only. It never loads the model, so the server must
@@ -139,6 +112,10 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         max_tokens: usize,
     },
+    /// Run the HTTP inference service.
+    ///
+    /// Binds loopback unless `--host` says otherwise: this service has no
+    /// authentication, so reaching the network must be a deliberate act.
     #[cfg(feature = "cuda")]
     Serve {
         model: PathBuf,
@@ -162,6 +139,13 @@ enum Command {
         /// KV pages. Defaults to enough for max_batch full-context sequences.
         #[arg(long)]
         kv_pages: Option<usize>,
+        /// Prompt tokens consumed per scheduler step.
+        ///
+        /// Smaller values interleave prefill with decode more finely, at the
+        /// cost of prefill GEMM efficiency. The default is measured; see the
+        /// chunk-size table in the README.
+        #[arg(long)]
+        prefill_chunk_tokens: Option<usize>,
         /// Public model id for the OpenAI-compatible endpoints.
         ///
         /// Published by /v1/models and echoed in every compatibility response.
@@ -205,6 +189,25 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         trials: usize,
     },
+    /// Check chunked prefill against prefilling each prompt in one piece.
+    ///
+    /// The claim under test is that where a chunk boundary falls cannot change
+    /// what a request generates. Page boundaries are 16 tokens, so boundaries
+    /// that align and boundaries that do not are both exercised.
+    #[cfg(feature = "cuda")]
+    GpuPrefillCheck {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        /// Prompt lengths to check. Defaults straddle every page boundary.
+        #[arg(long, default_value = "1,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512")]
+        lengths: String,
+        /// Chunk sizes to compare against monolithic prefill.
+        #[arg(long, default_value = "32,64,128,256")]
+        chunks: String,
+        #[arg(long, default_value_t = 24)]
+        steps: usize,
+    },
     /// Check that a request's sampled output does not depend on who it is
     /// batched with, or on which selection path served it.
     ///
@@ -222,6 +225,8 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         max_batch: usize,
     },
+    /// Eager versus graph replay on identical inputs, across graph-cache
+    /// transitions and slot permutations.
     #[cfg(feature = "cuda")]
     GpuGraphCheck {
         model: PathBuf,
@@ -235,6 +240,10 @@ enum Command {
         #[arg(long, default_value = "15,16,17,31,32,33,127,128,129,255,256,511,512,513,700,900")]
         lengths: String,
     },
+    /// Batched GEMV against the tiled GEMM, per projection shape and batch.
+    ///
+    /// Also checks the two agree numerically before reporting any timing: a
+    /// faster kernel that computes something else is not a result.
     #[cfg(feature = "cuda")]
     GpuGemvBench {
         #[arg(long, default_value = "1,2,4,8,16")]
@@ -242,6 +251,7 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         iters: usize,
     },
+    /// Stage breakdown of a batched decode step, at several batch sizes.
     #[cfg(feature = "cuda")]
     GpuProfileBatch {
         model: PathBuf,
@@ -256,6 +266,11 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         iters: usize,
     },
+    /// Concurrent-decode throughput against N independent single-request runs.
+    ///
+    /// Aggregate throughput and per-request throughput are different claims and
+    /// are reported separately: batching raises the first while lowering the
+    /// second, and calling that a latency improvement would be wrong.
     #[cfg(feature = "cuda")]
     GpuServeBench {
         model: PathBuf,
@@ -271,6 +286,13 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         trials: usize,
     },
+    /// Check batched decode and the continuous-batching scheduler against
+    /// independent single-request execution.
+    ///
+    /// The only result that matters is that a request's output does not depend
+    /// on who it was batched with. Heterogeneous lengths are the point: padding
+    /// everything to the longest sequence would pass a same-length test and
+    /// still be wrong.
     #[cfg(feature = "cuda")]
     GpuBatch {
         model: PathBuf,
@@ -286,6 +308,10 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         max_batch: usize,
     },
+    /// Cross-entropy on held-out tokens, per precision.
+    ///
+    /// The honest way to price quantisation: speed is easy to measure and easy
+    /// to be pleased by, but it is only worth having if quality holds.
     #[cfg(feature = "cuda")]
     GpuEval {
         model: PathBuf,
@@ -375,6 +401,7 @@ fn main() -> Result<()> {
             max_new_tokens,
             kv_pages,
             model_id,
+            prefill_chunk_tokens,
         } => {
             use llm_engine::paged::PAGE_TOKENS;
             use llm_engine::server::{serve, Limits, ServeOptions};
@@ -393,6 +420,7 @@ fn main() -> Result<()> {
                 quant,
                 kv_pages: pages,
                 model_id,
+                prefill_chunk: prefill_chunk_tokens,
                 limits: Limits {
                     max_batch,
                     max_queue,
@@ -409,6 +437,10 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuTopkBench { rows, top_k, vocab, iters, trials } => {
             gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPrefillCheck { model, quant, lengths, chunks, steps } => {
+            gpu_prefill_check(model, &quant, &lengths, &chunks, steps)
         }
         #[cfg(feature = "cuda")]
         Command::GpuSampling { model, quant, steps, max_batch } => {
@@ -1328,6 +1360,191 @@ fn gpu_topk_bench(
     println!("cand D2H is two blocks of rows*{TOPK_MAX} regardless of k; full D2H is one");
     println!("{vocab}-float row per sampled request. host topk is the selection the");
     println!("full-logit path then has to do, which the kernel removes as well.");
+    Ok(())
+}
+
+
+/// Chunked prefill against monolithic prefill, on generated tokens.
+///
+/// Comparing prose would prove nothing, so this compares token id sequences:
+/// the same prompt, the same seed, the same everything except where the prompt
+/// was cut. Greedy and sampled are both checked, because sampling turns a tiny
+/// logit difference into a visibly different sequence and is therefore the more
+/// sensitive test of the two.
+#[cfg(feature = "cuda")]
+fn gpu_prefill_check(
+    dir: PathBuf,
+    quant: &str,
+    lengths: &str,
+    chunks: &str,
+    steps: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+    use llm_engine::sampling::GenerationConfig;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0 && *v + steps + 2 < cfg.block_size)
+        .collect();
+    let chunk_sizes: Vec<usize> = chunks
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+
+    let max_len = *lens.iter().max().unwrap_or(&1);
+    let pages = (max_len + steps + 2).div_ceil(PAGE_TOKENS) * 8 + 8;
+
+    let build = |chunked: bool, chunk: usize| -> Result<Runtime> {
+        let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        m.enable_paging(pages, 8)?;
+        let mut rt = Runtime::new(m)?;
+        rt.set_chunked_prefill(chunked);
+        rt.set_prefill_chunk(chunk);
+        Ok(rt)
+    };
+
+    // One request at a time, so the only variable is where the prompt was cut.
+    let run_one = |rt: &mut Runtime, prompt: &[usize], config: GenerationConfig|
+     -> Result<Vec<usize>> {
+        rt.submit(Request { id: 0, prompt: prompt.to_vec(), config });
+        rt.run_to_completion(steps * 8 + 64)?;
+        Ok(rt.completed().pop().expect("one completion").tokens)
+    };
+
+    let configs: [(&str, GenerationConfig); 2] = [
+        ("greedy", GenerationConfig::greedy(steps)),
+        ("sampled", GenerationConfig {
+            max_tokens: steps, temperature: 0.8, top_k: 40, seed: 4242,
+        }),
+    ];
+
+    println!("page size    {PAGE_TOKENS} tokens");
+    println!("chunks       {chunk_sizes:?}");
+    println!("prompts      {lens:?}");
+    println!();
+
+    let mut failures = 0usize;
+    let header = format!("{:>7}  {:>9}  {}", "prompt", "mode",
+                         chunk_sizes.iter().map(|c| format!("{:>9}", format!("chunk {c}")))
+                             .collect::<Vec<_>>().join(""));
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    let mut mono = build(false, 0)?;
+    let mut chunked: Vec<Runtime> = chunk_sizes.iter().map(|c| build(true, *c)).collect::<Result<_>>()?;
+
+    for &len in &lens {
+        let prompt = probe_tokens(len, cfg.vocab_size);
+        for (label, config) in &configs {
+            let want = run_one(&mut mono, &prompt, config.clone())?;
+            print!("{len:>7}  {label:>9}  ");
+            for rt in chunked.iter_mut() {
+                let got = run_one(rt, &prompt, config.clone())?;
+                let ok = got == want;
+                if !ok {
+                    failures += 1;
+                }
+                print!("{:>9}", if ok { "same" } else { "DIFFERS" });
+            }
+            println!();
+        }
+    }
+
+    // Boundary alignment: a chunk size that divides the page size and one that
+    // does not, against a prompt length that is neither.
+    println!();
+    println!("misaligned chunk sizes against a misaligned prompt");
+    let odd_prompt = probe_tokens(251, cfg.vocab_size);
+    let want = run_one(&mut mono, &odd_prompt, GenerationConfig::greedy(steps))?;
+    for c in [7usize, 13, 17, 100, 251, 300] {
+        let mut rt = build(true, c)?;
+        let got = run_one(&mut rt, &odd_prompt, GenerationConfig::greedy(steps))?;
+        let ok = got == want;
+        if !ok {
+            failures += 1;
+        }
+        println!("  chunk {c:>4} vs monolithic: {}", if ok { "same" } else { "DIFFERS" });
+    }
+
+    // Concurrency: a request's output must not depend on other prompts being
+    // prefilled at the same time.
+    println!();
+    println!("independence from concurrent prefill");
+    let mut rt = build(true, 128)?;
+    let solo_prompt = probe_tokens(300, cfg.vocab_size);
+    let solo_cfg = GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 20, seed: 77 };
+    let solo = run_one(&mut rt, &solo_prompt, solo_cfg.clone())?;
+
+    let mut rt = build(true, 128)?;
+    rt.submit(Request { id: 0, prompt: solo_prompt.clone(), config: solo_cfg });
+    for i in 1..6u64 {
+        rt.submit(Request {
+            id: i,
+            prompt: probe_tokens(120 * i as usize + 37, cfg.vocab_size),
+            config: GenerationConfig::greedy(steps),
+        });
+    }
+    rt.run_to_completion(steps * 16 + 256)?;
+    let mut done = rt.completed();
+    done.sort_by_key(|c| c.id);
+    let together = done.iter().find(|c| c.id == 0).expect("request 0").tokens.clone();
+    let ok = together == solo;
+    if !ok {
+        failures += 1;
+    }
+    println!("  alone vs prefilled alongside five other prompts: {}",
+             if ok { "identical" } else { "MISMATCH" });
+    println!("  pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+    if rt.free_pages() != rt.model().page_pool().n_pages() {
+        anyhow::bail!("pages leaked");
+    }
+
+    // Cancellation at four points in a long prompt's prefill.
+    println!();
+    println!("cancellation during prefill");
+    let long = probe_tokens(600, cfg.vocab_size);
+    for (label, chunks_before) in [("before the first chunk", 0usize),
+                                   ("after one chunk", 1),
+                                   ("midway", 3),
+                                   ("one chunk before the end", 4)] {
+        let mut rt = build(true, 128)?;
+        let total = rt.model().page_pool().n_pages();
+        rt.submit(Request { id: 900, prompt: long.clone(), config: GenerationConfig::greedy(steps) });
+        for _ in 0..chunks_before {
+            rt.step()?;
+        }
+        let was_prefilling = rt.prefilling_len();
+        rt.cancel(900)?;
+        let _ = rt.completed();
+        // The pages must come back, and the runtime must still work afterwards.
+        let freed = rt.free_pages() == total;
+        rt.submit(Request { id: 901, prompt: long.clone(), config: GenerationConfig::greedy(steps) });
+        rt.run_to_completion(steps * 16 + 256)?;
+        let reused = rt.completed().pop().map(|c| c.tokens.len()) == Some(steps);
+        let clean = rt.free_pages() == total;
+        if !(freed && reused && clean) {
+            failures += 1;
+        }
+        println!("  {label:<26} prefilling {was_prefilling}, pages freed {freed}, \
+                  reuse {reused}, clean {clean}");
+    }
+
+    println!();
+    if failures > 0 {
+        anyhow::bail!("{failures} comparison(s) differed between chunked and monolithic prefill");
+    }
+    println!("Chunked prefill generates exactly what monolithic prefill generates,");
+    println!("at every prompt length, chunk size and alignment tested, and a");
+    println!("request cancelled mid-prompt returns every page it held.");
     Ok(())
 }
 

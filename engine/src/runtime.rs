@@ -24,6 +24,64 @@
 //! is deliberately the simplest policy that exercises the machinery; anything
 //! cleverer (priorities, preemption, prefix sharing) is a scheduling question,
 //! not a correctness one, and belongs after this is measured.
+//!
+//! # Prefill is scheduled work, not something admission does
+//!
+//! Admission used to prefill the whole prompt inline, so a step that admitted a
+//! 941-token prompt did the entire prefill before any decoding. Every stream
+//! already running felt one gap the size of that prefill: measured at 28.6 ms
+//! against a 0.86 ms median, a 33x stall, and it grew with prompt length.
+//!
+//! So a prompt is now consumed in bounded chunks, and a step looks like:
+//!
+//! ```text
+//! admit    pending -> prefilling   (page allocation only, no GPU work)
+//! decode   one step for every request that already has a token
+//! prefill  at most one chunk for the oldest prefilling request
+//! retire   whoever finished
+//! ```
+//!
+//! Decode goes first because that is the latency being protected. Prefill runs
+//! afterwards and always runs, which is what keeps the two from starving each
+//! other: a decode step is guaranteed before every chunk, and a chunk is
+//! guaranteed after every decode step. There is no tuning knob balancing them
+//! because there is nothing to balance -- the interleave is one-to-one.
+//!
+//! Chunks go to the *oldest* prefilling request until its prompt is consumed,
+//! rather than round-robin. Round-robin would delay every waiting prompt's
+//! first token instead of one of them, which is worse on the metric that
+//! matters: FCFS finishes the request that has already waited longest.
+//!
+//! # Chunking is off by default, and the measurement says why
+//!
+//! It does not pay here. Prefill on this engine costs about **6.6 ms before it
+//! processes a single token** -- TTFT on an idle server is flat at 7.3 ms for
+//! every prompt from 1 to 134 tokens, one decode step included -- because a
+//! prefill is roughly 170 eager kernel launches through twelve layers and,
+//! unlike decode, has no captured CUDA graph. Splitting a prompt multiplies
+//! that fixed cost by the chunk count:
+//!
+//! ```text
+//! 941-token prompt        worst gap    its TTFT   burst-16 aggregate
+//!   monolithic              29.1 ms      31.1 ms         3733 tok/s
+//!   chunk 256               27.7 ms      53.6 ms         2940 tok/s
+//!   chunk 128               21.1 ms      83.8 ms         2329 tok/s
+//!   chunk  64               19.5 ms     140.6 ms         1693 tok/s
+//!   chunk  32               17.5 ms     261.1 ms         1083 tok/s
+//! ```
+//!
+//! The stall shrinks by 1.7x at best and costs 8.4x the time-to-first-token and
+//! two thirds of the throughput to get there. No chunk size wins: below the
+//! ~230-token break-even a chunk is mostly fixed cost, and above it a chunk is
+//! already a large fraction of the prefill it was meant to break up.
+//!
+//! So the machinery ships and the policy does not: `CRUCIBLE_CHUNKED_PREFILL=1`
+//! or `--prefill-chunk-tokens` turns it on for anyone who would rather trade
+//! throughput for a smaller worst-case gap. What would make it pay is removing
+//! the fixed cost rather than working around it -- capturing a CUDA graph for
+//! prefill the way the decode path already does, which is what turned decode's
+//! launch overhead from dominant into negligible. That is a kernel-path change
+//! and deliberately not attempted here.
 
 use anyhow::{bail, Result};
 use std::collections::VecDeque;
@@ -83,6 +141,22 @@ pub struct Completion {
     pub reason: FinishReason,
 }
 
+/// A request whose prompt is still being consumed.
+///
+/// The state that used to be implicit in "between `pending` and `active`" and
+/// lasted only as long as one blocking call. Making it explicit is what lets a
+/// prompt be advanced a chunk at a time, and what gives cancellation something
+/// to find when a client leaves mid-prefill.
+struct Prefilling {
+    id: u64,
+    seq: SequencePages,
+    prompt: Vec<usize>,
+    /// Prompt tokens already written to this request's pages. The next chunk
+    /// starts here, and this is the `pos_offset` the model is given.
+    done: usize,
+    config: GenerationConfig,
+}
+
 /// One resident request.
 struct Active {
     id: u64,
@@ -126,16 +200,41 @@ pub struct StepInfo {
     /// of selecting tokens on the device, so a benchmark should not be
     /// reporting a formula that could drift from what the code does.
     pub d2h_bytes: usize,
+    /// Prompt tokens this step consumed, and how many chunks that took.
+    pub prefill_tokens: usize,
+    pub prefill_chunks: usize,
+    /// Requests still working through their prompt when the step ended.
+    pub prefilling_after: usize,
 }
 
 pub struct Runtime {
     model: GpuModel,
     active: Vec<Active>,
+    /// Requests that hold pages and are partway through their prompt.
+    prefilling: Vec<Prefilling>,
     pending: VecDeque<Request>,
     done: Vec<Completion>,
     step_no: u64,
     max_batch: usize,
+    /// Prompt tokens consumed per scheduling step.
+    ///
+    /// The whole tradeoff lives in this number: smaller chunks interleave more
+    /// finely and disturb running streams less, larger ones keep the
+    /// tensor-core prefill GEMM efficient. Chosen by measurement, overridable
+    /// per server.
+    prefill_chunk: usize,
+    /// When false -- the default -- a prompt is prefilled whole and before any
+    /// decoding, which is what the runtime has always done. Chunking is the
+    /// opt-in path; see the module docs for the measurement behind that choice.
+    chunked_prefill: bool,
 }
+
+/// Prompt tokens per prefill chunk when chunking is enabled.
+///
+/// 128 is the least-bad of the measured sizes: it halves the worst-case gap
+/// where 256 does not, without the throughput collapse of 32 and 64. It is not
+/// a good default, which is why chunking is off unless asked for.
+pub const DEFAULT_PREFILL_CHUNK: usize = 128;
 
 impl Runtime {
     /// `model` must already have paging enabled; the pool it allocated is the
@@ -148,11 +247,43 @@ impl Runtime {
         Ok(Self {
             model,
             active: Vec::new(),
+            prefilling: Vec::new(),
             pending: VecDeque::new(),
             done: Vec::new(),
             step_no: 0,
             max_batch,
+            prefill_chunk: std::env::var("CRUCIBLE_PREFILL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &usize| *v > 0)
+                .unwrap_or(DEFAULT_PREFILL_CHUNK),
+            // Off unless asked for: measured slower on every metric but the
+            // worst-case gap, and that one improves by only 1.7x.
+            chunked_prefill: std::env::var("CRUCIBLE_CHUNKED_PREFILL").as_deref() == Ok("1"),
         })
+    }
+
+    /// Prompt tokens consumed per step.
+    pub fn set_prefill_chunk(&mut self, tokens: usize) {
+        self.prefill_chunk = tokens.max(1);
+    }
+
+    pub fn prefill_chunk(&self) -> usize {
+        self.prefill_chunk
+    }
+
+    /// Turn chunking off, restoring prefill-at-admission. The A/B control.
+    pub fn set_chunked_prefill(&mut self, on: bool) {
+        self.chunked_prefill = on;
+    }
+
+    pub fn chunked_prefill(&self) -> bool {
+        self.chunked_prefill
+    }
+
+    /// Requests holding pages but not yet decoding.
+    pub fn prefilling_len(&self) -> usize {
+        self.prefilling.len()
     }
 
     pub fn submit(&mut self, req: Request) {
@@ -168,7 +299,7 @@ impl Runtime {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.active.is_empty() && self.pending.is_empty()
+        self.active.is_empty() && self.pending.is_empty() && self.prefilling.is_empty()
     }
 
     /// Drain everything that has finished since the last call.
@@ -189,9 +320,15 @@ impl Runtime {
     }
 
     /// Pages currently held by resident requests, and slots wasted inside them.
+    ///
+    /// Counts prefilling requests too: they hold their prompt's pages from
+    /// admission, so leaving them out would under-report occupancy exactly
+    /// when a long prompt is being consumed.
     pub fn residency(&self) -> (usize, usize) {
-        let pages = self.active.iter().map(|a| a.seq.n_pages()).sum();
-        let wasted = self.active.iter().map(|a| a.seq.wasted_slots()).sum();
+        let pages: usize = self.active.iter().map(|a| a.seq.n_pages()).sum::<usize>()
+            + self.prefilling.iter().map(|p| p.seq.n_pages()).sum::<usize>();
+        let wasted: usize = self.active.iter().map(|a| a.seq.wasted_slots()).sum::<usize>()
+            + self.prefilling.iter().map(|p| p.seq.wasted_slots()).sum::<usize>();
         (pages, wasted)
     }
 
@@ -203,15 +340,37 @@ impl Runtime {
             ..Default::default()
         };
 
-        info.admitted = self.admit(&mut info.tokens)?;
+        // Admission is now cheap: it takes pages and nothing else, so a step
+        // that accepts a long prompt costs the same as one that accepts a short
+        // one. The prompt itself is consumed below, in bounded pieces.
+        info.admitted = self.admit()?;
+
+        // Monolithic control path: prompts are consumed whole, before any
+        // decoding, which is what the runtime did before chunking.
+        if !self.chunked_prefill {
+            let (t, c) = self.advance_prefill(&mut info.tokens, usize::MAX)?;
+            info.prefill_tokens += t;
+            info.prefill_chunks += c;
+        }
 
         if !self.active.is_empty() {
             let (decoded, d2h) = self.decode_active(&mut info.tokens)?;
             info.decoded = decoded;
             info.d2h_bytes = d2h;
         }
+
+        // Decode first, then exactly one bounded chunk. A decode step is
+        // guaranteed before every chunk and a chunk after every decode step, so
+        // neither class can starve the other and there is no ratio to tune.
+        if self.chunked_prefill {
+            let (t, c) = self.advance_prefill(&mut info.tokens, self.prefill_chunk)?;
+            info.prefill_tokens += t;
+            info.prefill_chunks += c;
+        }
+
         info.finished = self.retire()?;
 
+        info.prefilling_after = self.prefilling.len();
         info.active_after = self.active.len();
         info.pending_after = self.pending.len();
         info.free_pages = self.model.page_pool().free_pages();
@@ -219,15 +378,25 @@ impl Runtime {
         Ok(info)
     }
 
-    /// Move pending requests into the active set while slots and pages allow.
+    /// Move pending requests into the prefilling set while slots and pages allow.
     ///
-    /// Admission prefills the prompt, which is where a new request's pages are
-    /// taken. A prompt that does not fit leaves the request pending and stops
-    /// admission for this step -- FCFS, so a large request is not starved by
-    /// smaller ones queued behind it.
-    fn admit(&mut self, first_tokens: &mut Vec<(u64, usize)>) -> Result<Vec<u64>> {
+    /// This is where a request's prompt pages are taken, and it is all this
+    /// does: no GPU work, so the cost of admitting a request no longer depends
+    /// on how long its prompt is. A prompt that cannot get pages stays queued
+    /// and stops admission for this step -- FCFS, so a large request is not
+    /// starved by smaller ones queued behind it.
+    ///
+    /// Prompt pages are still reserved in full rather than progressively. The
+    /// request either fits now or waits, which keeps allocator exhaustion a
+    /// decision made once, at a point where nothing has been written and
+    /// nothing has to be unwound. Generation pages continue to grow one step at
+    /// a time, as before.
+    fn admit(&mut self) -> Result<Vec<u64>> {
         let mut admitted = Vec::new();
-        while self.active.len() < self.max_batch {
+        // Prefilling requests hold a slot: they own pages and are on their way
+        // into the batch, so counting only `active` would let the scheduler
+        // over-admit and then find no room.
+        while self.active.len() + self.prefilling.len() < self.max_batch {
             let Some(req) = self.pending.front() else { break };
             if req.prompt.is_empty() {
                 bail!("request {} has an empty prompt", req.id);
@@ -241,27 +410,93 @@ impl Runtime {
             }
 
             let req = self.pending.pop_front().expect("front checked above");
-            let table = seq.table_padded(self.model.table_stride());
-            let logits = self.model.prefill_request(&req.prompt, &table, 0)?;
-            // Prefill's final logits are this request's first token, so its RNG
-            // is created here and used immediately -- the first sampled token
-            // draws the first random number, exactly as running alone would.
-            let mut rng = Rng::new(req.config.seed);
-            let first = sampling::sample(&logits, &req.config, &mut rng);
-
             admitted.push(req.id);
-            first_tokens.push((req.id, first));
-            self.active.push(Active {
+            self.prefilling.push(Prefilling {
                 id: req.id,
                 seq,
-                prompt_len: req.prompt.len(),
-                next_token: first,
-                generated: vec![first],
+                prompt: req.prompt,
+                done: 0,
                 config: req.config,
-                rng,
             });
         }
         Ok(admitted)
+    }
+
+    /// Consume up to `budget` prompt tokens for the oldest prefilling request.
+    ///
+    /// Returns the tokens consumed and the chunks it took. A chunk is written
+    /// straight into the request's own pages at `pos_offset = done`, so there
+    /// is no staging buffer and no copy: prefill and decode share one page
+    /// mapping for the whole life of the request.
+    ///
+    /// Attention for a chunk row `r` covers `0 ..= done + r`, which is the
+    /// entire prefix already cached plus the causally earlier part of this
+    /// chunk. Nothing is recomputed and nothing is missed, and because the
+    /// kernel walks that range in the same order regardless of where the chunk
+    /// boundaries fall, the cache it produces does not depend on them.
+    fn advance_prefill(
+        &mut self,
+        produced: &mut Vec<(u64, usize)>,
+        budget: usize,
+    ) -> Result<(usize, usize)> {
+        let mut tokens = 0usize;
+        let mut chunks = 0usize;
+        let stride = self.model.table_stride();
+
+        // One chunk per call in the chunked policy; the control path passes an
+        // unbounded budget and loops until the prompt is gone.
+        loop {
+            let Some(p) = self.prefilling.first() else { break };
+            let remaining = p.prompt.len() - p.done;
+            let take = remaining.min(budget.max(1));
+            let last = take == remaining;
+
+            let (id, done, table) = {
+                let p = &self.prefilling[0];
+                (p.id, p.done, p.seq.table_padded(stride))
+            };
+            let chunk: Vec<usize> = {
+                let p = &self.prefilling[0];
+                p.prompt[p.done..p.done + take].to_vec()
+            };
+            // Only the last chunk's logits become a token; earlier ones skip
+            // the lm_head projection and its device-to-host copy entirely.
+            let logits = self.model.prefill_chunk(&chunk, &table, done, last)?;
+
+            tokens += take;
+            chunks += 1;
+            self.prefilling[0].done += take;
+
+            if !last {
+                if budget == usize::MAX {
+                    continue;
+                }
+                break;
+            }
+
+            // Prompt consumed. The final position's logits are this request's
+            // first token, and its RNG is created here and used immediately --
+            // the first sampled token draws the first random number, exactly as
+            // running alone would.
+            let p = self.prefilling.remove(0);
+            let mut rng = Rng::new(p.config.seed);
+            let first = sampling::sample(&logits, &p.config, &mut rng);
+            produced.push((id, first));
+            self.active.push(Active {
+                id: p.id,
+                seq: p.seq,
+                prompt_len: p.prompt.len(),
+                next_token: first,
+                generated: vec![first],
+                config: p.config,
+                rng,
+            });
+            if budget == usize::MAX {
+                continue;
+            }
+            break;
+        }
+        Ok((tokens, chunks))
     }
 
     /// One batched decode step across every active request.
@@ -413,6 +648,23 @@ impl Runtime {
     pub fn cancel(&mut self, id: u64) -> Result<bool> {
         if let Some(pos) = self.pending.iter().position(|r| r.id == id) {
             self.pending.remove(pos);
+            return Ok(true);
+        }
+        // Partway through its prompt: it holds pages and has written some of
+        // them, but has never produced a token. Removing it here is what stops
+        // any further chunk being scheduled for it, and the pages go back in
+        // the same call, so a client that leaves mid-prefill costs exactly the
+        // work already done and nothing more.
+        if let Some(pos) = self.prefilling.iter().position(|p| p.id == id) {
+            let mut p = self.prefilling.remove(pos);
+            p.seq.release(self.model.page_pool_mut())?;
+            self.done.push(Completion {
+                id: p.id,
+                prompt_len: p.prompt.len(),
+                tokens: Vec::new(),
+                finished_at: self.step_no,
+                reason: FinishReason::Cancelled,
+            });
             return Ok(true);
         }
         if let Some(pos) = self.active.iter().position(|a| a.id == id) {

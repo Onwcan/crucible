@@ -92,6 +92,9 @@ pub struct ServeOptions {
     /// Public identifier for the served checkpoint, used by the
     /// OpenAI-compatible endpoints.
     pub model_id: String,
+    /// Prompt tokens consumed per scheduler step. `None` keeps the measured
+    /// default.
+    pub prefill_chunk: Option<usize>,
 }
 
 // --- wire types -------------------------------------------------------------
@@ -130,6 +133,10 @@ struct Stats {
     batch_sum: u64,
     greedy_requests: u64,
     sampled_requests: u64,
+    prefilling: usize,
+    prefill_chunks: u64,
+    prefill_tokens: u64,
+    last_prefill_chunk: usize,
 }
 
 #[derive(Clone)]
@@ -269,6 +276,10 @@ async fn metrics(State(st): State<AppState>) -> Json<MetricsBody> {
         aggregate_tokens_generated: s.tokens,
         greedy_requests: s.greedy_requests,
         sampled_requests: s.sampled_requests,
+        prefilling_requests: s.prefilling,
+        prefill_chunks: s.prefill_chunks,
+        prefill_tokens: s.prefill_tokens,
+        last_prefill_chunk_tokens: s.last_prefill_chunk,
         average_batch_size: if s.steps > 0 {
             s.batch_sum as f64 / s.steps as f64
         } else {
@@ -777,6 +788,12 @@ fn inference_thread(
             s.tokens += info.tokens.len() as u64;
             s.pages_free = info.free_pages;
             s.pages_used = rt.model().page_pool().n_pages() - info.free_pages;
+            s.prefilling = info.prefilling_after;
+            s.prefill_chunks += info.prefill_chunks as u64;
+            s.prefill_tokens += info.prefill_tokens as u64;
+            if info.prefill_chunks > 0 {
+                s.last_prefill_chunk = info.prefill_tokens;
+            }
         }
     }
 }
@@ -801,7 +818,14 @@ fn build_runtime(opts: &ServeOptions) -> Result<(Runtime, InitInfo)> {
         weight_bytes: model.weight_bytes(),
         vocab: cfg.vocab_size,
     };
-    Ok((Runtime::new(model)?, info))
+        let mut rt = Runtime::new(model)?;
+    // Asking for a chunk size is asking for chunking; the flag would otherwise
+    // set a size on a policy that is off.
+    if let Some(n) = opts.prefill_chunk {
+        rt.set_prefill_chunk(n);
+        rt.set_chunked_prefill(true);
+    }
+    Ok((rt, info))
 }
 
 pub fn serve(opts: ServeOptions) -> Result<()> {
