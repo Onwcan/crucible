@@ -2528,13 +2528,15 @@ TTFT on an idle server, which is prefill plus one decode step (171.76 W,
 ```
 
 **Flat at ~7.3 ms from 1 token to 134**, then linear at about 28.5 us per token.
-That plateau is the fixed cost of issuing a prefill at all — roughly 170 eager
-kernel launches through twelve layers, with no captured CUDA graph, the same
-launch overhead the decode path once had and solved there with graphs. Net of
-the one decode step TTFT also contains, the prefill itself costs about 6.6 ms
-before it looks at a token, so the break-even chunk is around **230 tokens**:
-below that, a chunk's fixed cost exceeds the marginal cost of the tokens it
-carries.
+That plateau is a fixed cost paid before a prefill looks at a token — about
+6.6 ms of it, net of the one decode step TTFT also contains — so the break-even
+chunk is around **230 tokens**: below that, a chunk's fixed cost exceeds the
+marginal cost of the tokens it carries.
+
+At this point I attributed that plateau to launch overhead: 208 eager kernel
+launches through twelve layers, with no captured CUDA graph, the same problem
+the decode path once had. [The next section](#prefill-cuda-graphs-a-rejected-hypothesis)
+tested that and it was wrong.
 
 That is enough to explain the whole table. A 941-token prompt at chunk 128 is
 eight chunks: 8 x 6.6 ms of overhead added to ~27 ms of real work predicts 84 ms,
@@ -2547,13 +2549,8 @@ and a 256-token chunk already costs 13.9 ms, half of the 29.1 ms monolithic
 prefill it was meant to break up. The window where chunking both shrinks the
 stall and keeps the throughput is empty.
 
-**What would make it pay is removing that fixed cost, not working around it** —
-capturing a CUDA graph for the prefill path as the decode path already does.
-The target is specific: collapse the ~6.6 ms, after which a 128-token chunk
-would cost about 3.6 ms instead of 10.2 ms, the break-even chunk would fall from
-~230 tokens to a few dozen, and the arithmetic above flips. That is kernel-path
-work, it is not attempted here, and this measurement is the evidence that would
-justify it.
+**What would make it pay is removing that fixed cost, not working around it.**
+The next section does exactly that experiment.
 
 One methodological note, since it nearly produced a wrong number. An earlier
 version of this curve was taken with the laptop in a power-saving profile and
@@ -2593,6 +2590,135 @@ batching chunks from several requests into one GEMM is a different idea and is
 not justified while the fixed per-call cost dominates. And the head-of-line
 stall this milestone set out to remove is still there when chunking is off,
 which is the honest state of it.
+
+## Prefill CUDA graphs: a rejected hypothesis
+
+The previous section ended with a prediction: prefill's ~6.6 ms fixed cost is
+launch overhead, so capturing a CUDA graph should collapse it, and chunked
+prefill would then pay. Graphs were built, verified, and measured.
+
+**The prediction was wrong.** Submission is 0.5 ms of the 6.6.
+
+### What the graphs are
+
+One graph per `(chunk length, produces logits)`. Length is in the key because it
+sets every grid dimension in the sequence; `want_logits` is in the key because a
+non-final chunk deliberately skips the lm_head projection, and folding both into
+one graph would put back work the previous milestone removed.
+
+Exact lengths, no padding buckets — the same standard the batched-decode graphs
+were held to. Masking rows that must not write KV, must not shift attention and
+must not affect logits is a correctness proof; exact lengths need no proof.
+
+One value blocked capture. `pos_offset`, a chunk's offset into its own prompt,
+was a by-value kernel argument to `rope_batch`, `cache_store_paged` and
+`attention_prefill_paged`, and a captured graph freezes those. It moved into the
+existing per-step parameter buffer — the mechanism the decode path already uses
+for exactly this reason, whose comment already said "anything that changes per
+token must be read from memory rather than passed by value". Three kernels now
+read `params[PARAM_PREFILL_POS]`. Nothing else changed: same GEMM path, same
+paged attention, same page layout, same `pos_offset` semantics.
+
+That is what makes the cache small for the case that matters. Because the offset
+is not in the key, every full chunk of a chunked prefill shares **one** graph
+however deep into the prompt it is — a 700-token prompt at chunk 64 replays two
+graphs eleven times. Monolithic prefill needs one graph per distinct prompt
+length instead, so the cache is capped at 64 and anything past it runs eager.
+
+Capture is lazy, costs **1.3 ms** per graph, and a failure is remembered and
+falls back to eager rather than taking the server down.
+
+### Correctness
+
+`gpu-prefill-graph-check` compares generated token ids, four paths crossed:
+eager/graph against monolithic/chunked.
+
+- 10 prompt lengths x 5 sampling policies (greedy, top-k 5/40/128, and the
+  top-k 500 full-logit fallback) — **identical in all 50**;
+- the full four-way matrix at chunk sizes 32/64/128/256 and the misaligned
+  37/73/131 — identical everywhere;
+- **request isolation**: six requests with different token ids, different pages
+  and different offsets driven through the same two cached graphs, with a
+  cancellation between each — identical to eager, 24 replays, every page
+  returned. That is the test that says nothing request-specific was captured;
+- non-zero offsets: chunk 64 replays one graph at eleven different offsets —
+  identical to eager, which is only possible if the offset was never baked in.
+
+### Where the time actually goes
+
+`gpu-prefill-bench` replays the captured graph in a loop with one sync at the
+end, which is the kernel sequence executing with no submission cost at all
+(163.00 W, 3090 MHz, median of 30):
+
+| tokens | eager | graph | pure GPU replay | submission | GPU share |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 6.74 ms | 6.23 ms | **5.76 ms** | 0.51 ms | 92% |
+| 33 | 6.37 ms | 5.88 ms | **5.74 ms** | 0.49 ms | 97% |
+| 134 | 6.95 ms | 6.45 ms | 6.29 ms | 0.50 ms | 97% |
+| 535 | 14.50 ms | 14.12 ms | 13.74 ms | 0.38 ms | 97% |
+| 941 | 30.02 ms | 29.62 ms | 29.34 ms | 0.40 ms | 99% |
+
+**Submission is ~0.5 ms, flat, and does not scale with anything.** Prefilling a
+*single token* costs 5.76 ms of pure GPU execution. The plateau was never the
+host talking to the driver; it is the device running ~208 kernels whose grids
+are far too small to fill it.
+
+Which is a problem this repository has already solved once, elsewhere. The
+[batched GEMV](#batched-gemv-the-projections-were-the-whole-problem) section
+records the same discovery for decode: "at M=1 it launches 12 blocks on a 60-SM
+GPU, and profiling showed its cost is flat from batch 1 to batch 16". Prefill
+runs six of those GEMMs per layer, seventy-two per call, and at small T they are
+occupancy-starved in exactly the same way. Graphs remove the cost of *asking*
+for that work. They cannot make it smaller.
+
+### What graphs are still worth
+
+0.4–0.5 ms per prefill, always, for a verified-identical result. That is 7% of a
+short prefill and 1.3% of a long one, and it shows up where prefills are
+frequent (161–167 W, 3090 MHz):
+
+| | eager | graph |
+|---|---:|---:|
+| 33-token arrival, worst gap | 8.18 ms | **7.00 ms** |
+| 941-token arrival, worst gap | 29.03 ms | 28.62 ms |
+| burst of 16, median TTFT | 139.7 ms | **131.9 ms** |
+| burst of 16, aggregate | 3,799 tok/s | **3,931 tok/s** |
+
+Small, free and never wrong, so **graph prefill ships on**.
+`CRUCIBLE_PREFILL_GRAPH=0` is the control every number above was paired against.
+
+### Chunking, re-decided on the new numbers
+
+Repeating the sweep with graphs on (157–167 W, 3090 MHz, 941-token arrival):
+
+| policy | worst gap | its TTFT | burst-16 TTFT | burst-16 p95 | burst-16 agg |
+|---|---:|---:|---:|---:|---:|
+| **monolithic** | 28.4 ms | **30.6 ms** | 131.7 ms | **132.7 ms** | **3,905 t/s** |
+| chunk 256 | 27.4 ms | 51.4 ms | 129.1 ms | 213.2 ms | 3,069 t/s |
+| chunk 128 | 20.8 ms | 79.8 ms | **82.6 ms** | 307.0 ms | 2,431 t/s |
+| chunk 64 | 19.0 ms | 132.7 ms | 154.3 ms | 465.7 ms | 1,790 t/s |
+| chunk 32 | **17.1 ms** | 246.1 ms | 144.8 ms | 813.0 ms | 1,138 t/s |
+
+Recomputed break-even: fixed cost ~6.3 ms with graphs against ~6.6 ms without,
+marginal 25.5 us per token, so **~247 tokens** against ~230. The model still
+predicts the table — 941 tokens at chunk 128 is 8 x 6.3 + 24 ms + a decode step
+= 80 ms, and 79.8 ms was measured — because the term graphs removed was never
+the one that mattered.
+
+Chunk 128 does now win the burst *median* time-to-first-token, 82.6 ms against
+131.7. It also triples the burst tail and costs 38% of aggregate throughput. So
+**chunking stays off**, for the same reason and by nearly the same margin as
+before.
+
+### What this makes the next candidate
+
+Not graphs, and not chunking. The residual is measured GPU compute inefficiency
+inside small prefills — 5.76 ms to prefill one token, on kernels that launch
+twelve blocks onto sixty SMs. That is the precondition the previous milestone
+set for considering **cross-request batched prefill**: prefill chunks from
+several waiting requests concatenated into one tensor-core GEMM, so the grids
+are full. It is the same fix batched GEMV was for decode, and this measurement
+is what justifies attempting it. It is not attempted here.
 
 ## Against llama.cpp and vLLM
 
@@ -2846,8 +2972,10 @@ share decode steps in one scheduler.
       count_tokens, over the same scheduler; 0.96x to 0.98x of native
 - [x] Prefill as scheduled work — explicit prefilling state, non-blocking
       admission, cancellation mid-prompt, prefill metrics
-- [ ] Prefill CUDA graphs — measured at 6.8 ms of fixed launch cost per call,
-      which is what makes chunked prefill unprofitable today
+- [x] Prefill CUDA graphs — shipped, and the hypothesis behind them rejected:
+      submission was 0.5 ms of the 6.6 ms fixed cost, not the whole of it
+- [ ] Cross-request batched prefill — now the measured candidate: 5.76 ms of
+      pure GPU time to prefill one token, on occupancy-starved grids
 - [~] Chunked prefill — implemented and verified identical to monolithic, but
       measured slower on every metric but worst-case gap, so it ships off
 - [ ] Batched fused SwiGLU (gate/up are still two launches)

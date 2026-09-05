@@ -39,6 +39,10 @@
 #define WARP_SIZE 32
 #define NEG_INF __int_as_float(0xff800000)
 
+// Parameter-buffer slot holding a prefill chunk's offset into its prompt.
+// Must match PARAM_PREFILL_POS in gpu.rs.
+#define PARAM_PREFILL_POS 5
+
 // Sum a value across the warp. __shfl_down_sync is register-to-register, with
 // no shared memory or barrier cost.
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -1003,8 +1007,13 @@ extern "C" __global__ void rope_batch_f32(
     const int n_heads,
     const int head_dim,
     const int row_stride,
-    const int pos_offset)
+    // Read from the parameter buffer rather than taken by value: a captured
+    // CUDA graph freezes kernel arguments, and a chunk's offset into its own
+    // prompt changes on every replay. Same reason the decode path reads its
+    // positions from device memory.
+    const int* __restrict__ params)
 {
+    const int pos_offset = params[PARAM_PREFILL_POS];
     const int half = head_dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int per_row = n_heads * half;
@@ -1642,8 +1651,13 @@ extern "C" __global__ void cache_store_paged_f32(
     const int kv_dim,
     const int n_layer,
     const int layer,
-    const int pos_offset)
+    // Read from the parameter buffer rather than taken by value: a captured
+    // CUDA graph freezes kernel arguments, and a chunk's offset into its own
+    // prompt changes on every replay. Same reason the decode path reads its
+    // positions from device memory.
+    const int* __restrict__ params)
 {
+    const int pos_offset = params[PARAM_PREFILL_POS];
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * kv_dim) return;
     const int row = i / kv_dim;
@@ -1837,8 +1851,13 @@ extern "C" __global__ void attention_prefill_paged_f32(
     const int n_layer,
     const int layer,
     const int kv_dim,
-    const int pos_offset)
+    // Read from the parameter buffer rather than taken by value: a captured
+    // CUDA graph freezes kernel arguments, and a chunk's offset into its own
+    // prompt changes on every replay. Same reason the decode path reads its
+    // positions from device memory.
+    const int* __restrict__ params)
 {
+    const int pos_offset = params[PARAM_PREFILL_POS];
     extern __shared__ float scores[];
 
     const int h = blockIdx.x;

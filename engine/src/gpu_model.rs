@@ -10,11 +10,13 @@
 //! `crate::gpu::validate` checks the kernels; `gpu-logits` checks the whole
 //! model against PyTorch.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{bail, Result};
 use cudarc::driver::{CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{attn_chunks, Gpu, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{attn_chunks, Gpu, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::paged::{PagePool, SequencePages, PAGE_TOKENS};
 use crate::quant::QuantTensor;
@@ -138,6 +140,14 @@ struct PrefillScratch {
     up: CudaSlice<f32>,
     last: CudaSlice<f32>,
 }
+
+/// Prefill graphs kept at once.
+///
+/// Chunked prefill needs a handful: every full chunk shares one key and only
+/// each prompt's tail differs. Monolithic prefill needs one per distinct prompt
+/// length, which is unbounded in principle, so the cache stops growing here and
+/// anything past it runs eager -- correct, just without the saving.
+const MAX_PREFILL_GRAPHS: usize = 64;
 
 /// Buffers for one decode step across several requests.
 ///
@@ -268,6 +278,33 @@ pub struct GpuModel {
     /// exactly the sequence it executed before sampling existed.
     batch_graphs: Vec<Option<CudaGraph>>,
     use_batch_graph: bool,
+
+    /// Captured prefill graphs, keyed by chunk length and whether the chunk
+    /// produces logits.
+    ///
+    /// Length is in the key because it sets every grid dimension in the
+    /// sequence -- there is no padding scheme here, for the same reason the
+    /// decode graphs are per exact batch size: masking rows that must not write
+    /// KV, must not shift attention and must not affect logits is a correctness
+    /// proof, and exact lengths need no proof at all.
+    ///
+    /// `want_logits` is in the key because a non-final chunk deliberately skips
+    /// the lm_head projection. Folding both into one graph would put that work
+    /// back, which the previous milestone removed on purpose.
+    ///
+    /// A chunk's offset into its prompt is *not* in the key: it lives in the
+    /// parameter buffer, so full chunks of the same size share one graph
+    /// however far into a prompt they are. That is what makes chunked prefill
+    /// cheap to cache -- every full chunk is one key -- while monolithic
+    /// prefill needs a key per distinct prompt length.
+    prefill_graphs: HashMap<(usize, bool), CudaGraph>,
+    /// Keys whose capture failed. Retrying every call would pay the failure
+    /// cost forever; eager execution is correct, so it is the fallback.
+    prefill_graph_failed: HashSet<(usize, bool)>,
+    use_prefill_graph: bool,
+    prefill_graphs_captured: usize,
+    prefill_graph_capture_secs: f64,
+    prefill_graph_replays: usize,
     /// Wall time spent capturing, and how many shapes were captured.
     graph_capture_secs: f64,
     graphs_captured: usize,
@@ -438,6 +475,15 @@ impl GpuModel {
             // On by default; CRUCIBLE_BATCH_GRAPH=0 keeps the eager path for
             // A/B measurement and debugging.
             use_batch_graph: std::env::var("CRUCIBLE_BATCH_GRAPH").as_deref() != Ok("0"),
+            prefill_graphs: HashMap::new(),
+            prefill_graph_failed: HashSet::new(),
+            // On by default; CRUCIBLE_PREFILL_GRAPH=0 keeps the eager path,
+            // which is the A/B control every prefill comparison is paired
+            // against.
+            use_prefill_graph: std::env::var("CRUCIBLE_PREFILL_GRAPH").as_deref() != Ok("0"),
+            prefill_graphs_captured: 0,
+            prefill_graph_capture_secs: 0.0,
+            prefill_graph_replays: 0,
             graph_capture_secs: 0.0,
             graphs_captured: 0,
             use_device_argmax: std::env::var("CRUCIBLE_DEVICE_ARGMAX").as_deref() != Ok("0"),
@@ -621,6 +667,73 @@ impl GpuModel {
     /// Candidates the device path can return for one row.
     pub fn topk_capacity(&self) -> usize {
         TOPK_MAX
+    }
+
+    /// Replay prefill from captured graphs instead of issuing every launch.
+    pub fn set_prefill_graph(&mut self, on: bool) {
+        self.use_prefill_graph = on;
+        if !on {
+            self.prefill_graphs.clear();
+            self.prefill_graph_failed.clear();
+        }
+    }
+
+    pub fn prefill_graph(&self) -> bool {
+        self.use_prefill_graph
+    }
+
+    /// Graphs captured, replays served, and the wall time capture cost.
+    pub fn prefill_graph_stats(&self) -> (usize, usize, f64) {
+        (
+            self.prefill_graphs_captured,
+            self.prefill_graph_replays,
+            self.prefill_graph_capture_secs,
+        )
+    }
+
+    /// Device execution time of one prefill, with no submission cost at all.
+    ///
+    /// Replays the captured graph `iters` times back to back and synchronises
+    /// once, so what comes back is what the GPU spends on the kernel sequence:
+    /// no per-launch driver work, no metadata upload, no logits copy. Against
+    /// the eager wall time it says how much of a prefill is submission and how
+    /// much is execution -- which is the difference between a launch-overhead
+    /// problem and a kernel problem.
+    pub fn time_prefill_replay(
+        &mut self,
+        len: usize,
+        want_logits: bool,
+        iters: usize,
+    ) -> Result<f64> {
+        let key = (len, want_logits);
+        if !self.prefill_graphs.contains_key(&key) {
+            bail!("no captured prefill graph for {len} tokens; run one first");
+        }
+        let g = self.prefill_graphs.get(&key).expect("checked above");
+        for _ in 0..3 {
+            self.gpu.graph_launch(g)?;
+        }
+        self.gpu.sync()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            self.gpu.graph_launch(g)?;
+        }
+        self.gpu.sync()?;
+        Ok(t0.elapsed().as_secs_f64() / iters as f64)
+    }
+
+    /// Drop every captured prefill graph.
+    ///
+    /// A graph holds the device addresses it was captured with, so anything
+    /// that can move a buffer has to come through here. Nothing in a prefill
+    /// graph is request-specific: token ids, page tables, sequence lengths and
+    /// the chunk offset are all contents of buffers whose addresses outlive any
+    /// one request, which is why one graph serves every request of that shape.
+    pub fn invalidate_prefill_graphs(&mut self) {
+        self.prefill_graphs.clear();
+        self.prefill_graph_failed.clear();
+        self.prefill_graphs_captured = 0;
+        self.prefill_graph_capture_secs = 0.0;
     }
 
     /// Drop every captured decode graph.
@@ -1874,6 +1987,80 @@ impl GpuModel {
 
         let ids: Vec<i32> = tokens.iter().map(|v| *v as i32).collect();
         self.gpu.write_i32(&mut self.prefill_scratch.tokens, &ids)?;
+        // Where this chunk starts in its own prompt. A kernel argument would be
+        // frozen by graph capture; the parameter buffer is read at replay.
+        // Both writes are host-to-device copies from temporaries, so they stay
+        // outside anything captured -- a captured memcpy would hold a host
+        // pointer that is gone by the next replay.
+        self.host_params[PARAM_PREFILL_POS] = pos_offset as i32;
+        let hp = self.host_params.clone();
+        self.gpu.write_i32(&mut self.params, &hp)?;
+
+        // Capture-or-replay, on exactly the sequence eager execution issues.
+        // Only the paged path is eligible: the contiguous fallback still takes
+        // its offset by value, and it is the legacy single-sequence path.
+        let key = (t, want_logits);
+        if self.use_prefill_graph && self.use_paged {
+            if !self.prefill_graphs.contains_key(&key)
+                && !self.prefill_graph_failed.contains(&key)
+                && self.prefill_graphs.len() < MAX_PREFILL_GRAPHS
+            {
+                let t0 = std::time::Instant::now();
+                let began = self.gpu.begin_capture();
+                if began.is_ok() {
+                    let queued = self.queue_prefill(t, want_logits);
+                    // End capture unconditionally: leaving the stream in
+                    // capture mode would break every later launch.
+                    let graph = self.gpu.end_capture();
+                    match (queued, graph) {
+                        (Ok(()), Ok(g)) => {
+                            self.prefill_graphs.insert(key, g);
+                            self.prefill_graphs_captured += 1;
+                            self.prefill_graph_capture_secs += t0.elapsed().as_secs_f64();
+                        }
+                        _ => {
+                            // Eager execution is correct, so a capture failure
+                            // costs speed and nothing else. Remembered so the
+                            // cost is paid once rather than every call.
+                            self.prefill_graph_failed.insert(key);
+                        }
+                    }
+                } else {
+                    self.prefill_graph_failed.insert(key);
+                }
+            }
+            if let Some(g) = self.prefill_graphs.get(&key) {
+                self.gpu.graph_launch(g)?;
+                self.prefill_graph_replays += 1;
+                return self.prefill_result(t, want_logits);
+            }
+        }
+        self.queue_prefill(t, want_logits)?;
+        self.prefill_result(t, want_logits)
+    }
+
+    /// Copy back the final position's logits, if this chunk produced any.
+    ///
+    /// The only synchronisation in a prefill, and the only thing that cannot be
+    /// captured: the graph writes the logits, the host reads them afterwards.
+    fn prefill_result(&mut self, _t: usize, want_logits: bool) -> Result<Vec<f32>> {
+        if !want_logits {
+            return Ok(Vec::new());
+        }
+        self.gpu.to_host(&self.scratch.logits)
+    }
+
+    /// Queue every kernel of one prefill chunk.
+    ///
+    /// Shared by eager execution and by graph capture, so a replay executes
+    /// exactly what eager execution would. Everything that varies between calls
+    /// -- token ids, page table, sequence length, chunk offset -- is read from
+    /// device buffers whose addresses never change, which is what makes a
+    /// captured graph valid for a different request of the same shape.
+    fn queue_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
+        let kv_dim = n_kv * hd;
 
         {
             let p = &mut self.prefill_scratch;
@@ -1882,6 +2069,9 @@ impl GpuModel {
 
         for (l, layer) in self.layers.iter().enumerate() {
             let layer_base = l * self.capacity * kv_dim;
+            // The contiguous fallback still takes the offset by value; it is
+            // never captured, so reading it from the host copy is safe.
+            let pos_offset = self.host_params[PARAM_PREFILL_POS] as usize;
             let p = &mut self.prefill_scratch;
 
             self.gpu.rmsnorm_batch(&p.x, &layer.attn_norm, &mut p.normed, t, d, NORM_EPS)?;
@@ -1890,10 +2080,10 @@ impl GpuModel {
             // into the cache, so prefill and decode share one cache layout.
             self.gpu.gemm(&layer.k_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
             self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
-                                t, n_kv, hd, kv_dim, pos_offset)?;
+                                t, n_kv, hd, kv_dim, &self.params)?;
             if self.use_paged {
                 self.gpu.cache_store_paged(&p.kv, &mut self.k_pool, &self.page_tables,
-                                           t, kv_dim, cfg.n_layer, l, pos_offset)?;
+                                           t, kv_dim, cfg.n_layer, l, &self.params)?;
             } else {
                 self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
             }
@@ -1901,21 +2091,21 @@ impl GpuModel {
             self.gpu.gemm(&layer.v_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
             if self.use_paged {
                 self.gpu.cache_store_paged(&p.kv, &mut self.v_pool, &self.page_tables,
-                                           t, kv_dim, cfg.n_layer, l, pos_offset)?;
+                                           t, kv_dim, cfg.n_layer, l, &self.params)?;
             } else {
                 self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
             }
 
             self.gpu.gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
             self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
-                                t, n_head, hd, d, pos_offset)?;
+                                t, n_head, hd, d, &self.params)?;
 
             if self.use_paged {
                 self.gpu.attention_prefill_paged(&p.q, &self.k_pool, &self.v_pool,
                                                  &mut p.attn, &self.page_tables,
                                                  t, n_head, n_kv, hd,
                                                  cfg.n_layer, l, kv_dim,
-                                                 self.capacity, pos_offset)?;
+                                                 self.capacity, &self.params)?;
             } else {
                 self.gpu.attention_prefill(&p.q, &self.k_cache, &self.v_cache, &mut p.attn,
                                            t, n_head, n_kv, hd, self.capacity,
@@ -1943,7 +2133,7 @@ impl GpuModel {
         // Only the last position's logits are needed, so this stays a GEMV over
         // one row rather than a [T, vocab] matrix.
         if !want_logits {
-            return Ok(Vec::new());
+            return Ok(());
         }
         {
             let p = &self.prefill_scratch;
@@ -1955,8 +2145,7 @@ impl GpuModel {
         Self::project_dyn(&self.gpu, &self.tok_emb, &self.scratch.x,
                           &mut self.scratch.logits, cfg.vocab_size, d,
                           &self.params, 0, PARAM_ZERO, false)?;
-
-        self.gpu.to_host(&self.scratch.logits)
+        Ok(())
     }
 
     /// Append tokens to the cache and return logits for the final position.

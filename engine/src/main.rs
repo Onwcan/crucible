@@ -189,6 +189,33 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         trials: usize,
     },
+    /// Where a prefill's time goes: submission, execution, or the logits copy.
+    #[cfg(feature = "cuda")]
+    GpuPrefillBench {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "1,33,67,134,268,535,941")]
+        lengths: String,
+        #[arg(long, default_value_t = 30)]
+        iters: usize,
+    },
+    /// Check graph-replayed prefill against issuing every launch eagerly.
+    ///
+    /// The claim under test is that a captured prefill graph holds nothing
+    /// request-specific, so one graph serves any request of that shape.
+    #[cfg(feature = "cuda")]
+    GpuPrefillGraphCheck {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "1,2,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512,941")]
+        lengths: String,
+        #[arg(long, default_value = "32,64,128,256,37,73,131")]
+        chunks: String,
+        #[arg(long, default_value_t = 24)]
+        steps: usize,
+    },
     /// Check chunked prefill against prefilling each prompt in one piece.
     ///
     /// The claim under test is that where a chunk boundary falls cannot change
@@ -437,6 +464,14 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuTopkBench { rows, top_k, vocab, iters, trials } => {
             gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPrefillBench { model, quant, lengths, iters } => {
+            gpu_prefill_bench(model, &quant, &lengths, iters)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPrefillGraphCheck { model, quant, lengths, chunks, steps } => {
+            gpu_prefill_graph_check(model, &quant, &lengths, &chunks, steps)
         }
         #[cfg(feature = "cuda")]
         Command::GpuPrefillCheck { model, quant, lengths, chunks, steps } => {
@@ -1363,6 +1398,281 @@ fn gpu_topk_bench(
     Ok(())
 }
 
+
+
+
+/// Split a prefill into submission cost, device execution and the logits copy.
+///
+/// The point is to tell two very different problems apart. If eager and graph
+/// wall times differ a lot, prefill is launch-bound and graphs fix it. If they
+/// agree and both sit well above nothing, the kernels themselves are the cost
+/// and no amount of graph work will help.
+#[cfg(feature = "cuda")]
+fn gpu_prefill_bench(dir: PathBuf, quant: &str, lengths: &str, iters: usize) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::paged::SequencePages;
+    use std::time::Instant;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0 && *v < cfg.block_size)
+        .collect();
+    let max_len = *lens.iter().max().unwrap_or(&1);
+    let pages = max_len.div_ceil(PAGE_TOKENS) + 4;
+
+    let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    model.enable_paging(pages, 4)?;
+
+    println!("gpu       {}", envelope());
+    println!("workload  median of {iters} iterations, final chunks (logits produced)");
+    println!();
+    let header = format!("{:>7} {:>11} {:>11} {:>12} {:>11} {:>9}",
+                         "tokens", "eager ms", "graph ms", "replay ms", "submit ms", "of total");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    for &len in &lens {
+        let tokens = probe_tokens(len, cfg.vocab_size);
+        let mut seq = SequencePages::new();
+        seq.grow(model.page_pool_mut(), len)?;
+        let table = seq.table_padded(model.table_stride());
+
+        let time_it = |model: &mut GpuModel, graph: bool| -> Result<f64> {
+            model.set_prefill_graph(graph);
+            // Warm: first call captures, and a cold clock is not the subject.
+            for _ in 0..3 {
+                model.prefill_chunk(&tokens, &table, 0, true)?;
+            }
+            let mut samples = Vec::new();
+            for _ in 0..iters {
+                let t0 = Instant::now();
+                model.prefill_chunk(&tokens, &table, 0, true)?;
+                samples.push(t0.elapsed().as_secs_f64());
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            Ok(samples[samples.len() / 2])
+        };
+
+        let eager = time_it(&mut model, false)?;
+        let graph = time_it(&mut model, true)?;
+        // Pure device time for the same sequence: no submission, no copy.
+        let replay = model.time_prefill_replay(len, true, iters)?;
+        let submit = eager - graph;
+
+        println!("{len:>7} {:>10.3} {:>10.3} {:>11.3} {:>10.3} {:>8.0}%",
+                 eager * 1000.0, graph * 1000.0, replay * 1000.0, submit * 1000.0,
+                 replay / graph * 100.0);
+        seq.release(model.page_pool_mut())?;
+    }
+
+    println!();
+    println!("replay ms is the GPU executing the same kernels with zero submission");
+    println!("cost. 'of total' is how much of a graph-mode prefill that accounts for:");
+    println!("the closer to 100%, the less there is left for any launch-side fix.");
+    Ok(())
+}
+
+/// Graph-replayed prefill against eager prefill, on generated tokens.
+///
+/// Four independent paths are compared -- eager/graph crossed with
+/// monolithic/chunked -- because a defect in graph capture and a defect in
+/// chunk handling would each show up in only some of them, and comparing two
+/// paths could not tell them apart.
+#[cfg(feature = "cuda")]
+fn gpu_prefill_graph_check(
+    dir: PathBuf,
+    quant: &str,
+    lengths: &str,
+    chunks: &str,
+    steps: usize,
+) -> Result<()> {
+    use llm_engine::gpu_model::{GpuModel, Precision};
+    use llm_engine::paged::PAGE_TOKENS;
+    use llm_engine::runtime::{Request, Runtime};
+    use llm_engine::sampling::GenerationConfig;
+
+    let cfg = Config::from_file(dir.join("config.json"))?;
+    let weights = Weights::open(dir.join("model.safetensors"))?;
+    let precision = Precision::parse(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+
+    let lens: Vec<usize> = lengths
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0 && *v + steps + 2 < cfg.block_size)
+        .collect();
+    let chunk_sizes: Vec<usize> = chunks
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .filter(|v: &usize| *v > 0)
+        .collect();
+    let max_len = *lens.iter().max().unwrap_or(&1);
+    let pages = (max_len + steps + 2).div_ceil(PAGE_TOKENS) * 8 + 8;
+
+    // graph: replay captured prefill. chunked: consume the prompt in pieces.
+    let build = |graph: bool, chunked: bool, chunk: usize| -> Result<Runtime> {
+        let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        m.enable_paging(pages, 8)?;
+        m.set_prefill_graph(graph);
+        let mut rt = Runtime::new(m)?;
+        rt.set_chunked_prefill(chunked);
+        rt.set_prefill_chunk(chunk.max(1));
+        Ok(rt)
+    };
+    let run = |rt: &mut Runtime, id: u64, prompt: &[usize], config: GenerationConfig|
+     -> Result<Vec<usize>> {
+        rt.submit(Request { id, prompt: prompt.to_vec(), config });
+        rt.run_to_completion(steps * 8 + 64)?;
+        Ok(rt.completed().pop().expect("one completion").tokens)
+    };
+
+    let configs: [(&str, GenerationConfig); 5] = [
+        ("greedy", GenerationConfig::greedy(steps)),
+        ("top_k 5", GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 5, seed: 11 }),
+        ("top_k 40", GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 40, seed: 4242 }),
+        ("top_k 128", GenerationConfig { max_tokens: steps, temperature: 0.7, top_k: 128, seed: 7 }),
+        ("top_k 500", GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 500, seed: 99 }),
+    ];
+
+    println!("prompts   {lens:?}");
+    println!("chunks    {chunk_sizes:?}");
+    println!();
+
+    let mut failures = 0usize;
+
+    // --- eager vs graph, monolithic ----------------------------------------
+    println!("monolithic prefill: eager vs graph");
+    let header = format!("{:>7}  {}", "prompt",
+                         configs.iter().map(|(l, _)| format!("{l:>11}"))
+                             .collect::<Vec<_>>().join(""));
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+    let mut eager = build(false, false, 1)?;
+    let mut graph = build(true, false, 1)?;
+    for &len in &lens {
+        let prompt = probe_tokens(len, cfg.vocab_size);
+        print!("{len:>7}  ");
+        for (_, config) in &configs {
+            let want = run(&mut eager, 0, &prompt, config.clone())?;
+            let got = run(&mut graph, 0, &prompt, config.clone())?;
+            let ok = got == want;
+            if !ok {
+                failures += 1;
+            }
+            print!("{:>11}", if ok { "same" } else { "DIFFERS" });
+        }
+        println!();
+    }
+    let (captured, replays, secs) = graph.model().prefill_graph_stats();
+    println!("  {captured} graphs captured in {:.1} ms total, {replays} replays",
+             secs * 1000.0);
+
+    // --- the four-way matrix ------------------------------------------------
+    println!();
+    println!("four paths, greedy and sampled, per chunk size");
+    let header = format!("{:>7} {:>6}  {:>12} {:>12} {:>12}",
+                         "prompt", "chunk", "mono-graph", "chunk-eager", "chunk-graph");
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+    for &len in &lens {
+        if len < 32 {
+            continue;
+        }
+        let prompt = probe_tokens(len, cfg.vocab_size);
+        for &c in &chunk_sizes {
+            let mut row = Vec::new();
+            for (g, ch) in [(true, false), (false, true), (true, true)] {
+                let mut rt = build(g, ch, c)?;
+                let mut ok = true;
+                for (_, config) in &configs {
+                    let want = run(&mut eager, 0, &prompt, config.clone())?;
+                    let got = run(&mut rt, 0, &prompt, config.clone())?;
+                    if got != want {
+                        ok = false;
+                    }
+                }
+                if !ok {
+                    failures += 1;
+                }
+                row.push(if ok { "same" } else { "DIFFERS" });
+            }
+            println!("{len:>7} {c:>6}  {:>12} {:>12} {:>12}", row[0], row[1], row[2]);
+        }
+    }
+
+    // --- a graph captured for one request must serve another ---------------
+    println!();
+    println!("request isolation: one graph, different requests");
+    let mut rt = build(true, true, 128)?;
+    let mut isolation_ok = true;
+    for i in 0..6u64 {
+        // Same shape every time so the same graph key is reused, but different
+        // token ids, different pages and -- through chunking -- different
+        // offsets. Anything request-specific baked into the graph shows here.
+        let prompt = probe_tokens(300, cfg.vocab_size)
+            .iter()
+            .map(|t| (t + i as usize * 977) % cfg.vocab_size)
+            .collect::<Vec<_>>();
+        let config = GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 40,
+                                        seed: 1000 + i };
+        let want = run(&mut eager, i, &prompt, config.clone())?;
+        let got = run(&mut rt, i, &prompt, config)?;
+        if got != want {
+            isolation_ok = false;
+            failures += 1;
+        }
+        // Cancel a request mid-prefill between reuses, so the next one inherits
+        // a pool that has been released and re-taken.
+        rt.submit(Request { id: 500 + i, prompt: prompt.clone(),
+                            config: GenerationConfig::greedy(steps) });
+        rt.step()?;
+        rt.cancel(500 + i)?;
+        let _ = rt.completed();
+    }
+    let (captured, replays, _) = rt.model().prefill_graph_stats();
+    println!("  six different requests through the same graphs: {}",
+             if isolation_ok { "identical to eager" } else { "MISMATCH" });
+    println!("  {captured} graphs served {replays} replays");
+    println!("  pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+    if rt.free_pages() != rt.model().page_pool().n_pages() {
+        anyhow::bail!("pages leaked");
+    }
+
+    // --- non-zero offsets must not be captured -----------------------------
+    println!();
+    println!("non-zero chunk offsets");
+    let prompt = probe_tokens(700, cfg.vocab_size);
+    let want = run(&mut eager, 0, &prompt, GenerationConfig::greedy(steps))?;
+    for c in [64usize, 128, 256] {
+        let mut rt = build(true, true, c)?;
+        // Every chunk after the first replays the same graph at a different
+        // offset, which is only correct if the offset was never captured.
+        let got = run(&mut rt, 0, &prompt, GenerationConfig::greedy(steps))?;
+        let ok = got == want;
+        if !ok {
+            failures += 1;
+        }
+        let (g, r, _) = rt.model().prefill_graph_stats();
+        println!("  chunk {c:>4}: {} ({g} graphs, {r} replays for {} chunks)",
+                 if ok { "same as eager" } else { "DIFFERS" },
+                 prompt.len().div_ceil(c));
+    }
+
+    println!();
+    if failures > 0 {
+        anyhow::bail!("{failures} comparison(s) differed between eager and graph prefill");
+    }
+    println!("Graph-replayed prefill generates exactly what eager prefill generates,");
+    println!("across prompt lengths, chunk sizes, sampling policies and offsets, and a");
+    println!("graph captured for one request serves unrelated ones unchanged.");
+    Ok(())
+}
 
 /// Chunked prefill against monolithic prefill, on generated tokens.
 ///

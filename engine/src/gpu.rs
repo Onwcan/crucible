@@ -71,7 +71,14 @@ pub const PARAM_TOKEN: usize = 1;
 pub const PARAM_POS: usize = 2;
 pub const PARAM_SEQ: usize = 3;
 pub const PARAM_SLOT: usize = 4;
-pub const PARAM_COUNT: usize = 5;
+/// A prefill chunk's offset into its own prompt.
+///
+/// The one value the prefill sequence used to pass by kernel argument that
+/// changes between replays of the same graph, so it moved here for the same
+/// reason the decode positions did. Must match `PARAM_PREFILL_POS` in
+/// kernels.cu.
+pub const PARAM_PREFILL_POS: usize = 5;
+pub const PARAM_COUNT: usize = 6;
 
 /// Threads per block for reduction kernels.
 ///
@@ -819,19 +826,18 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
         row_stride: usize,
-        pos_offset: usize,
+        params: &CudaSlice<i32>,
     ) -> Result<()> {
         let total = (rows * n_heads * head_dim / 2) as u32;
         let cfg = LaunchConfig::for_num_elems(total);
-        let (r, nh, hd, rs, po) = (
+        let (r, nh, hd, rs) = (
             rows as i32,
             n_heads as i32,
             head_dim as i32,
             row_stride as i32,
-            pos_offset as i32,
         );
         let mut b = self.stream.launch_builder(&self.rope_batch);
-        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(&po);
+        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -909,19 +915,18 @@ impl Gpu {
         kv_dim: usize,
         n_layer: usize,
         layer: usize,
-        pos_offset: usize,
+        params: &CudaSlice<i32>,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
-        let (r, kd, nl, l, po) = (
+        let (r, kd, nl, l) = (
             rows as i32,
             kv_dim as i32,
             n_layer as i32,
             layer as i32,
-            pos_offset as i32,
         );
         let mut b = self.stream.launch_builder(&self.cache_store_paged);
         b.arg(src).arg(pool).arg(page_table)
-            .arg(&r).arg(&kd).arg(&nl).arg(&l).arg(&po);
+            .arg(&r).arg(&kd).arg(&nl).arg(&l).arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1097,25 +1102,24 @@ impl Gpu {
         layer: usize,
         kv_dim: usize,
         max_seq: usize,
-        pos_offset: usize,
+        params: &CudaSlice<i32>,
     ) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, rows as u32, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
         };
-        let (nh, nkv, hd, nl, l, kd, po) = (
+        let (nh, nkv, hd, nl, l, kd) = (
             n_head as i32,
             n_kv_head as i32,
             head_dim as i32,
             n_layer as i32,
             layer as i32,
             kv_dim as i32,
-            pos_offset as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention_prefill_paged);
         b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(page_table)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(&nl).arg(&l).arg(&kd).arg(&po);
+            .arg(&nh).arg(&nkv).arg(&hd).arg(&nl).arg(&l).arg(&kd).arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
