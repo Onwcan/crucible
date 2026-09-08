@@ -152,6 +152,11 @@ pub struct Gpu {
     cache_store_rows_paged: CudaFunction,
     attention_decode_paged: CudaFunction,
     attention_prefill_paged: CudaFunction,
+    attention_prefill_packed: CudaFunction,
+    cache_store_packed_paged: CudaFunction,
+    gather_prefill_rows: CudaFunction,
+    gemv_final_rows_f32: CudaFunction,
+    gemv_final_rows_i8: CudaFunction,
     embed_i8: CudaFunction,
 }
 
@@ -261,6 +266,11 @@ impl Gpu {
             cache_store_rows_paged: cu(module.load_function("cache_store_rows_paged_f32"))?,
             attention_decode_paged: cu(module.load_function("attention_decode_paged_f32"))?,
             attention_prefill_paged: cu(module.load_function("attention_prefill_paged_f32"))?,
+            attention_prefill_packed: cu(module.load_function("attention_prefill_packed_f32"))?,
+            cache_store_packed_paged: cu(module.load_function("cache_store_packed_paged_f32"))?,
+            gather_prefill_rows: cu(module.load_function("gather_prefill_rows_f32"))?,
+            gemv_final_rows_f32: cu(module.load_function("gemv_final_rows_f32"))?,
+            gemv_final_rows_i8: cu(module.load_function("gemv_final_rows_i8"))?,
             embed_i8: cu(module.load_function("embed_i8"))?,
             ctx,
             stream,
@@ -1121,6 +1131,90 @@ impl Gpu {
         b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(page_table)
             .arg(&nh).arg(&nkv).arg(&hd).arg(&nl).arg(&l).arg(&kd).arg(params);
         unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Packed causal attention. Ownership and absolute positions are dynamic
+    /// device metadata; arithmetic is shared with single-request prefill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_packed(
+        &self, q: &CudaSlice<f32>, k_pool: &CudaSlice<f32>, v_pool: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>, tables: &CudaSlice<i32>, owners: &CudaSlice<i32>,
+        positions: &CudaSlice<i32>, rows: usize, table_stride: usize,
+        n_head: usize, n_kv_head: usize, head_dim: usize, n_layer: usize,
+        layer: usize, kv_dim: usize, max_seq: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (n_head as u32, rows as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
+        };
+        let (ts, nh, nk, hd, nl, l, kd) = (table_stride as i32, n_head as i32,
+            n_kv_head as i32, head_dim as i32, n_layer as i32, layer as i32, kv_dim as i32);
+        let mut b = self.stream.launch_builder(&self.attention_prefill_packed);
+        b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(tables).arg(owners).arg(positions)
+            .arg(&ts).arg(&nh).arg(&nk).arg(&hd).arg(&nl).arg(&l).arg(&kd);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cache_store_packed_paged(
+        &self, src: &CudaSlice<f32>, pool: &mut CudaSlice<f32>, tables: &CudaSlice<i32>,
+        owners: &CudaSlice<i32>, positions: &CudaSlice<i32>, rows: usize,
+        kv_dim: usize, table_stride: usize, n_layer: usize, layer: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
+        let (r, kd, ts, nl, l) = (rows as i32, kv_dim as i32, table_stride as i32,
+            n_layer as i32, layer as i32);
+        let mut b = self.stream.launch_builder(&self.cache_store_packed_paged);
+        b.arg(src).arg(pool).arg(tables).arg(owners).arg(positions)
+            .arg(&r).arg(&kd).arg(&ts).arg(&nl).arg(&l);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    pub fn gather_prefill_rows(
+        &self, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>, indices: &CudaSlice<i32>,
+        rows: usize, width: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig::for_num_elems((rows * width) as u32);
+        let (r, w) = (rows as i32, width as i32);
+        let mut b = self.stream.launch_builder(&self.gather_prefill_rows);
+        b.arg(src).arg(dst).arg(indices).arg(&r).arg(&w);
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Preserve standalone lm_head arithmetic at every completion count.
+    /// WMMA here would make half rounding depend on unrelated final rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_final_rows(
+        &self, w: &Proj2, x: &CudaSlice<f32>, y: &mut CudaSlice<f32>,
+        rows: usize, cols: usize, batch: usize,
+    ) -> Result<()> {
+        if let Proj2::Int8(data, scales) = w {
+            if cols % 4 == 0 && cols / 4 < REDUCE_THREADS as usize {
+                return self.gemv_batch_i8(data, scales, x, y, rows, cols, batch, false);
+            }
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, batch as u32, 1),
+            block_dim: (REDUCE_THREADS, 1, 1), shared_mem_bytes: 0,
+        };
+        let (r, c) = (rows as i32, cols as i32);
+        match w {
+            Proj2::F32(data) => {
+                let mut b = self.stream.launch_builder(&self.gemv_final_rows_f32);
+                b.arg(*data).arg(x).arg(y).arg(&r).arg(&c);
+                unsafe { cu(b.launch(cfg))? };
+            }
+            Proj2::Int8(data, scales) => {
+                let mut b = self.stream.launch_builder(&self.gemv_final_rows_i8);
+                b.arg(*data).arg(*scales).arg(x).arg(y).arg(&r).arg(&c);
+                unsafe { cu(b.launch(cfg))? };
+            }
+        }
         Ok(())
     }
 

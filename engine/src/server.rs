@@ -52,8 +52,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
@@ -95,6 +94,8 @@ pub struct ServeOptions {
     /// Prompt tokens consumed per scheduler step. `None` keeps the measured
     /// default.
     pub prefill_chunk: Option<usize>,
+    pub prefill_token_budget: Option<usize>,
+    pub max_prefill_requests: Option<usize>,
 }
 
 // --- wire types -------------------------------------------------------------
@@ -107,6 +108,9 @@ pub(crate) struct Job {
     prompt: Vec<usize>,
     config: GenerationConfig,
     events: mpsc::Sender<StreamItem>,
+    /// Shared across the HTTP channel and Runtime.pending; released only when
+    /// pages/slot are admitted, or when a waiting client cancels.
+    queue_slot: OwnedSemaphorePermit,
 }
 
 /// What the inference thread sends back per request.
@@ -137,11 +141,21 @@ struct Stats {
     prefill_chunks: u64,
     prefill_tokens: u64,
     last_prefill_chunk: usize,
+    prefill_batches: u64,
+    packed_prefill_batches: u64,
+    packed_prefill_tokens: u64,
+    prefill_requests: u64,
+    prefill_final_rows: u64,
+    last_prefill_batch_requests: usize,
+    last_prefill_batch_tokens: usize,
+    max_prefill_batch_tokens: usize,
+    prefill_d2h_bytes: u64,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     jobs: mpsc::Sender<Job>,
+    queue_slots: Arc<Semaphore>,
     stats: Arc<Mutex<Stats>>,
     next_id: Arc<AtomicU64>,
     pub(crate) limits: Limits,
@@ -178,9 +192,19 @@ struct Live {
     events: mpsc::Sender<StreamItem>,
     decoder: IncrementalDecoder,
     generated: usize,
+    queue_slot: Option<OwnedSemaphorePermit>,
 }
 
 // --- request validation -----------------------------------------------------
+
+fn validate_pool_capacity(prompt: usize, generated: usize, pages: usize) -> std::result::Result<(), String> {
+    let positions = prompt.checked_add(generated.saturating_sub(1))
+        .ok_or_else(|| "request token count overflows usize".to_string())?;
+    if positions.div_ceil(PAGE_TOKENS) > pages {
+        return Err(format!("request needs {} KV pages, server pool has {pages}", positions.div_ceil(PAGE_TOKENS)));
+    }
+    Ok(())
+}
 
 /// Reject what the runtime cannot serve, with a reason the caller can act on.
 ///
@@ -209,7 +233,7 @@ pub fn validate(
             limits.max_prompt_tokens
         ));
     }
-    if prompt_tokens + max_tokens > limits.context {
+    if prompt_tokens.checked_add(max_tokens).is_none_or(|n| n > limits.context) {
         return Err(format!(
             "prompt ({prompt_tokens}) plus max_tokens ({max_tokens}) exceeds the \
              model context of {}",
@@ -227,7 +251,7 @@ pub fn validate(
 pub(crate) fn is_size_failure(prompt_tokens: usize, max_tokens: usize, limits: &Limits) -> bool {
     max_tokens > limits.max_new_tokens
         || prompt_tokens > limits.max_prompt_tokens
-        || prompt_tokens + max_tokens > limits.context
+        || prompt_tokens.checked_add(max_tokens).is_none_or(|n| n > limits.context)
 }
 
 /// The finish reason as the OpenAI schema spells it.
@@ -265,7 +289,7 @@ async fn metrics(State(st): State<AppState>) -> Json<MetricsBody> {
     let s = st.stats.lock().unwrap();
     Json(MetricsBody {
         active_requests: s.active,
-        queued_requests: s.queued,
+        queued_requests: st.limits.max_queue - st.queue_slots.available_permits(),
         completed_requests: s.completed,
         cancelled_requests: s.cancelled,
         failed_requests: s.failed,
@@ -280,6 +304,19 @@ async fn metrics(State(st): State<AppState>) -> Json<MetricsBody> {
         prefill_chunks: s.prefill_chunks,
         prefill_tokens: s.prefill_tokens,
         last_prefill_chunk_tokens: s.last_prefill_chunk,
+        prefill_batches: s.prefill_batches,
+        packed_prefill_batches: s.packed_prefill_batches,
+        packed_prefill_tokens: s.packed_prefill_tokens,
+        prefill_requests: s.prefill_requests,
+        prefill_final_rows: s.prefill_final_rows,
+        last_prefill_batch_requests: s.last_prefill_batch_requests,
+        last_prefill_batch_tokens: s.last_prefill_batch_tokens,
+        max_prefill_batch_tokens: s.max_prefill_batch_tokens,
+        prefill_d2h_bytes: s.prefill_d2h_bytes,
+        average_prefill_batch_requests: if s.prefill_batches == 0 { 0.0 }
+            else { s.prefill_requests as f64 / s.prefill_batches as f64 },
+        average_prefill_batch_tokens: if s.prefill_batches == 0 { 0.0 }
+            else { s.prefill_tokens as f64 / s.prefill_batches as f64 },
         average_batch_size: if s.steps > 0 {
             s.batch_sum as f64 / s.steps as f64
         } else {
@@ -348,6 +385,12 @@ async fn submit(
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let config = config_from_request(req, st.vocab)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    validate_pool_capacity(prompt_tokens, req.max_tokens, st.health.kv_pages)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let queue_slot = st.queue_slots.clone().try_acquire_owned().map_err(|_| (
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("server queue is full ({} waiting); retry shortly", st.limits.max_queue),
+    ))?;
 
     // Bounded channel: a client that stops reading cannot make the inference
     // thread buffer without limit.
@@ -357,6 +400,7 @@ async fn submit(
         prompt,
         config,
         events: tx,
+        queue_slot,
     };
 
     // try_send rather than send: a full queue must answer 429 immediately
@@ -473,6 +517,10 @@ pub(crate) async fn submit_compat(
     if let Err(msg) = sampling::validate(&config, st.vocab) {
         return Err(SubmitError::Sampling(msg));
     }
+    validate_pool_capacity(prompt_tokens, max_tokens, st.health.kv_pages)
+        .map_err(SubmitError::TooLarge)?;
+    let queue_slot = st.queue_slots.clone().try_acquire_owned().map_err(|_| SubmitError::QueueFull(
+        format!("The server queue is full ({} waiting). Retry shortly.", st.limits.max_queue)))?;
 
     let (tx, rx) = mpsc::channel(st.limits.max_new_tokens.min(512) + 8);
     let job = Job {
@@ -480,6 +528,7 @@ pub(crate) async fn submit_compat(
         prompt: tokens,
         config,
         events: tx,
+        queue_slot,
     };
     st.jobs.try_send(job).map_err(|e| match e {
         mpsc::error::TrySendError::Full(_) => SubmitError::QueueFull(format!(
@@ -618,10 +667,47 @@ async fn generate_stream(
 
 // --- inference thread -------------------------------------------------------
 
-/// Owns the runtime for the process lifetime.
-///
-/// Structured so that a per-request failure is reported to that request only,
-/// while a runtime failure stops the loop and marks the service unhealthy.
+/// A rejected job never replaces or fails another live request.
+fn accept_job(rt: &mut Runtime, live: &mut HashMap<u64, Live>, stats: &Mutex<Stats>, job: Job) {
+    let greedy = job.config.is_greedy();
+    if let Err(error) = rt.submit(RtRequest {
+        id: job.id, prompt: job.prompt, config: job.config,
+    }) {
+        // HTTP validates first, but direct runtime guards still reject safely.
+        // This job owns no pages, and its waiting permit drops with the job.
+        let _ = job.events.try_send(StreamItem::Failed(error.to_string()));
+        stats.lock().unwrap().failed += 1;
+        return;
+    }
+    {
+        let mut s = stats.lock().unwrap();
+        if greedy { s.greedy_requests += 1; } else { s.sampled_requests += 1; }
+    }
+    live.insert(job.id, Live {
+        events: job.events, decoder: IncrementalDecoder::new(), generated: 0,
+        queue_slot: Some(job.queue_slot),
+    });
+}
+
+fn fail_runtime(
+    live: &mut HashMap<u64, Live>, jobs: &mut mpsc::Receiver<Job>,
+    stats: &Mutex<Stats>, fatal: &Mutex<Option<String>>, message: String,
+) {
+    // Close admission before draining, so arrivals during a failed GPU step
+    // cannot miss the failure notification or keep the drain alive forever.
+    jobs.close();
+    *fatal.lock().unwrap() = Some(message.clone());
+    stats.lock().unwrap().failed += 1;
+    for (_, request) in live.drain() {
+        let _ = request.events.try_send(StreamItem::Failed(message.clone()));
+    }
+    while let Ok(job) = jobs.try_recv() {
+        let _ = job.events.try_send(StreamItem::Failed(message.clone()));
+    }
+}
+
+/// Owns the runtime for the process lifetime. A runtime failure stops this
+/// thread and drops its CUDA state; a rejected request leaves its peers live.
 fn inference_thread(
     opts: ServeOptions,
     tokenizer: Arc<Tokenizer>,
@@ -649,29 +735,7 @@ fn inference_thread(
         // Take whatever has arrived without blocking.
         loop {
             match jobs.try_recv() {
-                Ok(job) => {
-                    {
-                        let mut s = stats.lock().unwrap();
-                        if job.config.is_greedy() {
-                            s.greedy_requests += 1;
-                        } else {
-                            s.sampled_requests += 1;
-                        }
-                    }
-                    rt.submit(RtRequest {
-                        id: job.id,
-                        prompt: job.prompt,
-                        config: job.config,
-                    });
-                    live.insert(
-                        job.id,
-                        Live {
-                            events: job.events,
-                            decoder: IncrementalDecoder::new(),
-                            generated: 0,
-                        },
-                    );
-                }
+                Ok(job) => accept_job(&mut rt, &mut live, &stats, job),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 // Every handler dropped: the server is shutting down.
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
@@ -682,35 +746,13 @@ fn inference_thread(
         // GPU. This is also where shutdown is noticed when idle.
         if rt.is_idle() {
             match jobs.blocking_recv() {
-                Some(job) => {
-                    {
-                        let mut s = stats.lock().unwrap();
-                        if job.config.is_greedy() {
-                            s.greedy_requests += 1;
-                        } else {
-                            s.sampled_requests += 1;
-                        }
-                    }
-                    rt.submit(RtRequest {
-                        id: job.id,
-                        prompt: job.prompt,
-                        config: job.config,
-                    });
-                    live.insert(
-                        job.id,
-                        Live {
-                            events: job.events,
-                            decoder: IncrementalDecoder::new(),
-                            generated: 0,
-                        },
-                    );
-                }
+                Some(job) => accept_job(&mut rt, &mut live, &stats, job),
                 None => return,
             }
         }
 
         // Withdraw anything whose client has gone. Checked between steps: a
-        // step is one fused graph launch and cannot be interrupted partway.
+        // step completes its bounded submitted GPU work before recycling pages.
         let gone: Vec<u64> = live
             .iter()
             .filter(|(_, l)| l.events.is_closed())
@@ -723,7 +765,7 @@ fn inference_thread(
                     stats.lock().unwrap().cancelled += 1;
                 }
                 Err(e) => {
-                    *fatal.lock().unwrap() = Some(format!("cancel failed: {e}"));
+                    fail_runtime(&mut live, &mut jobs, &stats, &fatal, format!("cancel failed: {e}"));
                     return;
                 }
             }
@@ -736,15 +778,15 @@ fn inference_thread(
             Err(e) => {
                 // A runtime failure is fatal: the GPU state is no longer
                 // trustworthy. Tell everyone still waiting, then stop.
-                let msg = format!("{e}");
-                for (_, l) in live.drain() {
-                    let _ = l.events.try_send(StreamItem::Failed(msg.clone()));
-                }
-                stats.lock().unwrap().failed += 1;
-                *fatal.lock().unwrap() = Some(msg);
+                fail_runtime(&mut live, &mut jobs, &stats, &fatal, e.to_string());
                 return;
             }
         };
+        for id in &info.admitted {
+            if let Some(request) = live.get_mut(id) {
+                request.queue_slot.take();
+            }
+        }
 
         // Route tokens. A send failure means the client vanished between the
         // disconnect check and now, which the next iteration will clean up.
@@ -794,6 +836,17 @@ fn inference_thread(
             if info.prefill_chunks > 0 {
                 s.last_prefill_chunk = info.prefill_tokens;
             }
+            s.prefill_batches += info.prefill_batches as u64;
+            s.packed_prefill_batches += info.packed_prefill_batches as u64;
+            s.packed_prefill_tokens += info.packed_prefill_tokens as u64;
+            s.prefill_requests += info.prefill_requests as u64;
+            s.prefill_final_rows += info.prefill_final_rows as u64;
+            s.prefill_d2h_bytes += info.prefill_d2h_bytes as u64;
+            if info.prefill_batches > 0 {
+                s.last_prefill_batch_requests = info.last_prefill_batch_requests;
+                s.last_prefill_batch_tokens = info.last_prefill_batch_tokens;
+                s.max_prefill_batch_tokens = s.max_prefill_batch_tokens.max(info.max_prefill_batch_tokens);
+            }
         }
     }
 }
@@ -818,17 +871,23 @@ fn build_runtime(opts: &ServeOptions) -> Result<(Runtime, InitInfo)> {
         weight_bytes: model.weight_bytes(),
         vocab: cfg.vocab_size,
     };
-        let mut rt = Runtime::new(model)?;
+    let mut rt = Runtime::new(model)?;
     // Asking for a chunk size is asking for chunking; the flag would otherwise
     // set a size on a policy that is off.
     if let Some(n) = opts.prefill_chunk {
+        if n == 0 || n > cfg.block_size { anyhow::bail!("prefill chunk must be in 1..={}", cfg.block_size); }
         rt.set_prefill_chunk(n);
         rt.set_chunked_prefill(true);
     }
+    if let Some(n) = opts.prefill_token_budget { rt.set_prefill_token_budget(n)?; }
+    if let Some(n) = opts.max_prefill_requests { rt.set_max_prefill_requests(n)?; }
     Ok((rt, info))
 }
 
 pub fn serve(opts: ServeOptions) -> Result<()> {
+    if opts.limits.max_batch == 0 || opts.limits.max_queue == 0 || opts.kv_pages == 0 {
+        anyhow::bail!("max-batch, max-queue and kv-pages must all be positive");
+    }
     let tokenizer = Arc::new(
         Tokenizer::load(&opts.tokenizer)
             .with_context(|| format!("loading tokenizer {}", opts.tokenizer.display()))?,
@@ -838,6 +897,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let fatal = Arc::new(Mutex::new(None));
     let (job_tx, job_rx) = mpsc::channel::<Job>(limits.max_queue);
+    let queue_slots = Arc::new(Semaphore::new(limits.max_queue));
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<InitInfo>>();
 
     let model_name = opts
@@ -896,6 +956,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
 
     let state = AppState {
         jobs: job_tx,
+        queue_slots,
         vocab,
         stats,
         next_id: Arc::new(AtomicU64::new(1)),
@@ -1000,6 +1061,77 @@ mod tests {
         assert!(validate(4, 0, &limits()).is_err());
         assert!(validate(4, 257, &limits()).unwrap_err().contains("server limit"));
         assert!(validate(4, 256, &limits()).is_ok());
+    }
+
+    #[test]
+    fn token_size_validation_handles_integer_overflow_and_small_pools() {
+        let unrestricted = Limits {
+            max_prompt_tokens: usize::MAX, max_new_tokens: usize::MAX,
+            context: usize::MAX, ..limits()
+        };
+        assert!(validate(usize::MAX, 1, &unrestricted).is_err());
+        assert!(is_size_failure(usize::MAX, 1, &unrestricted));
+        assert!(validate_pool_capacity(16, 1, 1).is_ok());
+        assert!(validate_pool_capacity(16, 2, 1).is_err());
+        assert!(validate_pool_capacity(usize::MAX, 2, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn queue_permit_survives_channel_drain_and_returns_on_admission_or_cancel() {
+        let slots = Arc::new(Semaphore::new(2));
+        let (jobs, mut receiver) = mpsc::channel(2);
+        for id in 1..=2 {
+            let (events, _) = mpsc::channel(8);
+            let job = Job {
+                id, prompt: vec![7], config: GenerationConfig::greedy(1), events,
+                queue_slot: slots.clone().try_acquire_owned().unwrap(),
+            };
+            assert!(jobs.try_send(job).is_ok());
+        }
+        let mut waiting = Vec::new();
+        while let Ok(job) = receiver.try_recv() {
+            waiting.push(Live {
+                events: job.events, decoder: IncrementalDecoder::new(), generated: 0,
+                queue_slot: Some(job.queue_slot),
+            });
+        }
+        // The transport is empty, but both requests still await page admission.
+        assert_eq!(jobs.capacity(), 2);
+        assert!(slots.clone().try_acquire_owned().is_err());
+        waiting[0].queue_slot.take(); // info.admitted
+        let replacement = slots.clone().try_acquire_owned().unwrap();
+        assert!(slots.clone().try_acquire_owned().is_err());
+        waiting.pop(); // cancellation before admission
+        assert_eq!(slots.available_permits(), 1);
+        drop(replacement);
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    #[test]
+    fn fatal_failure_notifies_residents_and_inflight_arrivals_and_reclaims_permits() {
+        let slots = Arc::new(Semaphore::new(2));
+        let (jobs, mut queued) = mpsc::channel(2);
+        let (live_tx, mut live_rx) = mpsc::channel(8);
+        let (queued_tx, mut queued_rx) = mpsc::channel(8);
+        let mut live = HashMap::from([(1, Live {
+            events: live_tx, decoder: IncrementalDecoder::new(), generated: 0,
+            queue_slot: Some(slots.clone().try_acquire_owned().unwrap()),
+        })]);
+        assert!(jobs.try_send(Job {
+            id: 2, prompt: vec![1], config: GenerationConfig::greedy(1), events: queued_tx,
+            queue_slot: slots.clone().try_acquire_owned().unwrap(),
+        }).is_ok());
+        let stats = Mutex::new(Stats::default());
+        let fatal = Mutex::new(None);
+        fail_runtime(&mut live, &mut queued, &stats, &fatal, "device failed".into());
+        assert!(jobs.is_closed());
+        assert!(live.is_empty());
+        assert_eq!(slots.available_permits(), 2);
+        assert_eq!(stats.lock().unwrap().failed, 1);
+        assert_eq!(fatal.lock().unwrap().as_deref(), Some("device failed"));
+        for receiver in [&mut live_rx, &mut queued_rx] {
+            assert!(matches!(receiver.try_recv(), Ok(StreamItem::Failed(message)) if message == "device failed"));
+        }
     }
 
     #[test]

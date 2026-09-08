@@ -98,6 +98,28 @@ pub struct Metrics {
     pub prefill_tokens: u64,
     #[serde(default)]
     pub last_prefill_chunk_tokens: usize,
+    #[serde(default)]
+    pub prefill_batches: u64,
+    #[serde(default)]
+    pub packed_prefill_batches: u64,
+    #[serde(default)]
+    pub packed_prefill_tokens: u64,
+    #[serde(default)]
+    pub prefill_requests: u64,
+    #[serde(default)]
+    pub prefill_final_rows: u64,
+    #[serde(default)]
+    pub last_prefill_batch_requests: usize,
+    #[serde(default)]
+    pub last_prefill_batch_tokens: usize,
+    #[serde(default)]
+    pub max_prefill_batch_tokens: usize,
+    #[serde(default)]
+    pub average_prefill_batch_requests: f64,
+    #[serde(default)]
+    pub average_prefill_batch_tokens: f64,
+    #[serde(default)]
+    pub prefill_d2h_bytes: u64,
 }
 
 impl Metrics {

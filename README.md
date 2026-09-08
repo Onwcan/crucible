@@ -1622,7 +1622,9 @@ the sixteenth request waits behind fifteen prefills.
 
 - Greedy only. No temperature, top-p or beam search.
 - Cancellation is effective at the next step boundary, not immediately.
-- Admission prefills one request per step, so TTFT scales with queue depth.
+- Prompt work is now packed across requests under a token budget; see the
+  cross-request prefill decision record below. Queued requests still wait for
+  resident slots and lifetime KV reservations.
 - No auth, TLS, or multi-model serving; local development scope.
 - `/metrics` counters are cumulative since startup, which is why the benchmark
   computes per-run averages from deltas rather than reading them directly.
@@ -2720,6 +2722,140 @@ several waiting requests concatenated into one tensor-core GEMM, so the grids
 are full. It is the same fix batched GEMV was for decode, and this measurement
 is what justifies attempting it. It is not attempted here.
 
+## Cross-request packed prefill: larger GEMMs, bounded scheduled work
+
+The previous graph experiment identified a roughly 5.76 ms GPU floor for one
+prompt token. Packing addresses that floor by making independent prompt rows
+share transformer launches. The result is **a partial win**: short bursts gain
+substantially, heterogeneous prompts reach their first token sooner, and small
+per-request chunks still cost too much to enable by default.
+
+This milestone started at `8f5c745c6309f25f4dae0466a2275598bf333042` with a clean
+working tree. A separate binary was rebuilt from an archive of that exact
+commit. The [full measurement report](docs/packed-prefill-results.md),
+[implementation contract](docs/packed-prefill-design.md), and
+[three-round evidence](docs/packed-prefill-evidence.json) contain the baseline,
+parameter sweeps, power envelopes, correctness matrix, and reproduction
+commands. No weights or GEMM tiles changed.
+
+### What actually runs
+
+`PrefillBatchPlan` carries stable request IDs, prompt offsets, real row counts,
+and final-slice flags. For four 64-token slices, each projection sees **M=256**
+in one call. Code inspection corrects the earlier estimate: K, V, Q, O, gate,
+up, and down are **seven GEMMs per layer, 84 across twelve layers**.
+Reference and packed execution share one transformer loop.
+
+Persistent int32 owner and absolute-position arrays route RoPE, K/V writes, and
+attention. Each query reads only its owner's paged history through its own
+absolute position. The existing 16-token page layout and attention reduction
+body are shared; there is no dense mask or padding with fake tokens. Only
+finishing prompt rows reach final normalization and the vocabulary projection.
+Greedy readback is four bytes per finishing request. Device top-k through 128
+and per-row full-logit fallback above 128 retain their existing sampling rules.
+
+Each iteration admits fitting requests, decodes existing streams, then executes
+one token-budgeted prefill plan. Unfinished contributors rotate to the back.
+With at most R resident requests, an eligible survivor receives work within R
+nonempty plans, including under arrivals and cancellation. This is a progress
+bound, not a latency deadline. Admission remains FCFS and reserves each
+request's full lifetime page requirement; prompt pages are assigned at
+admission and later decode growth is lazy. A semaphore now bounds the combined
+HTTP channel and runtime waiting queue. Draining the channel no longer creates
+unlimited internal waiting capacity.
+
+Added GPU metadata is **8,256 bytes** at token capacity 1024 and batch capacity
+16. Existing prefill scratch, page tables, and decode selection buffers are
+reused. Cancellation is observed between completed GPU calls; pages cannot be
+recycled while kernels use them. An execution failure stops the inference
+owner and fails queued/live work instead of continuing with suspect state.
+
+### Real service results
+
+These are medians of three alternating baseline/candidate rounds on AC power
+with the Windows Best Performance overlay. Per-round distributions and loaded
+clocks are retained in the evidence file; Dell's thermal-mode label could not
+be verified through its administrator-only CLI. TTFT starts at client request
+submission, including queueing, prefill, and delivery. The p95 column is the
+median of each round's request p95, not a percentile inferred from three means.
+
+| Workload | Baseline TTFT p50 / p95 | Packed TTFT p50 / p95 | Baseline / packed generation tok/s |
+|---|---:|---:|---:|
+| 16 short prompts (8–64 tokens) | 105.90 / 107.01 ms | 16.15 / 16.99 ms | 5,031 / 8,739 |
+| Four 256-token prompts | 35.87 / 36.01 ms | 23.85 / 24.10 ms | 2,553 / 2,846 |
+| Four 512-token prompts | 54.51 / 54.71 ms | 35.17 / 47.28 ms | 1,868 / 1,928 |
+| Four 941-token prompts | 116.47 / 116.63 ms | 73.92 / 115.08 ms | 1,127 / 1,107 |
+| Eight 512-token prompts | 109.72 / 109.94 ms | 58.31 / 93.59 ms | 2,389 / 2,547 |
+
+The long-prompt tail and aggregate rate matter: lower median TTFT alone does
+not establish a throughput gain. With an established decoder and four arriving
+prompts, its median worst gap across rounds fell from 43.03 to 26.64 ms, with
+material arrival-order variation. A lone 941-token arrival still creates a
+roughly 27 ms worst gap. The 1024-token budget bounds submitted work; it does
+not promise sub-millisecond interruption.
+
+One-token HTTP bursts are a further limit: eight and sixteen clients benefit,
+while two clients had worse TTFT and throughput, and four had lower throughput
+despite better TTFT. Arrival composition and clock variation are material in
+that small workload. The dispatch threshold counts actual contributors in a
+plan; it does not guarantee that concurrent clients arrive in one batch. The
+full report retains these regressions as well as the successful workloads.
+
+### Correctness changed one older decode decision
+
+The expanded HTTP corpus exposed a pre-existing batch-composition bug in the
+baseline. Above eight active requests, decode switched its final projection to
+WMMA, rounding activations to half precision. A seeded top-k-500 sequence could
+change despite identical request input and seed. Int8 decode now retains the
+same batched GEMV arithmetic at every supported batch size, 1–16. The explicit
+forced-GEMM comparison remains available. The report separates the cost of this
+correctness repair from scheduler overhead.
+
+The GPU checks passed **1,084 exact int8 sequences** with 24 deterministic fuzz
+sets and **847 exact f32 sequences**, both with zero final-logit difference
+against independent monolithic prefill. Coverage includes page boundaries,
+misaligned offsets, permutations, changing neighbors, 16→1→8→2 stale metadata,
+mixed sampling, cancellation/reuse, malformed metadata, and 16 active decoders
+shrinking to eight. HTTP added 384 exact comparisons and real page-pressure
+checks. Native, OpenAI, Anthropic, official SDK, TUI, CPU/mock-server, graph,
+paged-cache, and held-out CE checks passed; the full report records commands
+and counts.
+
+An isolated six-request experiment proved that all five client surfaces shared
+one 94-row packed call after a 941-token singleton blocker. A 60-second mixed
+load at 35 requests/s completed 1,976 requests plus 124 scheduled disconnects
+with zero errors and peak queue depth two. A separate 100-request/s saturation
+test exercised bounded rejection and complete reclamation.
+
+CUDA-event stage attribution puts the 84 transformer GEMMs at about 83% of
+instrumented time for 16 × 16 rows; attention is about 4%. At 4 × 256 rows,
+GEMMs account for about 58% and attention 33%, making attention the largest
+individual stage. Event overhead and clock variation limit absolute timing;
+the report retains those caveats and the uninstrumented measurements. Nsight
+GPU activity and Compute Sanitizer instrumentation were unavailable under this
+WSL setup. No sanitizer pass is claimed.
+
+### Production decision
+
+| Setting | Default |
+|---|---|
+| Cross-request packing | **On**; `CRUCIBLE_BATCHED_PREFILL=0` preserves reference scheduling |
+| Aggregate prefill budget | **1024 real tokens**, clamped to model capacity |
+| Contributors per plan | `max_batch`, up to **16** |
+| Additional per-request chunking | **Off**; without it, the per-request cap is model capacity |
+| Optional chunk cap | **128** when explicitly enabled |
+| Dispatch | One contributor uses the existing single-request path; **two or more** use packed execution |
+| Single-request prefill graphs | **On**, existing bounded exact-length cache |
+| Packed serving graphs | **None**; eager packed work, temporary graphs only for measurement |
+
+Budgets 64/128/256/512/1024 and chunk caps 32/64/128/256/none were measured.
+Small caps reduce individual interruptions but repeat the fixed GPU cost and
+can worsen long-prompt tails and aggregate throughput. The measured crossover
+supports the simple two-request dispatch; an adaptive policy and a packed
+graph cache are not justified by these results. Prefix caching, multi-stream
+overlap, attention rewrites, and further GEMM tuning remain outside this
+milestone.
+
 ## Against llama.cpp and vLLM
 
 ```bash
@@ -2974,10 +3110,11 @@ share decode steps in one scheduler.
       admission, cancellation mid-prompt, prefill metrics
 - [x] Prefill CUDA graphs — shipped, and the hypothesis behind them rejected:
       submission was 0.5 ms of the 6.6 ms fixed cost, not the whole of it
-- [ ] Cross-request batched prefill — now the measured candidate: 5.76 ms of
-      pure GPU time to prefill one token, on occupancy-starved grids
+- [x] Cross-request packed prefill — shared transformer GEMMs, token-budgeted
+      scheduling and request isolation; short-burst TTFT 105.9 -> 16.2 ms
 - [~] Chunked prefill — implemented and verified identical to monolithic, but
-      measured slower on every metric but worst-case gap, so it ships off
+      small caps trade smaller decode interruptions for worse prompt tails
+      and throughput, so the additional per-request cap ships off
 - [ ] Batched fused SwiGLU (gate/up are still two launches)
 - [x] Throughput comparison against llama.cpp (decode 1.7x faster, prefill 104x slower)
 - [x] Batched prefill — 17x faster, prompt processed as a matrix

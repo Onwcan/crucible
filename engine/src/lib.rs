@@ -21,6 +21,7 @@ pub mod gpu;
 pub mod gpu_model;
 pub mod model;
 pub mod paged;
+pub mod prefill;
 // Wire types, shared by the service and its clients. No feature gate: the point
 // is that a client can depend on the protocol without depending on the engine.
 pub mod protocol;

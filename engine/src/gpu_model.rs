@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
-use cudarc::driver::{CudaGraph, CudaSlice};
+use cudarc::driver::{CudaEvent, CudaGraph, CudaSlice};
 
 use crate::config::Config;
 use crate::gpu::{attn_chunks, Gpu, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
@@ -23,6 +23,84 @@ use crate::quant::QuantTensor;
 use crate::weights::Weights;
 
 const NORM_EPS: f32 = 1e-6;
+
+/// Opt-in CUDA-event attribution for packed prefill. These are device-stream
+/// intervals, including event instrumentation and any submission gaps, rather
+/// than a replacement for uninstrumented end-to-end benchmark timings.
+pub struct PackedPrefillStage {
+    pub name: &'static str,
+    /// Timed GPU operations per pass, aggregated over all transformer layers.
+    /// This is an operation count, not a request count or a kernel trace.
+    pub calls: usize,
+    /// Mean summed event intervals for this stage in one complete pass.
+    pub milliseconds: f64,
+}
+
+pub struct PackedPrefillProfile {
+    pub stages: Vec<PackedPrefillStage>,
+    /// Mean start-to-end event interval, including event instrumentation and
+    /// host submission gaps, but excluding metadata H2D and output readback.
+    pub device_milliseconds: f64,
+}
+
+/// Created only by the explicit profiling API, before its timed passes. Serving
+/// instantiates the queue helpers with PROFILE=false, removing all event code.
+struct PackedPrefillEvents {
+    events: Vec<CudaEvent>,
+    labels: Vec<&'static str>,
+}
+
+impl PackedPrefillEvents {
+    fn new(gpu: &Gpu, boundaries: usize) -> Result<Self> {
+        let mut events = Vec::with_capacity(boundaries + 1);
+        for _ in 0..=boundaries {
+            events.push(gpu.ctx.new_event(Some(
+                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            )).map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))?);
+        }
+        Ok(Self { events, labels: Vec::with_capacity(boundaries) })
+    }
+
+    fn start(&mut self, gpu: &Gpu) -> Result<()> {
+        self.labels.clear();
+        self.events[0].record(&gpu.stream)
+            .map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))
+    }
+
+    fn mark(&mut self, gpu: &Gpu, name: &'static str) -> Result<()> {
+        let next = self.labels.len() + 1;
+        let event = self.events.get(next)
+            .ok_or_else(|| anyhow::anyhow!("packed profiling event capacity exceeded"))?;
+        event.record(&gpu.stream)
+            .map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))?;
+        self.labels.push(name);
+        Ok(())
+    }
+
+    /// Called only after the entire pass has completed. cudarc synchronizes
+    /// each queried event too, but these are already complete: no stage-wise
+    /// synchronization is inserted into the model's execution.
+    fn accumulate(&self, report: &mut PackedPrefillProfile, iters: usize) -> Result<()> {
+        for (index, &name) in self.labels.iter().enumerate() {
+            let elapsed = self.events[index].elapsed_ms(&self.events[index + 1])
+                .map_err(|e| anyhow::anyhow!("CUDA profiling elapsed time: {e:?}"))?;
+            let stage = match report.stages.iter().position(|s| s.name == name) {
+                Some(index) => &mut report.stages[index],
+                None => {
+                    report.stages.push(PackedPrefillStage { name, calls: 0, milliseconds: 0.0 });
+                    report.stages.last_mut().expect("just inserted")
+                }
+            };
+            stage.calls += 1;
+            stage.milliseconds += elapsed as f64 / iters as f64;
+        }
+        report.device_milliseconds += self.events[0]
+            .elapsed_ms(&self.events[self.labels.len()])
+            .map_err(|e| anyhow::anyhow!("CUDA profiling elapsed time: {e:?}"))?
+            as f64 / iters as f64;
+        Ok(())
+    }
+}
 
 /// Weight precision for the large projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +217,30 @@ struct PrefillScratch {
     gate: CudaSlice<f32>,
     up: CudaSlice<f32>,
     last: CudaSlice<f32>,
+}
+
+/// A transient view of one request's contiguous prompt chunk. Request identity
+/// remains in the scheduler; descriptor indices live for this GPU call only.
+pub struct PackedPrefillRequest<'a> {
+    pub tokens: &'a [usize],
+    pub page_table: &'a [i32],
+    pub pos_offset: usize,
+    pub want_logits: bool,
+}
+
+/// Persistent packed metadata. Tensor scratch is shared with reference prefill;
+/// completed rows reuse decode scratch after that iteration's decode has ended.
+struct PackedPrefillScratch {
+    owners: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    final_rows: CudaSlice<i32>,
+    host_tokens: Vec<i32>,
+    host_owners: Vec<i32>,
+    host_positions: Vec<i32>,
+    host_final_rows: Vec<i32>,
+    page_owner: Vec<i32>,
+    selection_kind: Vec<u8>,
+    prepared_shape: Option<(usize, usize)>,
 }
 
 /// Prefill graphs kept at once.
@@ -332,6 +434,7 @@ pub struct GpuModel {
     use_graph: bool,
 
     prefill_scratch: PrefillScratch,
+    packed_prefill: Option<PackedPrefillScratch>,
 
     /// Split-position attention, versus one block per head.
     ///
@@ -453,6 +556,7 @@ impl GpuModel {
                 up: gpu.alloc(capacity * hidden)?,
                 last: gpu.alloc(d)?,
             },
+            packed_prefill: None,
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             // Paging starts switched off and unallocated; `enable_paging`
@@ -534,9 +638,11 @@ impl GpuModel {
     /// because it is the memory budget, and a runtime that quietly grows its
     /// own cache is a runtime that fails at an unpredictable moment.
     pub fn enable_paging(&mut self, n_pages: usize, max_batch: usize) -> Result<()> {
-        if max_batch == 0 {
-            bail!("max_batch must be at least 1");
+        if max_batch == 0 || max_batch > Gpu::GEMV_BATCH_MAX {
+            bail!("max_batch must be in 1..={}", Gpu::GEMV_BATCH_MAX);
         }
+        let batch_rows = max_batch.checked_next_power_of_two()
+            .ok_or_else(|| anyhow::anyhow!("max_batch exceeds representable GEMV capacity"))?;
         // PAGE_TOKENS is duplicated as a compile-time constant in the kernels
         // so translation is a shift rather than a division. If the two ever
         // disagree every paged read silently lands in the wrong page.
@@ -559,16 +665,19 @@ impl GpuModel {
         self.seq_lens = self.gpu.to_device_i32(&self.host_lens.clone())?;
         self.seq = SequencePages::new();
         let d = self.cfg.n_embd;
+        // The batched GEMV reads every row of its 1/2/4/8/16 instantiation,
+        // including inactive accumulators. Keep their inputs in bounds even
+        // when the configured request limit is not a power of two.
         self.batch = Some(BatchScratch {
             tokens: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
             positions: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
-            x: self.gpu.alloc(max_batch * d)?,
-            normed: self.gpu.alloc(max_batch * d)?,
+            x: self.gpu.alloc(batch_rows * d)?,
+            normed: self.gpu.alloc(batch_rows * d)?,
             q: self.gpu.alloc(max_batch * d)?,
             kv: self.gpu.alloc(max_batch * kv_dim)?,
-            attn: self.gpu.alloc(max_batch * d)?,
+            attn: self.gpu.alloc(batch_rows * d)?,
             proj: self.gpu.alloc(max_batch * d)?,
-            gate: self.gpu.alloc(max_batch * self.hidden)?,
+            gate: self.gpu.alloc(batch_rows * self.hidden)?,
             up: self.gpu.alloc(max_batch * self.hidden)?,
             logits: self.gpu.alloc(max_batch * self.cfg.vocab_size)?,
             argmax_ids: self.gpu.to_device_i32(&vec![0i32; max_batch])?,
@@ -576,8 +685,21 @@ impl GpuModel {
             cand_vals: self.gpu.alloc(max_batch * TOPK_MAX)?,
             cand_ids: self.gpu.to_device_i32(&vec![-1i32; max_batch * TOPK_MAX])?,
         });
+        self.packed_prefill = Some(PackedPrefillScratch {
+            owners: self.gpu.to_device_i32(&vec![0; self.capacity])?,
+            positions: self.gpu.to_device_i32(&vec![0; self.capacity])?,
+            final_rows: self.gpu.to_device_i32(&vec![0; max_batch])?,
+            host_tokens: vec![0; self.capacity],
+            host_owners: vec![0; self.capacity],
+            host_positions: vec![0; self.capacity],
+            host_final_rows: vec![0; max_batch],
+            page_owner: vec![-1; n_pages],
+            selection_kind: vec![0; max_batch],
+            prepared_shape: None,
+        });
         // Buffer addresses just changed, so every captured graph is stale.
         self.invalidate_batch_graphs();
+        self.invalidate_prefill_graphs();
         self.batch_graphs = (0..2 * max_batch).map(|_| None).collect();
         self.use_paged = true;
         // A captured contiguous-path graph would replay contiguous kernels.
@@ -604,11 +726,29 @@ impl GpuModel {
     /// The page allocator, so a scheduler can grow and release sequences it
     /// owns. The pool lives here because the device memory it hands out does.
     pub fn page_pool_mut(&mut self) -> &mut PagePool {
+        // A caller may release/reassign any descriptor's pages through this
+        // borrow. A benchmark must prepare again before replaying them.
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
         &mut self.pool
     }
 
     pub fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    pub fn prefill_token_capacity(&self) -> usize {
+        // Attention uses grid.y for actual rows (CUDA's limit is 65535),
+        // while row-wise kernels use signed32 element counts. Internal GEMM
+        // tiles may pad their loads, but no semantic row is padded.
+        let kv_dim = self.cfg.n_kv_head.saturating_mul(self.cfg.head_dim());
+        let widest = self.cfg.n_embd.max(self.hidden).max(kv_dim).max(1);
+        self.capacity.min(65_535).min(i32::MAX as usize / widest)
+    }
+
+    pub fn prefill_request_capacity(&self) -> usize {
+        self.max_batch.min(Gpu::GEMV_BATCH_MAX)
     }
 
     /// Force the tiled GEMM for batched projections instead of GEMV.
@@ -820,39 +960,11 @@ impl GpuModel {
         1 + self.cfg.n_layer * 15 + 2
     }
 
-    /// Whether a batched projection of this shape should use GEMV or the
-    /// tiled GEMM.
-    ///
-    /// Measured, int8, 200 iterations, median of 3, 158 W (speedup = gemm/gemv):
-    ///
-    ///   shape                b1     b2     b4     b8    b16
-    ///   q/o    768x768      4.69   4.02   4.49   3.74   2.96
-    ///   k/v    192x768      3.68   4.19   3.73   2.97   3.09
-    ///   gate/up 2048x768    3.53   3.50   3.92   3.01   2.41
-    ///   down   768x2048     7.87  10.64   7.30   6.35   5.39
-    ///   lm_head 50304x768   7.76   5.56   3.57   1.77   1.00
-    ///
-    /// So the rule is shape-sensitive, because the shapes genuinely differ. The
-    /// per-layer projections have at most 2048 output rows, which gives the
-    /// GEMM only 12-32 blocks at decode M -- it is occupancy-starved and GEMV
-    /// wins across the whole range. The lm_head has 50304 rows, so the GEMM
-    /// already has 786 blocks and is not starved; there GEMV wins only to batch
-    /// 8 and reaches parity by 10.
-    ///
-    /// The lm_head crossover sits on the instantiation boundary rather than
-    /// anywhere physical: a batch of 10 runs the BMAX=16 kernel and pays for six
-    /// accumulators it discards. Finer instantiations would move it, which is a
-    /// reason not to read the constant as fundamental.
-    fn use_gemv(rows: usize, batch: usize) -> bool {
-        /// Below this many output rows, GEMV won at every batch measured.
-        const ROWS_ALWAYS: usize = 4096;
-        /// Above it, only up to this batch. Measured on the lm_head, the one
-        /// shape in this model with more rows than that.
-        const BIG_ROWS_MAX_BATCH: usize = 8;
-        rows <= ROWS_ALWAYS || batch <= BIG_ROWS_MAX_BATCH
-    }
-
-    /// One batched projection, dispatched by measured shape and batch size.
+    /// Keep default int8 decode arithmetic independent of active batch size.
+    /// The former lm_head crossover above eight requests changed f32 GEMV
+    /// activations to half-rounded WMMA inputs, changing generated tokens when
+    /// unrelated requests joined or retired. All supported int8 batches now
+    /// retain GEMV; force_gemm remains an explicit diagnostic comparison.
     fn project_batch(
         gpu: &Gpu,
         w: &Proj,
@@ -866,13 +978,12 @@ impl GpuModel {
     ) -> Result<()> {
         match w {
             Proj::Int8 { data, scales }
-                if !force_gemm && Self::use_gemv(rows, batch) && cols % 4 == 0 =>
+                if !force_gemm && cols % 4 == 0 =>
             {
                 gpu.gemv_batch_i8(data, scales, x, y, rows, cols, batch, accumulate)
             }
-            // f32 weights and the large-batch lm_head keep the GEMM. f32 is not
-            // the production decode path and a second GEMV instantiation family
-            // for it would be untested code.
+            // f32 weights, non-vectorizable widths and explicitly forced
+            // comparisons keep their existing GEMM arithmetic at every batch.
             _ => gpu.gemm(&w.view(), x, y, batch, rows, cols, accumulate),
         }
     }
@@ -896,6 +1007,9 @@ impl GpuModel {
         row_k: &[i32],
     ) -> Result<()> {
         let n = tokens.len();
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
         if !self.use_paged {
             bail!("batched decode requires paging; call enable_paging first");
         }
@@ -1079,7 +1193,13 @@ impl GpuModel {
 
         self.upload_batch(tokens, positions, tables, lens, &row_k)?;
         self.run_decode_batch(n, !topk_rows.is_empty())?;
+        self.read_batch_selection(n, !topk_rows.is_empty(), full_rows)
+    }
 
+    /// Decode and completed prefill rows share the same per-row D2H routing.
+    fn read_batch_selection(
+        &self, n: usize, topk: bool, full_rows: &[usize],
+    ) -> Result<DecodeSelection> {
         let vocab = self.cfg.vocab_size;
         let b = self.batch.as_ref().expect("paging allocates batch scratch");
         let ids: Vec<usize> = self
@@ -1095,7 +1215,7 @@ impl GpuModel {
         // a separate transfer per sampled row: at batch 16 the whole thing is
         // 16 KB, and each extra transfer costs more in launch and
         // synchronisation than the bytes it saves.
-        let (cand_vals, cand_ids) = if topk_rows.is_empty() {
+        let (cand_vals, cand_ids) = if !topk {
             (Vec::new(), Vec::new())
         } else {
             let vals = self.gpu.to_host_n(&b.cand_vals, n * TOPK_MAX)?;
@@ -1277,6 +1397,9 @@ impl GpuModel {
     }
 
     pub fn reset(&mut self) {
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
         self.cache_len = 0;
         if self.use_paged {
             // Releasing on reset is what makes a slot reusable. Leaking here
@@ -1304,6 +1427,9 @@ impl GpuModel {
 
     /// Write this step's scalars into the buffer the kernels read.
     fn set_params(&mut self, token: usize, pos: usize) -> Result<()> {
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
         let kv_dim = self.cfg.n_kv_head * self.cfg.head_dim();
         self.host_params[PARAM_ZERO] = 0;
         self.host_params[PARAM_TOKEN] = token as i32;
@@ -1909,6 +2035,9 @@ impl GpuModel {
     /// Slot 0 is what the single-request paged path and prefill both use; a
     /// batched decode step overwrites every slot anyway.
     fn upload_slot0(&mut self, table: &[i32], len: usize) -> Result<()> {
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
         self.host_tables[..self.table_stride]
             .copy_from_slice(&table[..self.table_stride]);
         self.host_lens[0] = len as i32;
@@ -1960,6 +2089,266 @@ impl GpuModel {
         self.prefill_body_opt(tokens, pos_offset, want_logits)
     }
 
+    /// Consume several independent chunks in one transformer execution. Every
+    /// projection sees M=sum(chunk lengths), while RoPE/KV/attention route by
+    /// the real row's owner and absolute position. Selection rows enumerate
+    /// only `want_logits` descriptors, in descriptor order.
+    ///
+    /// All bounds and page aliases are checked before the first device write.
+    /// The inference thread owns this call through completion: cancellation is
+    /// observed at the next scheduler boundary, never inside this sequence.
+    pub fn prefill_packed(
+        &mut self, chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)], full_rows: &[usize],
+    ) -> Result<DecodeSelection> {
+        let (rows, finals) = self.upload_packed_prefill(chunks, topk_rows, full_rows)?;
+        self.queue_packed_prefill(rows, finals, !topk_rows.is_empty())?;
+        if finals == 0 {
+            // A bounded batch has completed before pages can be cancelled and
+            // recycled. This also keeps non-final execution time honest.
+            self.gpu.sync()?;
+            return Ok(DecodeSelection { ids: Vec::new(), cand_vals: Vec::new(),
+                cand_ids: Vec::new(), full: Vec::new(), d2h_bytes: 0 });
+        }
+        self.read_batch_selection(finals, !topk_rows.is_empty(), full_rows)
+    }
+
+    /// Measured singleton dispatch: reuse the exact reference graph while
+    /// retaining compact first-token selection. The logits transfer below is
+    /// device-to-device into existing scratch, never a full host readback.
+    pub fn prefill_single_mixed(
+        &mut self, chunk: &PackedPrefillRequest<'_>,
+        topk_rows: &[(usize, usize)], full_rows: &[usize],
+    ) -> Result<DecodeSelection> {
+        let (rows, finals) = self.prepare_packed_prefill(
+            std::slice::from_ref(chunk), topk_rows, full_rows)?;
+        let p = self.packed_prefill.as_ref().expect("paging allocates metadata");
+        self.gpu.write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
+        self.gpu.write_i32(&mut self.page_tables, &self.host_tables)?;
+        self.host_params[PARAM_PREFILL_POS] = chunk.pos_offset as i32;
+        self.gpu.write_i32(&mut self.params, &self.host_params)?;
+        // Keep decode's cached row_k contents truthful even for a non-final
+        // slice; a later decode may reuse exactly this sampling composition.
+        self.gpu.write_i32(&mut self.batch.as_mut().expect("paging").row_k, &self.host_row_k)?;
+        self.run_prefill(rows, chunk.want_logits)?;
+        if finals == 0 {
+            self.gpu.sync()?;
+            return Ok(DecodeSelection { ids: Vec::new(), cand_vals: Vec::new(),
+                cand_ids: Vec::new(), full: Vec::new(), d2h_bytes: 0 });
+        }
+        let b = self.batch.as_mut().expect("paging allocates selection scratch");
+        let vocab = self.cfg.vocab_size;
+        self.gpu.copy_rows(&self.scratch.logits.slice(..vocab), &mut b.logits, vocab)?;
+        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, 1, vocab)?;
+        if !topk_rows.is_empty() {
+            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids, 1, vocab)?;
+        }
+        self.read_batch_selection(1, !topk_rows.is_empty(), full_rows)
+    }
+
+    fn prepare_packed_prefill(
+        &mut self, chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)], full_rows: &[usize],
+    ) -> Result<(usize, usize)> {
+        if !self.use_paged {
+            bail!("packed prefill requires paging");
+        }
+        if chunks.is_empty() || chunks.len() > self.prefill_request_capacity() {
+            bail!("packed prefill needs 1..={} requests, got {}",
+                self.prefill_request_capacity(), chunks.len());
+        }
+        let token_capacity = self.prefill_token_capacity();
+        if self.table_stride > i32::MAX as usize {
+            bail!("packed page-table stride exceeds kernel index range");
+        }
+        let p = self.packed_prefill.as_mut().expect("paging allocates packed metadata");
+        p.prepared_shape = None;
+        p.page_owner.fill(-1);
+        p.selection_kind.fill(0);
+        self.host_tables.fill(0);
+        let mut rows = 0usize;
+        let mut finals = 0usize;
+        for (owner, chunk) in chunks.iter().enumerate() {
+            let end = chunk.pos_offset.checked_add(chunk.tokens.len())
+                .ok_or_else(|| anyhow::anyhow!("packed position overflow"))?;
+            let packed_end = rows.checked_add(chunk.tokens.len())
+                .ok_or_else(|| anyhow::anyhow!("packed row count overflow"))?;
+            if chunk.tokens.is_empty() || end > self.capacity || end > i32::MAX as usize
+                || packed_end > token_capacity
+            {
+                bail!("packed chunk/batch exceeds {token_capacity} token capacity or is empty");
+            }
+            if chunk.page_table.len() != self.table_stride {
+                bail!("packed page table must contain {} entries", self.table_stride);
+            }
+            for &page in &chunk.page_table[..end.div_ceil(PAGE_TOKENS)] {
+                if page < 0 || page as usize >= p.page_owner.len() {
+                    bail!("packed page {page} outside the pool");
+                }
+                if p.page_owner[page as usize] != -1 {
+                    bail!("packed page {page} is aliased by multiple logical pages");
+                }
+                p.page_owner[page as usize] = owner as i32;
+            }
+            for (local, &token) in chunk.tokens.iter().enumerate() {
+                if token >= self.cfg.vocab_size || token > i32::MAX as usize {
+                    bail!("packed token {token} outside vocabulary {}", self.cfg.vocab_size);
+                }
+                p.host_tokens[rows + local] = token as i32;
+                p.host_owners[rows + local] = owner as i32;
+                p.host_positions[rows + local] = (chunk.pos_offset + local) as i32;
+            }
+            let start = owner * self.table_stride;
+            self.host_tables[start..start + self.table_stride].copy_from_slice(chunk.page_table);
+            if chunk.want_logits {
+                p.host_final_rows[finals] = (packed_end - 1) as i32;
+                finals += 1;
+            }
+            rows = packed_end;
+        }
+        if finals.checked_mul(self.cfg.vocab_size).is_none_or(|n| n > i32::MAX as usize) {
+            bail!("packed final logits exceed kernel index range");
+        }
+        for &(row, k) in topk_rows {
+            if row >= finals || k == 0 || k > TOPK_MAX {
+                bail!("invalid packed top-k row {row}, k={k}, final rows={finals}");
+            }
+            if p.selection_kind[row] != 0 {
+                bail!("duplicate packed selection row {row}");
+            }
+            p.selection_kind[row] = 1;
+        }
+        for &row in full_rows {
+            if row >= finals || p.selection_kind[row] != 0 {
+                bail!("invalid or duplicate packed full-logit row {row}");
+            }
+            p.selection_kind[row] = 2;
+        }
+        self.host_row_k.fill(0);
+        for &(row, k) in topk_rows {
+            self.host_row_k[row] = k as i32;
+        }
+        Ok((rows, finals))
+    }
+
+    fn upload_packed_prefill(
+        &mut self, chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)], full_rows: &[usize],
+    ) -> Result<(usize, usize)> {
+        let (rows, finals) = self.prepare_packed_prefill(chunks, topk_rows, full_rows)?;
+        let p = self.packed_prefill.as_mut().expect("paging allocates metadata");
+        // Every consumed element is overwritten, including row_k zeros. Stale
+        // capacity beyond these exact launch counts is never semantic input.
+        self.gpu.write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
+        self.gpu.write_i32(&mut p.owners, &p.host_owners[..rows])?;
+        self.gpu.write_i32(&mut p.positions, &p.host_positions[..rows])?;
+        self.gpu.write_i32(&mut self.page_tables, &self.host_tables)?;
+        if finals != 0 {
+            self.gpu.write_i32(&mut p.final_rows, &p.host_final_rows[..finals])?;
+        }
+        self.gpu.write_i32(&mut self.batch.as_mut().expect("paging").row_k, &self.host_row_k)?;
+        p.prepared_shape = Some((rows, finals));
+        Ok((rows, finals))
+    }
+
+    fn queue_packed_prefill(&mut self, rows: usize, finals: usize, topk: bool) -> Result<()> {
+        self.queue_packed_prefill_impl::<false>(rows, finals, topk, None)
+    }
+
+    fn queue_packed_prefill_impl<const PROFILE: bool>(
+        &mut self, rows: usize, finals: usize, topk: bool,
+        mut events: Option<&mut PackedPrefillEvents>,
+    ) -> Result<()> {
+        self.queue_prefill_transformer_impl::<PROFILE>(rows, true, events.as_deref_mut())?;
+        if finals == 0 {
+            return Ok(());
+        }
+        macro_rules! mark {
+            ($name:literal) => {
+                if PROFILE {
+                    events.as_deref_mut().expect("profiling requires events").mark(&self.gpu, $name)?;
+                }
+            };
+        }
+        let b = self.batch.as_mut().expect("paging allocates final-row scratch");
+        let p = self.packed_prefill.as_ref().expect("paging allocates metadata");
+        let d = self.cfg.n_embd;
+        self.gpu.gather_prefill_rows(&self.prefill_scratch.x, &mut b.x, &p.final_rows, finals, d)?;
+        mark!("final_gather");
+        self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, finals, d, NORM_EPS)?;
+        mark!("final_norm");
+        self.gpu.project_final_rows(&self.tok_emb.view(), &b.normed, &mut b.logits,
+            self.cfg.vocab_size, d, finals)?;
+        mark!("final_head");
+        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, finals, self.cfg.vocab_size)?;
+        mark!("argmax");
+        if topk {
+            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids,
+                finals, self.cfg.vocab_size)?;
+            mark!("topk");
+        }
+        Ok(())
+    }
+
+    /// Benchmark-only stage attribution using the exact packed transformer and
+    /// selection queue. Metadata upload and output readback are excluded. CUDA
+    /// events are allocated once before warmup, reused across `iters` complete
+    /// passes, and dropped on return. No event, timer, or allocation is added
+    /// to serving. Event insertion can perturb short stages; compare these
+    /// proportions with the uninstrumented wall/replay timings before acting.
+    pub fn profile_packed_prefill(
+        &mut self, chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)], full_rows: &[usize], iters: usize,
+    ) -> Result<PackedPrefillProfile> {
+        if iters == 0 {
+            bail!("packed profiling needs at least one iteration");
+        }
+        let (rows, finals) = self.upload_packed_prefill(chunks, topk_rows, full_rows)?;
+        // One boundary per GPU operation: embed, 17 per layer, up to five final
+        // operations (including optional top-k). The extra event is the start.
+        let mut events = PackedPrefillEvents::new(&self.gpu, 6 + 17 * self.layers.len())?;
+        // Warm the event records as well as the kernels, outside the samples.
+        self.gpu.sync()?;
+        events.start(&self.gpu)?;
+        self.queue_packed_prefill_impl::<true>(rows, finals, !topk_rows.is_empty(), Some(&mut events))?;
+        self.gpu.sync()?;
+        let mut report = PackedPrefillProfile { stages: Vec::new(), device_milliseconds: 0.0 };
+        for _ in 0..iters {
+            events.start(&self.gpu)?;
+            self.queue_packed_prefill_impl::<true>(rows, finals, !topk_rows.is_empty(), Some(&mut events))?;
+            self.gpu.sync()?;
+            events.accumulate(&mut report, iters)?;
+        }
+        for stage in &mut report.stages {
+            stage.calls /= iters;
+        }
+        Ok(report)
+    }
+
+    /// Benchmark-only graph: metadata must already be prepared by one packed
+    /// call. It is dropped on return and never populates a serving graph cache.
+    /// Capture cost is excluded; this isolates device execution from submission.
+    pub fn time_packed_replay(&mut self, rows: usize, finals: usize, iters: usize) -> Result<f64> {
+        if rows == 0 || rows > self.capacity || finals > self.prefill_request_capacity() || iters == 0 {
+            bail!("invalid packed replay benchmark shape");
+        }
+        if self.packed_prefill.as_ref().and_then(|p| p.prepared_shape) != Some((rows, finals)) {
+            bail!("packed replay requires a just-prepared matching batch");
+        }
+        self.gpu.sync()?;
+        self.gpu.begin_capture()?;
+        let queued = self.queue_packed_prefill(rows, finals, false);
+        let graph = self.gpu.end_capture();
+        queued?;
+        let graph = graph?;
+        for _ in 0..3 { self.gpu.graph_launch(&graph)?; }
+        self.gpu.sync()?;
+        let start = std::time::Instant::now();
+        for _ in 0..iters { self.gpu.graph_launch(&graph)?; }
+        self.gpu.sync()?;
+        Ok(start.elapsed().as_secs_f64() / iters as f64)
+    }
+
     /// The prefill compute itself. Assumes page tables are already uploaded
     /// when paged, and touches neither `self.seq` nor `self.cache_len`.
     ///
@@ -1980,9 +2369,6 @@ impl GpuModel {
         pos_offset: usize,
         want_logits: bool,
     ) -> Result<Vec<f32>> {
-        let cfg = self.cfg.clone();
-        let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
-        let kv_dim = n_kv * hd;
         let t = tokens.len();
 
         let ids: Vec<i32> = tokens.iter().map(|v| *v as i32).collect();
@@ -1995,7 +2381,13 @@ impl GpuModel {
         self.host_params[PARAM_PREFILL_POS] = pos_offset as i32;
         let hp = self.host_params.clone();
         self.gpu.write_i32(&mut self.params, &hp)?;
+        self.run_prefill(t, want_logits)?;
+        self.prefill_result(t, want_logits)
+    }
 
+    /// Queue or replay the shared reference topology without choosing a host
+    /// result representation. Full-logit and compact singleton APIs share it.
+    fn run_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
         // Capture-or-replay, on exactly the sequence eager execution issues.
         // Only the paged path is eligible: the contiguous fallback still takes
         // its offset by value, and it is the legacy single-sequence path.
@@ -2032,11 +2424,10 @@ impl GpuModel {
             if let Some(g) = self.prefill_graphs.get(&key) {
                 self.gpu.graph_launch(g)?;
                 self.prefill_graph_replays += 1;
-                return self.prefill_result(t, want_logits);
+                return Ok(());
             }
         }
-        self.queue_prefill(t, want_logits)?;
-        self.prefill_result(t, want_logits)
+        self.queue_prefill(t, want_logits)
     }
 
     /// Copy back the final position's logits, if this chunk produced any.
@@ -2057,8 +2448,21 @@ impl GpuModel {
     /// -- token ids, page table, sequence length, chunk offset -- is read from
     /// device buffers whose addresses never change, which is what makes a
     /// captured graph valid for a different request of the same shape.
-    fn queue_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
-        let cfg = self.cfg.clone();
+    fn queue_prefill_transformer(&mut self, t: usize, packed: bool) -> Result<()> {
+        self.queue_prefill_transformer_impl::<false>(t, packed, None)
+    }
+
+    fn queue_prefill_transformer_impl<const PROFILE: bool>(
+        &mut self, t: usize, packed: bool, mut events: Option<&mut PackedPrefillEvents>,
+    ) -> Result<()> {
+        macro_rules! mark {
+            ($name:literal) => {
+                if PROFILE {
+                    events.as_deref_mut().expect("profiling requires events").mark(&self.gpu, $name)?;
+                }
+            };
+        }
+        let cfg = &self.cfg;
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
 
@@ -2066,6 +2470,7 @@ impl GpuModel {
             let p = &mut self.prefill_scratch;
             self.gpu.embed_batch(&self.tok_emb.view(), &p.tokens, &mut p.x, t, d)?;
         }
+        mark!("embed");
 
         for (l, layer) in self.layers.iter().enumerate() {
             let layer_base = l * self.capacity * kv_dim;
@@ -2075,32 +2480,65 @@ impl GpuModel {
             let p = &mut self.prefill_scratch;
 
             self.gpu.rmsnorm_batch(&p.x, &layer.attn_norm, &mut p.normed, t, d, NORM_EPS)?;
+            mark!("norm");
 
             // K and V go through a dense [T, kv_dim] buffer and are then placed
             // into the cache, so prefill and decode share one cache layout.
             self.gpu.gemm(&layer.k_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
-            self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
-                                t, n_kv, hd, kv_dim, &self.params)?;
-            if self.use_paged {
+            mark!("qkv_gemm");
+            if packed {
+                let meta = self.packed_prefill.as_ref().expect("packed metadata");
+                self.gpu.rope_rows(&mut p.kv, &self.rope_cos, &self.rope_sin,
+                    &meta.positions, t, n_kv, hd, kv_dim)?;
+            } else {
+                self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
+                    t, n_kv, hd, kv_dim, &self.params)?;
+            }
+            mark!("rope");
+            if packed {
+                let meta = self.packed_prefill.as_ref().expect("packed metadata");
+                self.gpu.cache_store_packed_paged(&p.kv, &mut self.k_pool, &self.page_tables,
+                    &meta.owners, &meta.positions, t, kv_dim, self.table_stride, cfg.n_layer, l)?;
+            } else if self.use_paged {
                 self.gpu.cache_store_paged(&p.kv, &mut self.k_pool, &self.page_tables,
                                            t, kv_dim, cfg.n_layer, l, &self.params)?;
             } else {
                 self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
             }
+            mark!("kv_store");
 
             self.gpu.gemm(&layer.v_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
-            if self.use_paged {
+            mark!("qkv_gemm");
+            if packed {
+                let meta = self.packed_prefill.as_ref().expect("packed metadata");
+                self.gpu.cache_store_packed_paged(&p.kv, &mut self.v_pool, &self.page_tables,
+                    &meta.owners, &meta.positions, t, kv_dim, self.table_stride, cfg.n_layer, l)?;
+            } else if self.use_paged {
                 self.gpu.cache_store_paged(&p.kv, &mut self.v_pool, &self.page_tables,
                                            t, kv_dim, cfg.n_layer, l, &self.params)?;
             } else {
                 self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
             }
+            mark!("kv_store");
 
             self.gpu.gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
-            self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
-                                t, n_head, hd, d, &self.params)?;
+            mark!("qkv_gemm");
+            if packed {
+                let meta = self.packed_prefill.as_ref().expect("packed metadata");
+                self.gpu.rope_rows(&mut p.q, &self.rope_cos, &self.rope_sin,
+                    &meta.positions, t, n_head, hd, d)?;
+            } else {
+                self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
+                    t, n_head, hd, d, &self.params)?;
+            }
+            mark!("rope");
 
-            if self.use_paged {
+            if packed {
+                let meta = self.packed_prefill.as_ref().expect("packed metadata");
+                self.gpu.attention_prefill_packed(&p.q, &self.k_pool, &self.v_pool,
+                    &mut p.attn, &self.page_tables, &meta.owners, &meta.positions,
+                    t, self.table_stride, n_head, n_kv, hd, cfg.n_layer, l, kv_dim, self.capacity)?;
+            } else if self.use_paged {
                 self.gpu.attention_prefill_paged(&p.q, &self.k_pool, &self.v_pool,
                                                  &mut p.attn, &self.page_tables,
                                                  t, n_head, n_kv, hd,
@@ -2111,25 +2549,40 @@ impl GpuModel {
                                            t, n_head, n_kv, hd, self.capacity,
                                            kv_dim, layer_base, pos_offset)?;
             }
+            mark!("attention");
 
             self.gpu.gemm(&layer.o_proj.view(), &p.attn, &mut p.proj, t, d, d, false)?;
+            mark!("o_gemm");
             self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
+            mark!("residual");
 
             self.gpu.rmsnorm_batch(&p.x, &layer.mlp_norm, &mut p.normed, t, d, NORM_EPS)?;
+            mark!("norm");
             match &layer.gate_proj {
                 Some(gate) => {
                     self.gpu.gemm(&gate.view(), &p.normed, &mut p.gate, t, self.hidden, d, false)?;
+                    mark!("ffn_gate_up_gemm");
                     self.gpu.gemm(&layer.up_proj.view(), &p.normed, &mut p.up,
                                   t, self.hidden, d, false)?;
+                    mark!("ffn_gate_up_gemm");
                     self.gpu.swiglu_batch(&mut p.gate, &p.up, t * self.hidden)?;
+                    mark!("swiglu");
                 }
                 None => bail!("the GPU path currently implements swiglu only"),
             }
             self.gpu.gemm(&layer.down_proj.view(), &p.gate, &mut p.proj,
                           t, d, self.hidden, false)?;
+            mark!("down_gemm");
             self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
+            mark!("residual");
         }
 
+        Ok(())
+    }
+
+    fn queue_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
+        self.queue_prefill_transformer(t, false)?;
+        let d = self.cfg.n_embd;
         // Only the last position's logits are needed, so this stays a GEMV over
         // one row rather than a [T, vocab] matrix.
         if !want_logits {
@@ -2140,10 +2593,10 @@ impl GpuModel {
             let last_row = p.x.slice((t - 1) * d..t * d);
             self.gpu.copy_rows(&last_row, &mut self.scratch.normed, d)?;
         }
-        self.gpu.rmsnorm(&self.scratch.normed.clone(), &self.final_norm,
+        self.gpu.rmsnorm(&self.scratch.normed, &self.final_norm,
                          &mut self.scratch.x, d, NORM_EPS)?;
         Self::project_dyn(&self.gpu, &self.tok_emb, &self.scratch.x,
-                          &mut self.scratch.logits, cfg.vocab_size, d,
+                          &mut self.scratch.logits, self.cfg.vocab_size, d,
                           &self.params, 0, PARAM_ZERO, false)?;
         Ok(())
     }

@@ -1,93 +1,37 @@
-//! Continuous-batching runtime: many requests resident at once, entering and
-//! leaving while the others keep decoding.
+//! Continuous batching with a single GPU owner, paged KV and bounded prefill.
 //!
-//! The engine underneath is unchanged -- same weights, same kernels, same
-//! arithmetic. What changes is that a decode step carries one row per active
-//! request instead of one row total, and that a request's KV lives in pages
-//! that can be handed back the moment it finishes.
+//! Admission is FCFS and reserves the maximum pages a request can require,
+//! while physical generation pages still grow lazily. Active plus prefilling
+//! requests never exceed max_batch. Each request owns its pages and RNG;
+//! decoding slots may move without changing request identity.
 //!
-//! # Why this is not "batching"
+//! Packed prefill is enabled by default with an explicit A/B control. A step
+//! admits cheap metadata, decodes existing
+//! streams, executes one token-budgeted prefill plan, then retires completions.
+//! Plans take one bounded slice per request from a round-robin queue. Unfinished
+//! slices rejoin its back; arrivals join there too. A survivor receives work
+//! within R nonempty plans when at most R requests are resident. Real packed
+//! rows, requests per call and optional per-request chunks all have explicit
+//! limits; the CPU-only planner is tested independently of CUDA.
 //!
-//! Static batching runs a fixed group to completion: a batch of four where one
-//! request wants 8 tokens and another wants 300 spends most of its life
-//! computing padding for the request that already finished. Continuous batching
-//! removes a finished request from the batch immediately, reclaims its pages,
-//! and admits a waiting one in its place. Requests never have to start
-//! together, and lengths are never padded to the longest member -- each
-//! request's attention loop is bounded by its own length.
+//! The reference path remains available: monolithic prefill runs before decode,
+//! while opt-in single-request chunking runs after decode. Existing prefill
+//! CUDA graphs remain on for that reference. Packed execution initially uses
+//! eager kernels; it shares transformer arithmetic with the reference.
 //!
-//! # Scheduling policy
-//!
-//! First-come-first-served admission, bounded by two things: `max_batch` slots
-//! and free pages. A request that cannot get pages stays pending rather than
-//! failing, so the pool acts as backpressure instead of an error surface. This
-//! is deliberately the simplest policy that exercises the machinery; anything
-//! cleverer (priorities, preemption, prefix sharing) is a scheduling question,
-//! not a correctness one, and belongs after this is measured.
-//!
-//! # Prefill is scheduled work, not something admission does
-//!
-//! Admission used to prefill the whole prompt inline, so a step that admitted a
-//! 941-token prompt did the entire prefill before any decoding. Every stream
-//! already running felt one gap the size of that prefill: measured at 28.6 ms
-//! against a 0.86 ms median, a 33x stall, and it grew with prompt length.
-//!
-//! So a prompt is now consumed in bounded chunks, and a step looks like:
-//!
-//! ```text
-//! admit    pending -> prefilling   (page allocation only, no GPU work)
-//! decode   one step for every request that already has a token
-//! prefill  at most one chunk for the oldest prefilling request
-//! retire   whoever finished
-//! ```
-//!
-//! Decode goes first because that is the latency being protected. Prefill runs
-//! afterwards and always runs, which is what keeps the two from starving each
-//! other: a decode step is guaranteed before every chunk, and a chunk is
-//! guaranteed after every decode step. There is no tuning knob balancing them
-//! because there is nothing to balance -- the interleave is one-to-one.
-//!
-//! Chunks go to the *oldest* prefilling request until its prompt is consumed,
-//! rather than round-robin. Round-robin would delay every waiting prompt's
-//! first token instead of one of them, which is worse on the metric that
-//! matters: FCFS finishes the request that has already waited longest.
-//!
-//! # Chunking is off by default, and the measurement says why
-//!
-//! It does not pay here. Prefill on this engine costs about **6.6 ms before it
-//! processes a single token** -- TTFT on an idle server is flat at 7.3 ms for
-//! every prompt from 1 to 134 tokens, one decode step included -- because a
-//! prefill is roughly 170 eager kernel launches through twelve layers and,
-//! unlike decode, has no captured CUDA graph. Splitting a prompt multiplies
-//! that fixed cost by the chunk count:
-//!
-//! ```text
-//! 941-token prompt        worst gap    its TTFT   burst-16 aggregate
-//!   monolithic              29.1 ms      31.1 ms         3733 tok/s
-//!   chunk 256               27.7 ms      53.6 ms         2940 tok/s
-//!   chunk 128               21.1 ms      83.8 ms         2329 tok/s
-//!   chunk  64               19.5 ms     140.6 ms         1693 tok/s
-//!   chunk  32               17.5 ms     261.1 ms         1083 tok/s
-//! ```
-//!
-//! The stall shrinks by 1.7x at best and costs 8.4x the time-to-first-token and
-//! two thirds of the throughput to get there. No chunk size wins: below the
-//! ~230-token break-even a chunk is mostly fixed cost, and above it a chunk is
-//! already a large fraction of the prefill it was meant to break up.
-//!
-//! So the machinery ships and the policy does not: `CRUCIBLE_CHUNKED_PREFILL=1`
-//! or `--prefill-chunk-tokens` turns it on for anyone who would rather trade
-//! throughput for a smaller worst-case gap. What would make it pay is removing
-//! the fixed cost rather than working around it -- capturing a CUDA graph for
-//! prefill the way the decode path already does, which is what turned decode's
-//! launch overhead from dominant into negligible. That is a kernel-path change
-//! and deliberately not attempted here.
-
+//! Cancellation is observed between scheduler steps. Once a plan is submitted,
+//! that bounded batch finishes before cancellation is applied. All GPU work
+//! uses the same ordered stream, so pages returned at a boundary cannot be
+//! overwritten by a new owner before earlier work completes. A runtime error
+//! is fatal to its owning server thread; corrupted state is never reused.
 use anyhow::{bail, Result};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use crate::gpu_model::GpuModel;
+use crate::gpu_model::{GpuModel, PackedPrefillRequest};
 use crate::paged::SequencePages;
+use crate::prefill::{request_page_reservation, validate_request, validate_request_identity,
+    PageReservations, PrefillBatchPlan, PrefillBudget, PrefillWork};
 use crate::sampling::{self, GenerationConfig, Rng};
 
 /// Work submitted to the runtime.
@@ -155,6 +99,7 @@ struct Prefilling {
     /// starts here, and this is the `pos_offset` the model is given.
     done: usize,
     config: GenerationConfig,
+    reserved_pages: usize,
 }
 
 /// One resident request.
@@ -166,6 +111,7 @@ struct Active {
     next_token: usize,
     generated: Vec<usize>,
     config: GenerationConfig,
+    reserved_pages: usize,
     /// This request's own RNG.
     ///
     /// Owned by the request, not by the slot: `retire` and `cancel` use
@@ -205,28 +151,48 @@ pub struct StepInfo {
     pub prefill_chunks: usize,
     /// Requests still working through their prompt when the step ended.
     pub prefilling_after: usize,
+    /// Calls, slices and completed prompts, counted without GPU synchronization.
+    pub prefill_batches: usize,
+    pub packed_prefill_batches: usize,
+    pub packed_prefill_tokens: usize,
+    pub prefill_requests: usize,
+    pub prefill_final_rows: usize,
+    pub last_prefill_batch_requests: usize,
+    pub last_prefill_batch_tokens: usize,
+    pub max_prefill_batch_tokens: usize,
+    pub prefill_d2h_bytes: usize,
+    /// Admission completion for this step, sampled only when requests enter.
+    pub admitted_at: Option<Instant>,
+    /// Start of the first model prefill call; absent on decode-only/idle steps.
+    pub prefill_started_at: Option<Instant>,
+    /// CPU plan construction, page descriptors and sampling-route preparation.
+    pub prefill_planning_duration: Duration,
+    /// Host wall time inside model prefill calls, including required transfers.
+    /// This is not a CUDA-event measurement or an exclusive per-request cost.
+    pub prefill_execution_duration: Duration,
 }
 
 pub struct Runtime {
     model: GpuModel,
     active: Vec<Active>,
     /// Requests that hold pages and are partway through their prompt.
-    prefilling: Vec<Prefilling>,
+    prefilling: VecDeque<Prefilling>,
     pending: VecDeque<Request>,
     done: Vec<Completion>,
     step_no: u64,
     max_batch: usize,
-    /// Prompt tokens consumed per scheduling step.
-    ///
-    /// The whole tradeoff lives in this number: smaller chunks interleave more
-    /// finely and disturb running streams less, larger ones keep the
-    /// tensor-core prefill GEMM efficient. Chosen by measurement, overridable
-    /// per server.
+    /// Optional per-request slice cap. The packed aggregate has its own budget.
     prefill_chunk: usize,
-    /// When false -- the default -- a prompt is prefilled whole and before any
-    /// decoding, which is what the runtime has always done. Chunking is the
-    /// opt-in path; see the module docs for the measurement behind that choice.
+    /// Enables the per-request cap. When false, packed work is still bounded
+    /// by the aggregate token budget; the reference consumes whole prompts.
     chunked_prefill: bool,
+    batched_prefill: bool,
+    prefill_token_budget: usize,
+    max_prefill_requests: usize,
+    prefill_plan: PrefillBatchPlan,
+    prefill_tables: Vec<i32>,
+    /// Allocations remain lazy; admission cannot consume reserved decode growth.
+    page_reservations: PageReservations,
 }
 
 /// Prompt tokens per prefill chunk when chunking is enabled.
@@ -235,6 +201,22 @@ pub struct Runtime {
 /// where 256 does not, without the throughput collapse of 32 and 64. It is not
 /// a good default, which is why chunking is off unless asked for.
 pub const DEFAULT_PREFILL_CHUNK: usize = 128;
+/// The measured static budget: combines short prompts without imposing the
+/// repeated small-call cost on an isolated full-context prompt. See README.
+pub const DEFAULT_PREFILL_TOKEN_BUDGET: usize = 1024;
+
+fn env_positive(name: &str, default: usize, capacity: usize) -> Result<usize> {
+    let value = match std::env::var(name) {
+        Ok(v) => v.parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?,
+        Err(std::env::VarError::NotPresent) => default.min(capacity),
+        Err(e) => bail!("could not read {name}: {e}"),
+    };
+    if value == 0 || value > capacity {
+        bail!("{name} must be in 1..={capacity}, got {value}");
+    }
+    Ok(value)
+}
 
 impl Runtime {
     /// `model` must already have paging enabled; the pool it allocated is the
@@ -244,35 +226,45 @@ impl Runtime {
             bail!("runtime requires a model with paging enabled");
         }
         let max_batch = model.max_batch();
+        let capacity = model.prefill_token_capacity();
+        let prefill_chunk = env_positive("CRUCIBLE_PREFILL_CHUNK", DEFAULT_PREFILL_CHUNK, capacity)?;
+        let prefill_token_budget = env_positive(
+            "CRUCIBLE_PREFILL_TOKEN_BUDGET", DEFAULT_PREFILL_TOKEN_BUDGET, capacity)?;
+        let request_capacity = model.prefill_request_capacity();
+        let max_prefill_requests = env_positive("CRUCIBLE_MAX_PREFILL_REQUESTS", request_capacity, request_capacity)?;
+        let prefill_tables = vec![0; max_batch * model.table_stride()];
+        let page_reservations = PageReservations::new(model.page_pool().n_pages());
         Ok(Self {
             model,
-            active: Vec::new(),
-            prefilling: Vec::new(),
+            active: Vec::with_capacity(max_batch),
+            prefilling: VecDeque::with_capacity(max_batch),
             pending: VecDeque::new(),
             done: Vec::new(),
             step_no: 0,
             max_batch,
-            prefill_chunk: std::env::var("CRUCIBLE_PREFILL_CHUNK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|v: &usize| *v > 0)
-                .unwrap_or(DEFAULT_PREFILL_CHUNK),
+            prefill_chunk,
             // Off unless asked for: measured slower on every metric but the
             // worst-case gap, and that one improves by only 1.7x.
             chunked_prefill: std::env::var("CRUCIBLE_CHUNKED_PREFILL").as_deref() == Ok("1"),
+            batched_prefill: std::env::var("CRUCIBLE_BATCHED_PREFILL").as_deref() != Ok("0"),
+            prefill_token_budget,
+            max_prefill_requests,
+            prefill_plan: PrefillBatchPlan::with_capacity(max_batch),
+            prefill_tables,
+            page_reservations,
         })
     }
 
     /// Prompt tokens consumed per step.
     pub fn set_prefill_chunk(&mut self, tokens: usize) {
-        self.prefill_chunk = tokens.max(1);
+        self.prefill_chunk = tokens.clamp(1, self.model.prefill_token_capacity());
     }
 
     pub fn prefill_chunk(&self) -> usize {
         self.prefill_chunk
     }
 
-    /// Turn chunking off, restoring prefill-at-admission. The A/B control.
+    /// Enable the per-request chunk cap; independent of packed execution.
     pub fn set_chunked_prefill(&mut self, on: bool) {
         self.chunked_prefill = on;
     }
@@ -281,13 +273,56 @@ impl Runtime {
         self.chunked_prefill
     }
 
+    pub fn set_batched_prefill(&mut self, on: bool) {
+        self.batched_prefill = on;
+    }
+
+    pub fn batched_prefill(&self) -> bool { self.batched_prefill }
+
+    /// Borrow the most recently executed packed-policy plan without copying it.
+    /// Inspect only when the returned StepInfo has prefill_batches > 0 and
+    /// batched_prefill is enabled; decode-only steps retain the previous plan.
+    pub fn last_prefill_plan(&self) -> &PrefillBatchPlan { &self.prefill_plan }
+
+    pub fn set_prefill_token_budget(&mut self, tokens: usize) -> Result<()> {
+        self.prefill_budget(tokens, self.max_prefill_requests).validate(
+            self.model.prefill_token_capacity(), self.model.prefill_request_capacity())?;
+        self.prefill_token_budget = tokens;
+        Ok(())
+    }
+
+    pub fn prefill_token_budget(&self) -> usize { self.prefill_token_budget }
+
+    pub fn set_max_prefill_requests(&mut self, requests: usize) -> Result<()> {
+        self.prefill_budget(self.prefill_token_budget, requests).validate(
+            self.model.prefill_token_capacity(), self.model.prefill_request_capacity())?;
+        self.max_prefill_requests = requests;
+        Ok(())
+    }
+
+    fn prefill_budget(&self, tokens: usize, requests: usize) -> PrefillBudget {
+        PrefillBudget {
+            tokens,
+            requests,
+            chunk: if self.chunked_prefill { self.prefill_chunk } else { self.model.prefill_token_capacity() },
+        }
+    }
+
     /// Requests holding pages but not yet decoding.
     pub fn prefilling_len(&self) -> usize {
         self.prefilling.len()
     }
 
-    pub fn submit(&mut self, req: Request) {
+    /// Reject malformed work and duplicate live identity before queue or KV
+    /// state changes. A rejected caller cannot invalidate neighboring requests.
+    pub fn submit(&mut self, req: Request) -> Result<()> {
+        validate_request(&req.prompt, &req.config, self.model.cfg.vocab_size,
+            self.model.prefill_token_capacity(), self.model.page_pool().n_pages())?;
+        validate_request_identity(req.id, self.pending.iter().map(|r| r.id)
+            .chain(self.prefilling.iter().map(|r| r.id))
+            .chain(self.active.iter().map(|r| r.id)))?;
         self.pending.push_back(req);
+        Ok(())
     }
 
     pub fn active_len(&self) -> usize {
@@ -344,13 +379,21 @@ impl Runtime {
         // that accepts a long prompt costs the same as one that accepts a short
         // one. The prompt itself is consumed below, in bounded pieces.
         info.admitted = self.admit()?;
+        if !info.admitted.is_empty() {
+            info.admitted_at = Some(Instant::now());
+        }
 
         // Monolithic control path: prompts are consumed whole, before any
         // decoding, which is what the runtime did before chunking.
-        if !self.chunked_prefill {
-            let (t, c) = self.advance_prefill(&mut info.tokens, usize::MAX)?;
+        if !self.chunked_prefill && !self.batched_prefill {
+            let (t, c) = self.advance_prefill(&mut info, usize::MAX)?;
             info.prefill_tokens += t;
             info.prefill_chunks += c;
+            info.prefill_batches += c;
+            info.prefill_requests += c;
+            // A first token can complete a request. Do not decode it a second
+            // time when max_tokens=1, including on the preserved reference path.
+            info.finished.extend(self.retire()?);
         }
 
         if !self.active.is_empty() {
@@ -362,13 +405,17 @@ impl Runtime {
         // Decode first, then exactly one bounded chunk. A decode step is
         // guaranteed before every chunk and a chunk after every decode step, so
         // neither class can starve the other and there is no ratio to tune.
-        if self.chunked_prefill {
-            let (t, c) = self.advance_prefill(&mut info.tokens, self.prefill_chunk)?;
+        if self.batched_prefill {
+            self.advance_packed_prefill(&mut info)?;
+        } else if self.chunked_prefill {
+            let (t, c) = self.advance_prefill(&mut info, self.prefill_chunk)?;
             info.prefill_tokens += t;
             info.prefill_chunks += c;
+            info.prefill_batches += c;
+            info.prefill_requests += c;
         }
 
-        info.finished = self.retire()?;
+        info.finished.extend(self.retire()?);
 
         info.prefilling_after = self.prefilling.len();
         info.active_after = self.active.len();
@@ -402,8 +449,15 @@ impl Runtime {
                 bail!("request {} has an empty prompt", req.id);
             }
 
+            let reservation = request_page_reservation(
+                req.prompt.len(), req.config.max_tokens, self.model.prefill_token_capacity())?;
+            if !self.page_reservations.try_reserve(reservation)? {
+                break;
+            }
+
             let mut seq = SequencePages::new();
             if seq.grow(self.model.page_pool_mut(), req.prompt.len()).is_err() {
+                self.page_reservations.release(reservation)?;
                 // Not enough pages right now. Leave it queued; a retirement
                 // later this step or next will free some.
                 break;
@@ -411,12 +465,13 @@ impl Runtime {
 
             let req = self.pending.pop_front().expect("front checked above");
             admitted.push(req.id);
-            self.prefilling.push(Prefilling {
+            self.prefilling.push_back(Prefilling {
                 id: req.id,
                 seq,
                 prompt: req.prompt,
                 done: 0,
                 config: req.config,
+                reserved_pages: reservation,
             });
         }
         Ok(admitted)
@@ -436,7 +491,7 @@ impl Runtime {
     /// boundaries fall, the cache it produces does not depend on them.
     fn advance_prefill(
         &mut self,
-        produced: &mut Vec<(u64, usize)>,
+        info: &mut StepInfo,
         budget: usize,
     ) -> Result<(usize, usize)> {
         let mut tokens = 0usize;
@@ -446,7 +501,7 @@ impl Runtime {
         // One chunk per call in the chunked policy; the control path passes an
         // unbounded budget and loops until the prompt is gone.
         loop {
-            let Some(p) = self.prefilling.first() else { break };
+            let Some(p) = self.prefilling.front() else { break };
             let remaining = p.prompt.len() - p.done;
             let take = remaining.min(budget.max(1));
             let last = take == remaining;
@@ -461,10 +516,16 @@ impl Runtime {
             };
             // Only the last chunk's logits become a token; earlier ones skip
             // the lm_head projection and its device-to-host copy entirely.
+            let started = Instant::now();
+            info.prefill_started_at.get_or_insert(started);
             let logits = self.model.prefill_chunk(&chunk, &table, done, last)?;
+            info.prefill_execution_duration += started.elapsed();
 
             tokens += take;
             chunks += 1;
+            info.last_prefill_batch_requests = 1;
+            info.last_prefill_batch_tokens = take;
+            info.max_prefill_batch_tokens = info.max_prefill_batch_tokens.max(take);
             self.prefilling[0].done += take;
 
             if !last {
@@ -478,10 +539,12 @@ impl Runtime {
             // first token, and its RNG is created here and used immediately --
             // the first sampled token draws the first random number, exactly as
             // running alone would.
-            let p = self.prefilling.remove(0);
+            let p = self.prefilling.pop_front().expect("prefill front was executed");
             let mut rng = Rng::new(p.config.seed);
             let first = sampling::sample(&logits, &p.config, &mut rng);
-            produced.push((id, first));
+            info.tokens.push((id, first));
+            info.prefill_final_rows += 1;
+            info.prefill_d2h_bytes += logits.len() * std::mem::size_of::<f32>();
             self.active.push(Active {
                 id: p.id,
                 seq: p.seq,
@@ -489,6 +552,7 @@ impl Runtime {
                 next_token: first,
                 generated: vec![first],
                 config: p.config,
+                reserved_pages: p.reserved_pages,
                 rng,
             });
             if budget == usize::MAX {
@@ -497,6 +561,126 @@ impl Runtime {
             break;
         }
         Ok((tokens, chunks))
+    }
+
+    /// Execute one round-robin plan. Cancellation is observed before a step;
+    /// once this plan exists it completes as one bounded unit. No page or queue
+    /// mutation occurs between descriptor construction and the GPU submission.
+    fn advance_packed_prefill(&mut self, info: &mut StepInfo) -> Result<()> {
+        if self.prefilling.is_empty() {
+            return Ok(());
+        }
+        let planning_started = Instant::now();
+        let budget = self.prefill_budget(self.prefill_token_budget, self.max_prefill_requests);
+        self.prefill_plan.build(self.prefilling.iter().map(|p| PrefillWork {
+            request_id: p.id,
+            prompt_len: p.prompt.len(),
+            done: p.done,
+        }), budget)?;
+        let stride = self.model.table_stride();
+        let count = self.prefill_plan.slices.len();
+        self.prefill_tables[..count * stride].fill(0);
+        let mut topk_rows = Vec::with_capacity(self.prefill_plan.final_rows);
+        let mut full_rows = Vec::with_capacity(self.prefill_plan.final_rows);
+        let mut final_row = 0;
+        let vocab = self.model.cfg.vocab_size;
+        let cap = self.model.topk_capacity();
+        let device_topk = self.model.device_topk();
+        for (i, (p, slice)) in self.prefilling.iter().zip(&self.prefill_plan.slices).enumerate() {
+            if p.id != slice.request_id || p.done != slice.prompt_start {
+                bail!("prefill plan no longer matches request {}", slice.request_id);
+            }
+            let table = &mut self.prefill_tables[i * stride..(i + 1) * stride];
+            for (out, page) in table.iter_mut().zip(p.seq.pages()) { *out = *page as i32; }
+            if slice.is_final {
+                if !p.config.is_greedy() {
+                    let k = p.config.top_k.clamp(1, vocab);
+                    if device_topk && k <= cap { topk_rows.push((final_row, k)); }
+                    else { full_rows.push(final_row); }
+                }
+                final_row += 1;
+            }
+        }
+        // Token data is borrowed from resident prompts. Only the small array
+        // of request views is temporary; token and page metadata capacity is
+        // persistent, and the GPU owns all its scratch allocations.
+        let chunks: Vec<_> = self.prefilling.iter().zip(&self.prefill_plan.slices)
+            .enumerate().map(|(i, (p, slice))| PackedPrefillRequest {
+                tokens: &p.prompt[slice.prompt_start..slice.prompt_start + slice.len],
+                page_table: &self.prefill_tables[i * stride..(i + 1) * stride],
+                pos_offset: slice.prompt_start,
+                want_logits: slice.is_final,
+            }).collect();
+        // Paired measurements put the crossover at two requests: a singleton
+        // benefits from the existing exact-length graph, while two or more
+        // requests amortize the transformer over their combined token rows.
+        let packed = count > 1;
+        let started = Instant::now();
+        info.prefill_planning_duration = started.duration_since(planning_started);
+        info.prefill_started_at = Some(started);
+        let selection = if packed {
+            self.model.prefill_packed(&chunks, &topk_rows, &full_rows)?
+        } else {
+            self.model.prefill_single_mixed(&chunks[0], &topk_rows, &full_rows)?
+        };
+        info.prefill_execution_duration = started.elapsed();
+        drop(chunks);
+
+        final_row = 0;
+        let mut full_index = 0;
+        for slice in &self.prefill_plan.slices {
+            let mut p = self.prefilling.pop_front().expect("one queue entry per planned slice");
+            debug_assert_eq!(p.id, slice.request_id);
+            p.done += slice.len;
+            if !slice.is_final {
+                self.prefilling.push_back(p);
+                continue;
+            }
+            let mut rng = Rng::new(p.config.seed);
+            let first = if p.config.is_greedy() {
+                selection.ids[final_row]
+            } else if full_rows.get(full_index) == Some(&final_row) {
+                let base = full_index * vocab;
+                full_index += 1;
+                sampling::sample(&selection.full[base..base + vocab], &p.config, &mut rng)
+            } else {
+                let k = p.config.top_k.clamp(1, vocab);
+                let base = final_row * cap;
+                let mut candidates = Vec::with_capacity(k);
+                for j in 0..k {
+                    let id = selection.cand_ids[base + j];
+                    if id < 0 { bail!("packed top-k returned fewer than {k} candidates for request {}", p.id); }
+                    candidates.push((id as usize, selection.cand_vals[base + j]));
+                }
+                sampling::sample_candidates(&candidates, &p.config, &mut rng)
+            };
+            info.tokens.push((p.id, first));
+            self.active.push(Active {
+                id: p.id,
+                seq: p.seq,
+                prompt_len: p.prompt.len(),
+                next_token: first,
+                generated: vec![first],
+                config: p.config,
+                reserved_pages: p.reserved_pages,
+                rng,
+            });
+            final_row += 1;
+        }
+        info.prefill_tokens += self.prefill_plan.tokens;
+        info.prefill_chunks += count;
+        info.prefill_batches += 1;
+        info.packed_prefill_batches += usize::from(packed);
+        if packed {
+            info.packed_prefill_tokens += self.prefill_plan.tokens;
+        }
+        info.prefill_requests += count;
+        info.prefill_final_rows += self.prefill_plan.final_rows;
+        info.last_prefill_batch_requests = count;
+        info.last_prefill_batch_tokens = self.prefill_plan.tokens;
+        info.max_prefill_batch_tokens = self.prefill_plan.tokens;
+        info.prefill_d2h_bytes += selection.d2h_bytes;
+        Ok(())
     }
 
     /// One batched decode step across every active request.
@@ -621,6 +805,7 @@ impl Runtime {
             if self.active[i].generated.len() >= self.active[i].config.max_tokens {
                 let mut a = self.active.swap_remove(i);
                 a.seq.release(self.model.page_pool_mut())?;
+                self.page_reservations.release(a.reserved_pages)?;
                 finished.push(a.id);
                 self.done.push(Completion {
                     id: a.id,
@@ -656,8 +841,9 @@ impl Runtime {
         // the same call, so a client that leaves mid-prefill costs exactly the
         // work already done and nothing more.
         if let Some(pos) = self.prefilling.iter().position(|p| p.id == id) {
-            let mut p = self.prefilling.remove(pos);
+            let mut p = self.prefilling.remove(pos).expect("position found above");
             p.seq.release(self.model.page_pool_mut())?;
+            self.page_reservations.release(p.reserved_pages)?;
             self.done.push(Completion {
                 id: p.id,
                 prompt_len: p.prompt.len(),
@@ -670,6 +856,7 @@ impl Runtime {
         if let Some(pos) = self.active.iter().position(|a| a.id == id) {
             let mut a = self.active.swap_remove(pos);
             a.seq.release(self.model.page_pool_mut())?;
+            self.page_reservations.release(a.reserved_pages)?;
             self.done.push(Completion {
                 id: a.id,
                 prompt_len: a.prompt_len,

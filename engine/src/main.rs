@@ -3,6 +3,11 @@ use clap::{Parser, Subcommand};
 use llm_engine::{Config, Tokenizer, Weights};
 use std::path::PathBuf;
 
+#[cfg(feature = "cuda")]
+mod gpu_packed_validation;
+#[cfg(feature = "cuda")]
+mod gpu_prefill_trace;
+
 #[derive(Parser)]
 #[command(name = "llm-engine", about = "Inference engine for locally trained models")]
 struct Cli {
@@ -146,6 +151,13 @@ enum Command {
         /// chunk-size table in the README.
         #[arg(long)]
         prefill_chunk_tokens: Option<usize>,
+        /// Maximum real prompt rows in one packed prefill call.
+        /// Packing is enabled by default; bounded by model context capacity.
+        #[arg(long)]
+        prefill_token_budget: Option<usize>,
+        /// Maximum requests contributing a slice to one packed prefill call.
+        #[arg(long)]
+        max_prefill_requests: Option<usize>,
         /// Public model id for the OpenAI-compatible endpoints.
         ///
         /// Published by /v1/models and echoed in every compatibility response.
@@ -187,6 +199,50 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         iters: usize,
         #[arg(long, default_value_t = 5)]
+        trials: usize,
+    },
+    /// Adversarial cross-request packed prefill against independent requests.
+    #[cfg(feature = "cuda")]
+    GpuPackedPrefillCheck {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value_t = 16)]
+        steps: usize,
+        #[arg(long, default_value_t = 12)]
+        fuzz: usize,
+    },
+    /// Paired serial/packed prefill scaling, exact GEMM rows and GPU replay.
+    #[cfg(feature = "cuda")]
+    GpuPackedPrefillBench {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value_t = 15)]
+        iters: usize,
+        #[arg(long, default_value = "1,2,3,4,8,16")]
+        batches: String,
+        #[arg(long, default_value = "1,8,16,32,64,128,256")]
+        chunks: String,
+        /// Execute only packed work, for profiler traces.
+        #[arg(long)]
+        packed_only: bool,
+    },
+    /// Opt-in mixed-request runtime timing decomposition and plan trace.
+    #[cfg(feature = "cuda")]
+    GpuPrefillTrace {
+        model: PathBuf,
+        #[arg(long, default_value = "int8")]
+        quant: String,
+        #[arg(long, default_value = "8,17,33,64,127,256,512,941")]
+        lengths: String,
+        #[arg(long, default_value_t = 64)]
+        steps: usize,
+        #[arg(long, default_value_t = 16)]
+        max_batch: usize,
+        #[arg(long)]
+        budget: Option<usize>,
+        #[arg(long, default_value_t = 3)]
         trials: usize,
     },
     /// Where a prefill's time goes: submission, execution, or the logits copy.
@@ -429,6 +485,8 @@ fn main() -> Result<()> {
             kv_pages,
             model_id,
             prefill_chunk_tokens,
+            prefill_token_budget,
+            max_prefill_requests,
         } => {
             use llm_engine::paged::PAGE_TOKENS;
             use llm_engine::server::{serve, Limits, ServeOptions};
@@ -448,6 +506,8 @@ fn main() -> Result<()> {
                 kv_pages: pages,
                 model_id,
                 prefill_chunk: prefill_chunk_tokens,
+                prefill_token_budget,
+                max_prefill_requests,
                 limits: Limits {
                     max_batch,
                     max_queue,
@@ -466,8 +526,20 @@ fn main() -> Result<()> {
             gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
         }
         #[cfg(feature = "cuda")]
+        Command::GpuPackedPrefillCheck { model, quant, steps, fuzz } => {
+            gpu_packed_validation::check(model, &quant, steps, fuzz)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPackedPrefillBench { model, quant, iters, batches, chunks, packed_only } => {
+            gpu_packed_validation::bench(model, &quant, iters, &batches, &chunks, packed_only)
+        }
+        #[cfg(feature = "cuda")]
         Command::GpuPrefillBench { model, quant, lengths, iters } => {
             gpu_prefill_bench(model, &quant, &lengths, iters)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPrefillTrace { model, quant, lengths, steps, max_batch, budget, trials } => {
+            gpu_prefill_trace::trace(model, &quant, &lengths, steps, max_batch, budget, trials)
         }
         #[cfg(feature = "cuda")]
         Command::GpuPrefillGraphCheck { model, quant, lengths, chunks, steps } => {
@@ -1142,6 +1214,10 @@ fn gpu_sample_bench(
     model.enable_paging(pages, max_n)?;
     let vocab = cfg.vocab_size;
     let mut rt = Runtime::new(model)?;
+    // Prefill policy is outside this decode-only comparison. Finish all prompts
+    // in the untimed admission step regardless of serving environment flags.
+    rt.set_batched_prefill(false);
+    rt.set_chunked_prefill(false);
 
     println!("gpu        {}", envelope());
     println!("workload   prompts {lens:?} cycled, {steps} tokens, {trials} trials");
@@ -1189,7 +1265,7 @@ fn gpu_sample_bench(
                         id: i as u64,
                         prompt: probe_tokens(lens[i % lens.len()], vocab),
                         config,
-                    });
+                    })?;
                 }
                 rt.step()?; // admission + prefill, not timed as decode
                 let t0 = Instant::now();
@@ -1211,7 +1287,9 @@ fn gpu_sample_bench(
             }
             secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let t = secs[secs.len() / 2];
-            let decode_steps = (steps - 1) as f64;
+            // The untimed legacy admission step also generates one decode
+            // token after the first prefill token.
+            let decode_steps = steps.saturating_sub(2) as f64;
             let agg = n as f64 * decode_steps / t;
             if label == "greedy" {
                 greedy_agg = agg;
@@ -1521,13 +1599,14 @@ fn gpu_prefill_graph_check(
         m.enable_paging(pages, 8)?;
         m.set_prefill_graph(graph);
         let mut rt = Runtime::new(m)?;
+        rt.set_batched_prefill(false);
         rt.set_chunked_prefill(chunked);
         rt.set_prefill_chunk(chunk.max(1));
         Ok(rt)
     };
     let run = |rt: &mut Runtime, id: u64, prompt: &[usize], config: GenerationConfig|
      -> Result<Vec<usize>> {
-        rt.submit(Request { id, prompt: prompt.to_vec(), config });
+        rt.submit(Request { id, prompt: prompt.to_vec(), config })?;
         rt.run_to_completion(steps * 8 + 64)?;
         Ok(rt.completed().pop().expect("one completion").tokens)
     };
@@ -1630,7 +1709,7 @@ fn gpu_prefill_graph_check(
         // Cancel a request mid-prefill between reuses, so the next one inherits
         // a pool that has been released and re-taken.
         rt.submit(Request { id: 500 + i, prompt: prompt.clone(),
-                            config: GenerationConfig::greedy(steps) });
+                            config: GenerationConfig::greedy(steps) })?;
         rt.step()?;
         rt.cancel(500 + i)?;
         let _ = rt.completed();
@@ -1717,6 +1796,7 @@ fn gpu_prefill_check(
         let mut m = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
         m.enable_paging(pages, 8)?;
         let mut rt = Runtime::new(m)?;
+        rt.set_batched_prefill(false);
         rt.set_chunked_prefill(chunked);
         rt.set_prefill_chunk(chunk);
         Ok(rt)
@@ -1725,7 +1805,7 @@ fn gpu_prefill_check(
     // One request at a time, so the only variable is where the prompt was cut.
     let run_one = |rt: &mut Runtime, prompt: &[usize], config: GenerationConfig|
      -> Result<Vec<usize>> {
-        rt.submit(Request { id: 0, prompt: prompt.to_vec(), config });
+        rt.submit(Request { id: 0, prompt: prompt.to_vec(), config })?;
         rt.run_to_completion(steps * 8 + 64)?;
         Ok(rt.completed().pop().expect("one completion").tokens)
     };
@@ -1795,13 +1875,13 @@ fn gpu_prefill_check(
     let solo = run_one(&mut rt, &solo_prompt, solo_cfg.clone())?;
 
     let mut rt = build(true, 128)?;
-    rt.submit(Request { id: 0, prompt: solo_prompt.clone(), config: solo_cfg });
+    rt.submit(Request { id: 0, prompt: solo_prompt.clone(), config: solo_cfg })?;
     for i in 1..6u64 {
         rt.submit(Request {
             id: i,
             prompt: probe_tokens(120 * i as usize + 37, cfg.vocab_size),
             config: GenerationConfig::greedy(steps),
-        });
+        })?;
     }
     rt.run_to_completion(steps * 16 + 256)?;
     let mut done = rt.completed();
@@ -1828,7 +1908,7 @@ fn gpu_prefill_check(
                                    ("one chunk before the end", 4)] {
         let mut rt = build(true, 128)?;
         let total = rt.model().page_pool().n_pages();
-        rt.submit(Request { id: 900, prompt: long.clone(), config: GenerationConfig::greedy(steps) });
+        rt.submit(Request { id: 900, prompt: long.clone(), config: GenerationConfig::greedy(steps) })?;
         for _ in 0..chunks_before {
             rt.step()?;
         }
@@ -1837,7 +1917,7 @@ fn gpu_prefill_check(
         let _ = rt.completed();
         // The pages must come back, and the runtime must still work afterwards.
         let freed = rt.free_pages() == total;
-        rt.submit(Request { id: 901, prompt: long.clone(), config: GenerationConfig::greedy(steps) });
+        rt.submit(Request { id: 901, prompt: long.clone(), config: GenerationConfig::greedy(steps) })?;
         rt.run_to_completion(steps * 16 + 256)?;
         let reused = rt.completed().pop().map(|c| c.tokens.len()) == Some(steps);
         let clean = rt.free_pages() == total;
@@ -1913,7 +1993,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
                 id: i as u64,
                 prompt: prompt.clone(),
                 config: specs[i].1.clone(),
-            });
+            })?;
             rt.run_to_completion(steps * 4 + 16)?;
             let mut c = rt.completed();
             c.sort_by_key(|x| x.id);
@@ -1960,7 +2040,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
                 id: i as u64,
                 prompt: prompt.clone(),
                 config: specs[i].1.clone(),
-            });
+            })?;
         }
         rt.run_to_completion(steps * 8 + 32)?;
         let mut together = rt.completed();
@@ -1999,7 +2079,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
                     id: i as u64,
                     prompt: prompts[i].clone(),
                     config: specs[i].1.clone(),
-                });
+                })?;
             }
             if rt.is_idle() && pending.is_empty() {
                 break;
@@ -2026,7 +2106,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
             id: 900,
             prompt: prompts[victim].clone(),
             config: specs[victim].1.clone(),
-        });
+        })?;
         rt.step()?;
         rt.step()?;
         rt.cancel(900)?;
@@ -2035,7 +2115,7 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
             id: 901,
             prompt: prompts[victim].clone(),
             config: specs[victim].1.clone(),
-        });
+        })?;
         rt.run_to_completion(steps * 4 + 16)?;
         let after = rt.completed().pop().expect("one completion").tokens;
         let ok = after == alone[victim];
@@ -2462,6 +2542,8 @@ fn gpu_serve_bench(
 
     let mut rt = Runtime::new(model)?;
     let mem_before = gpu_mem_used_mb();
+    rt.set_batched_prefill(false);
+    rt.set_chunked_prefill(false);
     let mut step_ms: Vec<f64> = Vec::new();
     for &n in &sizes {
         // Full-logit and device-argmax trials are interleaved, not run in
@@ -2484,7 +2566,7 @@ fn gpu_serve_bench(
                         id: i as u64,
                         prompt: probe_tokens(lens[i % lens.len()], cfg.vocab_size),
                         config: llm_engine::sampling::GenerationConfig::greedy(steps),
-                    });
+                    })?;
                 }
                 // Admission prefills; time only the decode steps, so prompt
                 // processing is not counted as decode throughput.
@@ -2520,7 +2602,8 @@ fn gpu_serve_bench(
         let sp = spread(&secs[0]).max(spread(&secs[1]));
         let t_logits = med(&mut secs[0]);
         let t_argmax = med(&mut secs[1]);
-        let decode_steps = (steps - 1) as f64;
+        // Admission above includes both prefill and the first decode step.
+        let decode_steps = steps.saturating_sub(2) as f64;
         let agg_logits = n as f64 * decode_steps / t_logits;
         let agg_argmax = n as f64 * decode_steps / t_argmax;
         let per_argmax = decode_steps / t_argmax;
@@ -2678,7 +2761,7 @@ fn gpu_batch(
                 id: i as u64,
                 prompt: prompt.clone(),
                 config: llm_engine::sampling::GenerationConfig::greedy(steps),
-            });
+            })?;
             solo_rt.run_to_completion(steps * 4 + 16)?;
             let mut c = solo_rt.completed();
             c.sort_by_key(|x| x.id);
@@ -2730,7 +2813,7 @@ fn gpu_batch(
             id: i as u64,
             prompt: prompt.clone(),
             config: llm_engine::sampling::GenerationConfig::greedy(steps),
-        });
+        })?;
     }
     let all_at_once = rt.run_to_completion(steps * 4 + 16)?;
     let mut got = rt.completed();
@@ -2800,7 +2883,7 @@ fn gpu_batch(
                 id: id as u64,
                 prompt: prompts[id].clone(),
                 config: llm_engine::sampling::GenerationConfig::greedy(steps),
-            });
+            })?;
         }
         if rt.is_idle() && pending.is_empty() {
             break;

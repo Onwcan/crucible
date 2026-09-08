@@ -1838,8 +1838,10 @@ extern "C" __global__ void attention_decode_paged_f32(
     }
 }
 
-// Causal prefill attention over paged KV, one block per (head, prompt row).
-extern "C" __global__ void attention_prefill_paged_f32(
+// Both prefill entry points use exactly this reduction and value accumulation.
+// Only row ownership/position plumbing differs; changing packed neighbors must
+// never change a request's causal history or its floating-point order.
+__device__ __forceinline__ void attention_prefill_paged_impl(
     const float* __restrict__ q,            // [T, n_head * head_dim]
     const float* __restrict__ k_pool,
     const float* __restrict__ v_pool,
@@ -1851,20 +1853,14 @@ extern "C" __global__ void attention_prefill_paged_f32(
     const int n_layer,
     const int layer,
     const int kv_dim,
-    // Read from the parameter buffer rather than taken by value: a captured
-    // CUDA graph freezes kernel arguments, and a chunk's offset into its own
-    // prompt changes on every replay. Same reason the decode path reads its
-    // positions from device memory.
-    const int* __restrict__ params)
+    const int seq_len)
 {
-    const int pos_offset = params[PARAM_PREFILL_POS];
     extern __shared__ float scores[];
 
     const int h = blockIdx.x;
     const int row = blockIdx.y;
     if (h >= n_head) return;
 
-    const int seq_len = pos_offset + row + 1;   // causal: 0..=this position
     const int n_rep = n_head / n_kv_head;
     const int kv_h = h / n_rep;
     const float* qh = q + (size_t)row * n_head * head_dim + h * head_dim;
@@ -1927,6 +1923,97 @@ extern "C" __global__ void attention_prefill_paged_f32(
         dst[d] = acc * ssum;
     }
 }
+
+extern "C" __global__ void attention_prefill_paged_f32(
+    const float* q, const float* k_pool, const float* v_pool, float* out,
+    const int* page_table, const int n_head, const int n_kv_head,
+    const int head_dim, const int n_layer, const int layer, const int kv_dim,
+    const int* params)
+{
+    attention_prefill_paged_impl(q, k_pool, v_pool, out, page_table,
+        n_head, n_kv_head, head_dim, n_layer, layer, kv_dim,
+        params[PARAM_PREFILL_POS] + blockIdx.y + 1);
+}
+
+extern "C" __global__ void attention_prefill_packed_f32(
+    const float* q, const float* k_pool, const float* v_pool, float* out,
+    const int* page_tables, const int* row_request, const int* positions,
+    const int table_stride, const int n_head, const int n_kv_head,
+    const int head_dim, const int n_layer, const int layer, const int kv_dim)
+{
+    const int row = blockIdx.y;
+    const int* table = page_tables + (size_t)row_request[row] * table_stride;
+    attention_prefill_paged_impl(q, k_pool, v_pool, out, table,
+        n_head, n_kv_head, head_dim, n_layer, layer, kv_dim, positions[row] + 1);
+}
+
+// One owner and absolute position per real row. Tables stay per request rather
+// than being replicated for every token. No padding row reaches this kernel.
+extern "C" __global__ void cache_store_packed_paged_f32(
+    const float* src, float* pool, const int* page_tables,
+    const int* row_request, const int* positions, const int rows,
+    const int kv_dim, const int table_stride, const int n_layer, const int layer)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * kv_dim) return;
+    const int row = i / kv_dim;
+    const int pos = positions[row];
+    const int page = page_tables[(size_t)row_request[row] * table_stride
+                                + (pos >> PAGE_SHIFT)];
+    pool[paged_offset(page, pos & PAGE_MASK, n_layer, layer, kv_dim) + i % kv_dim] = src[i];
+}
+
+extern "C" __global__ void gather_prefill_rows_f32(
+    const float* src, float* dst, const int* final_rows, const int rows, const int width)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * width) dst[i] = src[(size_t)final_rows[i / width] * width + i % width];
+}
+
+// Exact standalone block-GEMV arithmetic for the f32 path and int8 widths
+// that do not use the existing warp-GEMV. grid.y aggregates final rows in one
+// launch without switching to half-converting WMMA when composition changes.
+template <bool I8>
+__device__ __forceinline__ void gemv_final_rows_impl(
+    const float* wf, const signed char* w8, const float* scales,
+    const float* x, float* y, const int rows, const int cols)
+{
+    const int row = blockIdx.x;
+    const int batch = blockIdx.y;
+    if (row >= rows) return;
+    const float* xr = x + (size_t)batch * cols;
+    float acc = 0.0f;
+    if (cols % 4 == 0) {
+        const float4* x4 = reinterpret_cast<const float4*>(xr);
+        for (int i = threadIdx.x; i < cols / 4; i += blockDim.x) {
+            const float4 b = x4[i];
+            if (I8) {
+                const char4 a = reinterpret_cast<const char4*>(w8 + (size_t)row * cols)[i];
+                acc += (float)a.x * b.x + (float)a.y * b.y
+                     + (float)a.z * b.z + (float)a.w * b.w;
+            } else {
+                const float4 a = reinterpret_cast<const float4*>(wf + (size_t)row * cols)[i];
+                acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+            const size_t o = (size_t)row * cols + i;
+            acc += (I8 ? (float)w8[o] : wf[o]) * xr[i];
+        }
+    }
+    acc = block_reduce_sum(acc);
+    if (threadIdx.x == 0) y[(size_t)batch * rows + row] = I8 ? acc * scales[row] : acc;
+}
+
+extern "C" __global__ void gemv_final_rows_f32(
+    const float* w, const float* x, float* y, const int rows, const int cols)
+{ gemv_final_rows_impl<false>(w, nullptr, nullptr, x, y, rows, cols); }
+
+extern "C" __global__ void gemv_final_rows_i8(
+    const signed char* w, const float* scales, const float* x, float* y,
+    const int rows, const int cols)
+{ gemv_final_rows_impl<true>(nullptr, w, scales, x, y, rows, cols); }
 
 // ===========================================================================
 // Tensor-core GEMM for prefill
