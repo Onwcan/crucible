@@ -80,6 +80,154 @@ pub const PARAM_SLOT: usize = 4;
 pub const PARAM_PREFILL_POS: usize = 5;
 pub const PARAM_COUNT: usize = 6;
 
+/// Attention A/B controls. The model defaults to the validated Exact q4/k64
+/// path; Reference remains the oracle and Tiled is the rejected online experiment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PrefillAttentionVariant {
+    #[default]
+    Reference,
+    Tiled {
+        query_tile: usize,
+        history_tile: usize,
+        hybrid: bool,
+        cache_page_table: bool,
+    },
+    Exact {
+        query_tile: usize,
+        history_tile: usize,
+        hybrid: bool,
+        cache_page_table: bool,
+    },
+}
+
+impl PrefillAttentionVariant {
+    pub fn is_reference(self) -> bool { matches!(self, Self::Reference) }
+
+    pub fn uses_hybrid(self) -> bool {
+        matches!(self, Self::Tiled { hybrid: true, .. } | Self::Exact { hybrid: true, .. })
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::Reference => "reference".to_owned(),
+            Self::Tiled { query_tile, history_tile, hybrid, cache_page_table } => format!(
+                "q{query_tile}-k{history_tile}{}{}",
+                if hybrid { "-hybrid" } else { "" },
+                if cache_page_table { "-cache" } else { "" }),
+            Self::Exact { query_tile, history_tile, hybrid, cache_page_table } => format!(
+                "exact-q{query_tile}-k{history_tile}{}{}",
+                if hybrid { "-hybrid" } else { "" },
+                if cache_page_table { "-cache" } else { "" }),
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if let Self::Tiled { query_tile, history_tile, .. } = self {
+            if !matches!(query_tile, 1 | 2 | 4) || !matches!(history_tile, 16 | 32 | 64) {
+                anyhow::bail!("attention tiles must be query=1/2/4 and history=16/32/64");
+            }
+        }
+        if let Self::Exact { query_tile, history_tile, .. } = self {
+            if !matches!(query_tile, 1 | 2 | 4) || !matches!(history_tile, 16 | 32 | 64) {
+                anyhow::bail!("exact attention tiles must be query=1/2/4 and history=16/32/64");
+            }
+        }
+        Ok(())
+    }
+
+    fn kernel_index(self) -> Result<usize> {
+        self.validate()?;
+        match self {
+            Self::Reference => anyhow::bail!("reference attention has no tiled kernel"),
+            Self::Tiled { query_tile, history_tile, .. }
+            | Self::Exact { query_tile, history_tile, .. } => Ok(
+                query_tile.trailing_zeros() as usize * 3 + (history_tile / 16).trailing_zeros() as usize),
+        }
+    }
+
+    pub fn threads_per_block(self) -> u32 {
+        match self {
+            Self::Reference => REDUCE_THREADS,
+            Self::Tiled { query_tile, .. } | Self::Exact { query_tile, .. } => (128 * query_tile) as u32,
+        }
+    }
+
+    pub fn dynamic_shared_bytes(self, max_seq: usize, table_stride: usize) -> usize {
+        match self {
+            Self::Reference => max_seq * 4,
+            Self::Tiled { query_tile, history_tile, cache_page_table, .. } =>
+                (2 * history_tile * 64 + query_tile * 4 * history_tile) * 4
+                    + if cache_page_table { table_stride * 4 } else { 0 },
+            // Exact uses a launch-specific score capacity, which is also part
+            // of the graph topology when history crosses a capacity bucket.
+            Self::Exact { query_tile, history_tile, cache_page_table, .. } =>
+                (history_tile * 64 + query_tile * 4 * max_seq) * 4
+                    + if cache_page_table { table_stride * 4 } else { 0 },
+        }
+    }
+}
+
+impl std::str::FromStr for PrefillAttentionVariant {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "reference" { return Ok(Self::Reference); }
+        let (mut base, mut hybrid, mut cache_page_table) = (value, false, false);
+        loop {
+            if let Some(prefix) = base.strip_suffix("-hybrid") {
+                if hybrid { anyhow::bail!("duplicate hybrid attention suffix"); }
+                hybrid = true;
+                base = prefix;
+            } else if let Some(prefix) = base.strip_suffix("-cache") {
+                if cache_page_table { anyhow::bail!("duplicate cache attention suffix"); }
+                cache_page_table = true;
+                base = prefix;
+            } else { break; }
+        }
+        let exact = base == "exact" || base.starts_with("exact-");
+        if let Some(prefix) = base.strip_prefix("exact-") { base = prefix; }
+        let (query_tile, history_tile) = match base {
+            "exact" => (4, 64),
+            "grouped" => (1, 16),
+            "tiled" => (2, 16),
+            "hybrid" => { hybrid = true; (2, 16) },
+            _ => {
+                let (q, k) = base.split_once("-k")
+                    .ok_or_else(|| anyhow::anyhow!("invalid prefill attention variant {value:?}"))?;
+                let q = q.strip_prefix('q')
+                    .ok_or_else(|| anyhow::anyhow!("invalid prefill attention variant {value:?}"))?;
+                (q.parse()?, k.parse()?)
+            }
+        };
+        let variant = if exact {
+            Self::Exact { query_tile, history_tile, hybrid, cache_page_table }
+        } else {
+            Self::Tiled { query_tile, history_tile, hybrid, cache_page_table }
+        };
+        variant.validate()?;
+        Ok(variant)
+    }
+}
+
+/// The f32 tiled implementation specializes the current model's GQA geometry.
+/// Other geometries continue to use the canonical implementation.
+pub fn supports_tiled_geometry(n_head: usize, n_kv_head: usize, head_dim: usize) -> bool {
+    head_dim == 64 && n_kv_head > 0 && n_kv_head.checked_mul(4) == Some(n_head)
+}
+
+/// Driver-reported resources and occupancy calculator output, never achieved
+/// occupancy. Local memory may include a stack as well as register spills.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PrefillAttentionResources {
+    pub threads_per_block: u32,
+    pub registers_per_thread: i32,
+    pub static_shared_bytes: i32,
+    pub dynamic_shared_bytes: usize,
+    pub local_bytes_per_thread: i32,
+    pub max_active_blocks_per_sm: u32,
+    pub estimated_occupancy: f64,
+}
+
 /// Threads per block for reduction kernels.
 ///
 /// 256 rather than 1024: a GEMV block reduces one output row, and at
@@ -153,6 +301,8 @@ pub struct Gpu {
     attention_decode_paged: CudaFunction,
     attention_prefill_paged: CudaFunction,
     attention_prefill_packed: CudaFunction,
+    attention_prefill_tiled: [CudaFunction; 9],
+    attention_prefill_exact: [CudaFunction; 9],
     cache_store_packed_paged: CudaFunction,
     gather_prefill_rows: CudaFunction,
     gemv_final_rows_f32: CudaFunction,
@@ -210,7 +360,30 @@ impl Gpu {
             .map_err(|e| anyhow::anyhow!("NVRTC compilation failed: {e:?}"))?;
         let module = cu(ctx.load_module(ptx))?;
 
+        let attention_prefill_exact = [
+            cu(module.load_function("attention_prefill_exact_q1_k16"))?,
+            cu(module.load_function("attention_prefill_exact_q1_k32"))?,
+            cu(module.load_function("attention_prefill_exact_q1_k64"))?,
+            cu(module.load_function("attention_prefill_exact_q2_k16"))?,
+            cu(module.load_function("attention_prefill_exact_q2_k32"))?,
+            cu(module.load_function("attention_prefill_exact_q2_k64"))?,
+            cu(module.load_function("attention_prefill_exact_q4_k16"))?,
+            cu(module.load_function("attention_prefill_exact_q4_k32"))?,
+            cu(module.load_function("attention_prefill_exact_q4_k64"))?,
+        ];
+        // q2/k64 with a cached page table and all q4 variants exceed the
+        // default 48 KiB limit at a 1024-token score capacity. Opt in once,
+        // outside launches/graph capture.
+        let optin_shared = cu(ctx.attribute(cudarc::driver::sys::CUdevice_attribute_enum::
+            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN))?;
+        for function in &attention_prefill_exact {
+            let static_shared = cu(function.shared_size_bytes())?;
+            cu(function.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, optin_shared - static_shared))?;
+        }
+
         Ok(Self {
+            attention_prefill_exact,
             gemv: cu(module.load_function("gemv_f32"))?,
             gemv_vec4: cu(module.load_function("gemv_f32_vec4"))?,
             rmsnorm: cu(module.load_function("rmsnorm_f32"))?,
@@ -267,6 +440,17 @@ impl Gpu {
             attention_decode_paged: cu(module.load_function("attention_decode_paged_f32"))?,
             attention_prefill_paged: cu(module.load_function("attention_prefill_paged_f32"))?,
             attention_prefill_packed: cu(module.load_function("attention_prefill_packed_f32"))?,
+            attention_prefill_tiled: [
+                cu(module.load_function("attention_prefill_tiled_q1_k16"))?,
+                cu(module.load_function("attention_prefill_tiled_q1_k32"))?,
+                cu(module.load_function("attention_prefill_tiled_q1_k64"))?,
+                cu(module.load_function("attention_prefill_tiled_q2_k16"))?,
+                cu(module.load_function("attention_prefill_tiled_q2_k32"))?,
+                cu(module.load_function("attention_prefill_tiled_q2_k64"))?,
+                cu(module.load_function("attention_prefill_tiled_q4_k16"))?,
+                cu(module.load_function("attention_prefill_tiled_q4_k32"))?,
+                cu(module.load_function("attention_prefill_tiled_q4_k64"))?,
+            ],
             cache_store_packed_paged: cu(module.load_function("cache_store_packed_paged_f32"))?,
             gather_prefill_rows: cu(module.load_function("gather_prefill_rows_f32"))?,
             gemv_final_rows_f32: cu(module.load_function("gemv_final_rows_f32"))?,
@@ -1156,6 +1340,104 @@ impl Gpu {
             .arg(&ts).arg(&nh).arg(&nk).arg(&hd).arg(&nl).arg(&l).arg(&kd);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
+    }
+
+    /// Launch the current model's f32 paged/GQA tiled attention. Each segment
+    /// contains `[packed_start, chunk_len, absolute_start, table_index]`; the
+    /// model validates their values and page ownership before uploading them.
+    /// All descriptors are dynamic device contents, including under graphs.
+    /// `current_k/current_v` are only read by the explicit hybrid variant.
+    /// Exact requires every segment's `absolute_start + chunk_len` to fit in
+    /// `score_capacity`; the caller validates that bound before uploading.
+    /// Online tiled variants ignore `score_capacity`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_tiled(
+        &self, q: &CudaSlice<f32>, k_pool: &CudaSlice<f32>, v_pool: &CudaSlice<f32>,
+        current_k: &CudaSlice<f32>, current_v: &CudaSlice<f32>, out: &mut CudaSlice<f32>,
+        tables: &CudaSlice<i32>, segments: &CudaSlice<i32>, requests: usize,
+        max_chunk: usize, table_stride: usize, n_head: usize, n_kv_head: usize,
+        head_dim: usize, n_layer: usize, layer: usize, kv_dim: usize,
+        variant: PrefillAttentionVariant, score_capacity: usize,
+    ) -> Result<()> {
+        let index = variant.kernel_index()?;
+        let (query_tile, hybrid, cache_page_table, function) = match variant {
+            PrefillAttentionVariant::Tiled { query_tile, hybrid, cache_page_table, .. } =>
+                (query_tile, hybrid, cache_page_table, &self.attention_prefill_tiled[index]),
+            PrefillAttentionVariant::Exact { query_tile, hybrid, cache_page_table, .. } =>
+                (query_tile, hybrid, cache_page_table, &self.attention_prefill_exact[index]),
+            PrefillAttentionVariant::Reference => unreachable!("kernel_index rejected reference"),
+        };
+        if !supports_tiled_geometry(n_head, n_kv_head, head_dim)
+            || n_kv_head.checked_mul(head_dim) != Some(kv_dim)
+        {
+            anyhow::bail!("tiled prefill attention requires head_dim=64 and four query heads per KV head");
+        }
+        if requests == 0 || max_chunk == 0 || table_stride == 0 || n_layer == 0 || layer >= n_layer
+            || requests > u16::MAX as usize || max_chunk.div_ceil(query_tile) > u16::MAX as usize
+            || [n_head, n_kv_head, n_layer, kv_dim, table_stride, max_chunk]
+                .iter().any(|&n| n > i32::MAX as usize)
+            || requests.checked_mul(4).is_none_or(|n| n > segments.len())
+            || requests.checked_mul(table_stride).is_none_or(|n| n > tables.len())
+            || n_head.checked_mul(head_dim).and_then(|d| d.checked_mul(max_chunk))
+                .is_none_or(|n| n > q.len() || n > out.len())
+        {
+            anyhow::bail!("invalid tiled attention launch dimensions or metadata capacity");
+        }
+        if hybrid && max_chunk.checked_mul(kv_dim)
+            .is_none_or(|n| n > current_k.len() || n > current_v.len())
+        {
+            anyhow::bail!("hybrid attention current K/V scratch is too small");
+        }
+        let exact = matches!(variant, PrefillAttentionVariant::Exact { .. });
+        if exact && (score_capacity < max_chunk || score_capacity > i32::MAX as usize
+            || table_stride.checked_mul(16).is_none_or(|n| score_capacity > n))
+        {
+            anyhow::bail!("exact attention score capacity must cover max_chunk and fit the page table");
+        }
+        let shared = variant.dynamic_shared_bytes(score_capacity, table_stride);
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_head as u32, max_chunk.div_ceil(query_tile) as u32, requests as u32),
+            block_dim: (variant.threads_per_block(), 1, 1),
+            shared_mem_bytes: u32::try_from(shared)?,
+        };
+        let (ts, nh, nl, l, kd, hy, ct) = (table_stride as i32, n_head as i32,
+            n_layer as i32, layer as i32, kv_dim as i32, i32::from(hybrid), i32::from(cache_page_table));
+        let mut b = self.stream.launch_builder(function);
+        b.arg(q).arg(k_pool).arg(v_pool).arg(current_k).arg(current_v).arg(out)
+            .arg(tables).arg(segments).arg(&ts).arg(&nh).arg(&nl).arg(&l).arg(&kd).arg(&hy).arg(&ct);
+        let score_stride = score_capacity as i32;
+        if exact { b.arg(&score_stride); }
+        unsafe { cu(b.launch(cfg))? };
+        Ok(())
+    }
+
+    /// Read compiled resource attributes and estimate the occupancy ceiling
+    /// for this launch. This performs no timed kernel work and is benchmark
+    /// diagnostics only; it does not report achieved occupancy or bandwidth.
+    pub fn attention_kernel_resources(
+        &self, variant: PrefillAttentionVariant, max_seq: usize, table_stride: usize,
+    ) -> Result<PrefillAttentionResources> {
+        variant.validate()?;
+        let function = match variant {
+            PrefillAttentionVariant::Reference => &self.attention_prefill_packed,
+            PrefillAttentionVariant::Tiled { .. } => &self.attention_prefill_tiled[variant.kernel_index()?],
+            PrefillAttentionVariant::Exact { .. } => &self.attention_prefill_exact[variant.kernel_index()?],
+        };
+        let threads_per_block = variant.threads_per_block();
+        let dynamic_shared_bytes = variant.dynamic_shared_bytes(max_seq, table_stride);
+        // get_attribute binds the CUDA context before the occupancy call.
+        let registers_per_thread = cu(function.num_regs())?;
+        let static_shared_bytes = cu(function.shared_size_bytes())?;
+        let local_bytes_per_thread = cu(function.local_size_bytes())?;
+        let max_active_blocks_per_sm = cu(function.occupancy_max_active_blocks_per_multiprocessor(
+            threads_per_block, dynamic_shared_bytes, None))?;
+        use cudarc::driver::sys::CUdevice_attribute_enum as Attr;
+        let max_threads = cu(self.ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))?;
+        Ok(PrefillAttentionResources {
+            threads_per_block, registers_per_thread, static_shared_bytes,
+            dynamic_shared_bytes, local_bytes_per_thread, max_active_blocks_per_sm,
+            estimated_occupancy: f64::from(max_active_blocks_per_sm * threads_per_block) / f64::from(max_threads),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

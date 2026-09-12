@@ -4,6 +4,8 @@ use llm_engine::{Config, Tokenizer, Weights};
 use std::path::PathBuf;
 
 #[cfg(feature = "cuda")]
+mod gpu_attention_validation;
+#[cfg(feature = "cuda")]
 mod gpu_packed_validation;
 #[cfg(feature = "cuda")]
 mod gpu_prefill_trace;
@@ -201,6 +203,29 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         trials: usize,
     },
+    /// Direct f32 paged-attention tensor, causal, GQA and isolation oracles.
+    #[cfg(feature = "cuda")]
+    GpuPrefillAttentionCheck {
+        #[arg(long, default_value_t = 64)]
+        fuzz: usize,
+        #[arg(long, default_value_t = 20260908)]
+        seed: u64,
+    },
+    /// Paired isolated paged-attention kernel timings on capacity-valid shapes.
+    #[cfg(feature = "cuda")]
+    GpuPrefillAttentionBench {
+        #[arg(long, default_value_t = 100)]
+        iters: usize,
+        #[arg(long, default_value_t = 5)]
+        trials: usize,
+        #[arg(long, default_value = "q1-k16,q1-k32,q1-k64,q2-k16,q2-k32,q2-k64,q4-k16,q4-k32,q4-k64,q2-k32-hybrid,q2-k32-cache,exact-q1-k16,exact-q1-k32,exact-q1-k64,exact-q2-k16,exact-q2-k32,exact-q2-k64,exact-q4-k16,exact-q4-k32,exact-q4-k64,exact-q2-k32-hybrid,exact-q2-k32-cache,exact-q2-k32-hybrid-cache")]
+        variants: String,
+        /// Comma-separated exact case names; empty runs the complete matrix.
+        #[arg(long, default_value = "")]
+        cases: String,
+        #[arg(long, default_value_t = 20260908)]
+        seed: u64,
+    },
     /// Adversarial cross-request packed prefill against independent requests.
     #[cfg(feature = "cuda")]
     GpuPackedPrefillCheck {
@@ -211,6 +236,9 @@ enum Command {
         steps: usize,
         #[arg(long, default_value_t = 12)]
         fuzz: usize,
+        /// Diagnose boundary ID 100..118 with oracle history; chunk 32, up to 32 steps.
+        #[arg(long)]
+        diagnose_request: Option<u64>,
     },
     /// Paired serial/packed prefill scaling, exact GEMM rows and GPU replay.
     #[cfg(feature = "cuda")]
@@ -417,6 +445,9 @@ enum Command {
         /// Replay decode from a captured CUDA graph
         #[arg(long)]
         graph: bool,
+        /// Use the decode-compatible paged pool and selected prefill attention.
+        #[arg(long)]
+        paged: bool,
     },
     /// Encode text and print token ids, to compare against tiktoken.
     Tokenize {
@@ -526,8 +557,16 @@ fn main() -> Result<()> {
             gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
         }
         #[cfg(feature = "cuda")]
-        Command::GpuPackedPrefillCheck { model, quant, steps, fuzz } => {
-            gpu_packed_validation::check(model, &quant, steps, fuzz)
+        Command::GpuPrefillAttentionCheck { fuzz, seed } => {
+            gpu_attention_validation::check(fuzz, seed)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPrefillAttentionBench { iters, trials, variants, cases, seed } => {
+            gpu_attention_validation::bench(iters, trials, &variants, &cases, seed)
+        }
+        #[cfg(feature = "cuda")]
+        Command::GpuPackedPrefillCheck { model, quant, steps, fuzz, diagnose_request } => {
+            gpu_packed_validation::check(model, &quant, steps, fuzz, diagnose_request)
         }
         #[cfg(feature = "cuda")]
         Command::GpuPackedPrefillBench { model, quant, iters, batches, chunks, packed_only } => {
@@ -576,8 +615,8 @@ fn main() -> Result<()> {
             gpu_paged(model, &quant, &lengths, graph)
         }
         #[cfg(feature = "cuda")]
-        Command::GpuEval { model, data, tokens, quant, graph, prefill_ctx } => {
-            gpu_eval(model, data, tokens, &quant, graph, prefill_ctx)
+        Command::GpuEval { model, data, tokens, quant, graph, prefill_ctx, paged } => {
+            gpu_eval(model, data, tokens, &quant, graph, prefill_ctx, paged)
         }
         Command::Generate {
             model,
@@ -969,6 +1008,7 @@ fn probe_tokens(n: usize, vocab: usize) -> Vec<usize> {
 
 #[cfg(feature = "cuda")]
 fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()> {
+    use llm_engine::gpu::PrefillAttentionVariant;
     use llm_engine::gpu_model::{GpuModel, Precision};
     use llm_engine::paged::PAGE_TOKENS;
 
@@ -978,6 +1018,9 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
         .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+    // This command isolates storage translation and retains its original
+    // bit-exact contract. Reordered attention has a separate tensor oracle.
+    model.set_prefill_attention(PrefillAttentionVariant::Reference)?;
     model.enable_graph(graph);
 
     // Enough pages for one full-context sequence, which is the parity case
@@ -990,6 +1033,7 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
     println!("pool        {n_pages} pages, {:.2} MB",
              model.page_pool().total_bytes() as f64 / 1e6);
     println!("graph       {graph}");
+    println!("attention   reference (storage parity; use gpu-prefill-attention-check for tiled numerics)");
     println!();
 
     let lens: Vec<usize> = lengths
@@ -1730,8 +1774,8 @@ fn gpu_prefill_graph_check(
     let want = run(&mut eager, 0, &prompt, GenerationConfig::greedy(steps))?;
     for c in [64usize, 128, 256] {
         let mut rt = build(true, true, c)?;
-        // Every chunk after the first replays the same graph at a different
-        // offset, which is only correct if the offset was never captured.
+        // Offsets remain dynamic. Exact attention reuses graphs within each
+        // shared-score capacity bucket and captures a new topology at its boundary.
         let got = run(&mut rt, 0, &prompt, GenerationConfig::greedy(steps))?;
         let ok = got == want;
         if !ok {
@@ -2999,7 +3043,7 @@ fn gpu_batch(
 
 #[cfg(feature = "cuda")]
 fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool,
-            prefill_ctx: usize) -> Result<()> {
+            prefill_ctx: usize, paged: bool) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let cfg = Config::from_file(dir.join("config.json"))?;
@@ -3031,6 +3075,12 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
             .ok_or_else(|| anyhow::anyhow!("unknown precision {name:?}"))?;
 
         let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
+        if paged {
+            model.enable_paging(cfg.block_size.div_ceil(llm_engine::paged::PAGE_TOKENS), 1)?;
+            println!("cache       paged; attention {}", model.prefill_attention().name());
+        } else {
+            println!("cache       contiguous (canonical attention)");
+        }
         model.enable_graph(graph);
 
         // Teacher forcing: feed the true token at every step and score the

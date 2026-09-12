@@ -1947,6 +1947,334 @@ extern "C" __global__ void attention_prefill_packed_f32(
         n_head, n_kv_head, head_dim, n_layer, layer, kv_dim, positions[row] + 1);
 }
 
+// Paged prefill with four GQA siblings per query row. One warp owns one
+// independent distribution and two output components per lane. The CTA stages
+// one logical history tile for all its query rows/heads. No history-sized score
+// buffer, dense mask, or cache conversion is used. The reference above remains
+// the numerical oracle: online normalization deliberately changes its order.
+//
+// Segment = [packed_start, chunk_len, absolute_start, table_index]. Segment
+// contents, including offsets and physical pages, stay dynamic under graphs.
+template <int QUERY_TILE, int HISTORY_TILE>
+__device__ __forceinline__ void attention_prefill_tiled_impl(
+    const float* __restrict__ q, const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool, const float* __restrict__ current_k,
+    const float* __restrict__ current_v, float* __restrict__ out,
+    const int* __restrict__ tables, const int* __restrict__ segments,
+    const int table_stride, const int n_head, const int n_layer,
+    const int layer, const int kv_dim, const int hybrid, const int cache_table)
+{
+    const int* segment = segments + (size_t)blockIdx.z * 4;
+    const int packed_start = segment[0];
+    const int chunk_len = segment[1];
+    const int absolute_start = segment[2];
+    const int query_start = blockIdx.y * QUERY_TILE;
+    if (query_start >= chunk_len) return; // uniform across the whole CTA
+    const int* table = tables + (size_t)segment[3] * table_stride;
+    const int kv_head = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int local_query = query_start + warp / 4;
+    const bool active = local_query < chunk_len;
+    const int head = kv_head * 4 + warp % 4;
+    const int row = packed_start + local_query;
+    const int causal_length = absolute_start + local_query + 1;
+    const int history_end = absolute_start + min(chunk_len, query_start + QUERY_TILE);
+
+    extern __shared__ float tile_storage[];
+    float* kt = tile_storage;
+    float* vt = kt + HISTORY_TILE * 64;
+    float* probabilities = vt + HISTORY_TILE * 64;
+    int* cached_table = reinterpret_cast<int*>(probabilities + QUERY_TILE * 4 * HISTORY_TILE);
+    if (cache_table) {
+        const int pages = (history_end + PAGE_MASK) >> PAGE_SHIFT;
+        for (int i = threadIdx.x; i < pages; i += blockDim.x) cached_table[i] = table[i];
+        __syncthreads();
+    }
+    const float q0 = active ? q[(size_t)row * n_head * 64 + head * 64 + lane] : 0.0f;
+    const float q1 = active ? q[(size_t)row * n_head * 64 + head * 64 + lane + 32] : 0.0f;
+    float maximum = NEG_INF;
+    float denominator = 0.0f;
+    float output0 = 0.0f;
+    float output1 = 0.0f;
+
+    for (int start = 0; start < history_end; start += HISTORY_TILE) {
+        // Each K and V component is fetched once per CTA. Within a position,
+        // consecutive lanes read consecutive dimensions of the same KV head.
+        // A page is 16 positions; 32/64 tiles translate every constituent page
+        // separately, so physical adjacency is never assumed.
+        for (int i = threadIdx.x; i < HISTORY_TILE * 64; i += blockDim.x) {
+            const int position = start + i / 64;
+            const int dimension = kv_head * 64 + i % 64;
+            float k = 0.0f;
+            float v = 0.0f;
+            if (position < history_end) {
+                if (hybrid && position >= absolute_start) {
+                    const size_t index = (size_t)(packed_start + position - absolute_start) * kv_dim + dimension;
+                    k = current_k[index];
+                    v = current_v[index];
+                } else {
+                    const int logical_page = position >> PAGE_SHIFT;
+                    const int page = cache_table ? cached_table[logical_page] : table[logical_page];
+                    const size_t index = paged_offset(page, position & PAGE_MASK,
+                        n_layer, layer, kv_dim) + dimension;
+                    k = k_pool[index];
+                    v = v_pool[index];
+                }
+            }
+            kt[i] = k;
+            vt[i] = v;
+        }
+        __syncthreads();
+
+        const int visible = min(HISTORY_TILE, causal_length - start);
+        if (active && visible > 0) {
+            float* scores = probabilities + warp * HISTORY_TILE;
+            for (int j = 0; j < visible; ++j) {
+                float dot = 0.0f;
+                dot += q0 * kt[j * 64 + lane];
+                dot += q1 * kt[j * 64 + lane + 32];
+                dot = warp_reduce_sum(dot);
+                if (lane == 0) scores[j] = dot * 0.125f; // rsqrt(64)
+            }
+            __syncwarp();
+            float tile_max = NEG_INF;
+            for (int j = lane; j < visible; j += 32) tile_max = fmaxf(tile_max, scores[j]);
+            #pragma unroll
+            for (int delta = 16; delta > 0; delta >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffff, tile_max, delta));
+            tile_max = __shfl_sync(0xffffffff, tile_max, 0);
+            const float next_maximum = fmaxf(maximum, tile_max);
+            const float alpha = __expf(maximum - next_maximum);
+            float tile_sum = 0.0f;
+            for (int j = lane; j < visible; j += 32) {
+                const float probability = __expf(scores[j] - next_maximum);
+                scores[j] = probability;
+                tile_sum += probability;
+            }
+            tile_sum = warp_reduce_sum(tile_sum);
+            tile_sum = __shfl_sync(0xffffffff, tile_sum, 0);
+            __syncwarp();
+            denominator = alpha * denominator + tile_sum;
+            output0 *= alpha;
+            output1 *= alpha;
+            for (int j = 0; j < visible; ++j) {
+                const float probability = scores[j];
+                output0 += probability * vt[j * 64 + lane];
+                output1 += probability * vt[j * 64 + lane + 32];
+            }
+            maximum = next_maximum;
+        }
+        // Inactive tail warps still participate. No producer overwrites the
+        // tile while any other warp is consuming it.
+        __syncthreads();
+    }
+    if (active) {
+        const float inverse = 1.0f / denominator;
+        out[(size_t)row * n_head * 64 + head * 64 + lane] = output0 * inverse;
+        out[(size_t)row * n_head * 64 + head * 64 + lane + 32] = output1 * inverse;
+    }
+}
+
+#define DEFINE_PREFILL_TILED(QT, KT) \
+extern "C" __global__ void attention_prefill_tiled_q##QT##_k##KT( \
+    const float* q, const float* k_pool, const float* v_pool, \
+    const float* current_k, const float* current_v, float* out, \
+    const int* tables, const int* segments, const int table_stride, \
+    const int n_head, const int n_layer, const int layer, const int kv_dim, \
+    const int hybrid, const int cache_table) { \
+    attention_prefill_tiled_impl<QT, KT>(q, k_pool, v_pool, current_k, current_v, \
+        out, tables, segments, table_stride, n_head, n_layer, layer, kv_dim, hybrid, cache_table); \
+}
+DEFINE_PREFILL_TILED(1, 16)
+DEFINE_PREFILL_TILED(1, 32)
+DEFINE_PREFILL_TILED(1, 64)
+DEFINE_PREFILL_TILED(2, 16)
+DEFINE_PREFILL_TILED(2, 32)
+DEFINE_PREFILL_TILED(2, 64)
+DEFINE_PREFILL_TILED(4, 16)
+DEFINE_PREFILL_TILED(4, 32)
+DEFINE_PREFILL_TILED(4, 64)
+#undef DEFINE_PREFILL_TILED
+
+// Share paged K/V transport across four GQA siblings and QUERY_TILE rows while
+// preserving the reference's complete arithmetic order. Unlike the online
+// experiment above, scores span the whole history. A single tile buffer serves
+// first K, then V, so q2/k16 uses 36 KiB at a 1024-token score capacity.
+//
+// Each query warp emulates the reference's 256 softmax threads: eight virtual
+// warps, with each virtual thread summing j = tid, tid + 256, ... . Both levels
+// of the reference block_reduce_sum shuffle tree are retained exactly. Value
+// accumulation visits every visible j in ascending order for both dimensions.
+template <int QUERY_TILE, int HISTORY_TILE>
+__device__ __forceinline__ void attention_prefill_exact_impl(
+    const float* __restrict__ q, const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool, const float* __restrict__ current_k,
+    const float* __restrict__ current_v, float* __restrict__ out,
+    const int* __restrict__ tables, const int* __restrict__ segments,
+    const int table_stride, const int n_head, const int n_layer,
+    const int layer, const int kv_dim, const int hybrid, const int cache_table,
+    const int score_stride)
+{
+    const int* segment = segments + (size_t)blockIdx.z * 4;
+    const int packed_start = segment[0];
+    const int chunk_len = segment[1];
+    const int absolute_start = segment[2];
+    const int query_start = blockIdx.y * QUERY_TILE;
+    if (query_start >= chunk_len) return;
+    const int* table = tables + (size_t)segment[3] * table_stride;
+    const int kv_head = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int local_query = query_start + warp / 4;
+    const bool active = local_query < chunk_len;
+    const int head = kv_head * 4 + warp % 4;
+    const int row = packed_start + local_query;
+    const int causal_length = absolute_start + local_query + 1;
+    const int history_end = absolute_start + min(chunk_len, query_start + QUERY_TILE);
+    extern __shared__ float exact_storage[];
+    float* tile = exact_storage;
+    float* all_scores = tile + HISTORY_TILE * 64;
+    float* scores = all_scores + warp * score_stride;
+    int* cached_table = reinterpret_cast<int*>(all_scores + QUERY_TILE * 4 * score_stride);
+    if (cache_table) {
+        const int pages = (history_end + PAGE_MASK) >> PAGE_SHIFT;
+        for (int i = threadIdx.x; i < pages; i += blockDim.x) cached_table[i] = table[i];
+        __syncthreads();
+    }
+    const float q0 = active ? q[(size_t)row * n_head * 64 + head * 64 + lane] : 0.0f;
+    const float q1 = active ? q[(size_t)row * n_head * 64 + head * 64 + lane + 32] : 0.0f;
+    for (int start = 0; start < history_end; start += HISTORY_TILE) {
+        for (int i = threadIdx.x; i < HISTORY_TILE * 64; i += blockDim.x) {
+            const int position = start + i / 64;
+            const int dimension = kv_head * 64 + i % 64;
+            float k = 0.0f;
+            if (position < history_end) {
+                if (hybrid && position >= absolute_start) {
+                    const size_t index = (size_t)(packed_start + position - absolute_start) * kv_dim + dimension;
+                    k = current_k[index];
+                } else {
+                    const int logical_page = position >> PAGE_SHIFT;
+                    const int page = cache_table ? cached_table[logical_page] : table[logical_page];
+                    k = k_pool[paged_offset(page, position & PAGE_MASK,
+                        n_layer, layer, kv_dim) + dimension];
+                }
+            }
+            tile[i] = k;
+        }
+        __syncthreads();
+        const int visible = min(HISTORY_TILE, causal_length - start);
+        if (active) {
+            for (int j = 0; j < visible; ++j) {
+                float dot = 0.0f;
+                dot += q0 * tile[j * 64 + lane];
+                dot += q1 * tile[j * 64 + lane + 32];
+                dot = warp_reduce_sum(dot);
+                if (lane == 0) scores[start + j] = dot * 0.125f;
+            }
+        }
+        __syncthreads();
+    }
+
+    float inverse = 0.0f;
+    if (active) {
+        float maximum = NEG_INF;
+        #pragma unroll
+        for (int virtual_warp = 0; virtual_warp < 8; ++virtual_warp) {
+            float m = NEG_INF;
+            // Empty virtual warps contribute the same identity without
+            // executing their shuffle trees; this condition is warp-uniform.
+            if (32 * virtual_warp < causal_length) {
+                for (int j = lane + 32 * virtual_warp; j < causal_length; j += 256)
+                    m = fmaxf(m, scores[j]);
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    m = fmaxf(m, __shfl_down_sync(0xffffffff, m, offset));
+                m = __shfl_sync(0xffffffff, m, 0);
+            }
+            // Reference thread 0 combines its eight warp maxima in order.
+            maximum = fmaxf(maximum, m);
+        }
+        float second_stage = 0.0f;
+        #pragma unroll
+        for (int virtual_warp = 0; virtual_warp < 8; ++virtual_warp) {
+            float warp_sum = 0.0f;
+            if (32 * virtual_warp < causal_length) {
+                float local = 0.0f;
+                for (int j = lane + 32 * virtual_warp; j < causal_length; j += 256) {
+                    const float e = __expf(scores[j] - maximum);
+                    scores[j] = e;
+                    local += e;
+                }
+                local = warp_reduce_sum(local);
+                warp_sum = __shfl_sync(0xffffffff, local, 0);
+            }
+            if (lane == virtual_warp) second_stage = warp_sum;
+        }
+        // Lanes 0..7 contain the eight partials, lanes 8..31 contain +0,
+        // exactly as the second warp reduction in block_reduce_sum.
+        second_stage = warp_reduce_sum(second_stage);
+        inverse = 1.0f / __shfl_sync(0xffffffff, second_stage, 0);
+    }
+
+    float output0 = 0.0f;
+    float output1 = 0.0f;
+    for (int start = 0; start < history_end; start += HISTORY_TILE) {
+        for (int i = threadIdx.x; i < HISTORY_TILE * 64; i += blockDim.x) {
+            const int position = start + i / 64;
+            const int dimension = kv_head * 64 + i % 64;
+            float v = 0.0f;
+            if (position < history_end) {
+                if (hybrid && position >= absolute_start) {
+                    const size_t index = (size_t)(packed_start + position - absolute_start) * kv_dim + dimension;
+                    v = current_v[index];
+                } else {
+                    const int logical_page = position >> PAGE_SHIFT;
+                    const int page = cache_table ? cached_table[logical_page] : table[logical_page];
+                    v = v_pool[paged_offset(page, position & PAGE_MASK,
+                        n_layer, layer, kv_dim) + dimension];
+                }
+            }
+            tile[i] = v;
+        }
+        __syncthreads();
+        const int visible = min(HISTORY_TILE, causal_length - start);
+        if (active) {
+            for (int j = 0; j < visible; ++j) {
+                const float probability = scores[start + j];
+                output0 += probability * tile[j * 64 + lane];
+                output1 += probability * tile[j * 64 + lane + 32];
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        out[(size_t)row * n_head * 64 + head * 64 + lane] = output0 * inverse;
+        out[(size_t)row * n_head * 64 + head * 64 + lane + 32] = output1 * inverse;
+    }
+}
+
+#define DEFINE_PREFILL_EXACT(QT, KT) \
+extern "C" __global__ void attention_prefill_exact_q##QT##_k##KT( \
+    const float* q, const float* k_pool, const float* v_pool, \
+    const float* current_k, const float* current_v, float* out, \
+    const int* tables, const int* segments, const int table_stride, \
+    const int n_head, const int n_layer, const int layer, const int kv_dim, \
+    const int hybrid, const int cache_table, const int score_stride) { \
+    attention_prefill_exact_impl<QT, KT>(q, k_pool, v_pool, current_k, current_v, \
+        out, tables, segments, table_stride, n_head, n_layer, layer, kv_dim, hybrid, cache_table, score_stride); \
+}
+DEFINE_PREFILL_EXACT(1, 16)
+DEFINE_PREFILL_EXACT(1, 32)
+DEFINE_PREFILL_EXACT(1, 64)
+DEFINE_PREFILL_EXACT(2, 16)
+DEFINE_PREFILL_EXACT(2, 32)
+DEFINE_PREFILL_EXACT(2, 64)
+DEFINE_PREFILL_EXACT(4, 16)
+DEFINE_PREFILL_EXACT(4, 32)
+DEFINE_PREFILL_EXACT(4, 64)
+#undef DEFINE_PREFILL_EXACT
+
 // One owner and absolute position per real row. Tables stay per request rather
 // than being replicated for every token. No padding row reaches this kernel.
 extern "C" __global__ void cache_store_packed_paged_f32(

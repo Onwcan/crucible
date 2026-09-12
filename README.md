@@ -2856,6 +2856,198 @@ graph cache are not justified by these results. Prefix caching, multi-stream
 overlap, attention rewrites, and further GEMM tuning remain outside this
 milestone.
 
+## Paged prefill attention: share K/V, preserve the reduction
+
+The attention milestone starts at `135b0953e51801d9748d52672713f19cb48b7ffa`.
+Packing had made the 4 x 256 attention stage the largest individual stage in
+the prefill profile. The new path keeps the canonical paged layout and shares
+K/V transport across GQA heads and query positions. The
+[design](docs/paged-attention-design.md),
+[complete results](docs/paged-attention-results.md), and
+[evidence](docs/paged-attention-evidence.json) record the reference, rejected
+candidates, validation, power envelopes, and reproduction commands.
+
+### The reference and the numerical constraint
+
+The old launch assigns a 256-thread block to each query row and query head.
+Eight warps form dot products, scores occupy a full-history shared buffer,
+and a block reduction normalizes them. Only 64 threads then accumulate V in
+ascending history order. Four GQA sibling heads independently load the same
+KV history, and different query rows share no explicit staging.
+
+The first candidates staged 16/32/64-position K/V tiles and used stable online
+softmax, retaining a running maximum, normalization sum, and weighted output.
+For each tile it computes `m' = max(m, tile_max)`, rescales prior state by
+`exp(m - m')`, adds `exp(score - m')` to the denominator and its weighted V
+to the output, and divides once after the final tile.
+They passed tensor tolerances with maximum absolute error around `1.1e-6`.
+They nevertheless changed a seeded top-k-500 sequence at its ninth token.
+Teacher forcing reproduced the failure with identical RNG state and the same
+500 candidates: two nearly equal logits swapped ranks 428 and 429. The
+existing WMMA projections also round attention outputs to half precision;
+small input differences can cross those rounding boundaries. An unchanged
+rounded CE value did not make the sequence change acceptable.
+
+Online attention remains an explicit diagnostic experiment. The production
+kernel preserves the reference's floating-point dot products, exponential
+normalization sums, value accumulation order, and final reciprocal. No sampling
+or vocabulary-projection arithmetic changed.
+
+### The selected kernel
+
+One block handles **four query positions from one request slice and one KV
+head**, hence sixteen independent query distributions. Its 512 threads assign
+one warp to each distribution, with two output components per lane. A
+64-position shared tile first stages K and then V. Each logical page is looked
+up separately; a tile never assumes consecutive physical page numbers.
+
+This is a two-pass tiled kernel with full per-query score storage on chip,
+not an online-softmax kernel. To preserve the canonical denominator, each warp
+emulates the reference's eight virtual warps and both summation trees. Empty
+virtual warps contribute the same zeros. Each query still has its own scores,
+normalization, causal bound, and output accumulator.
+
+Descriptors contain packed start, slice length, absolute start, and page-table
+index. They are uploaded in one bulk transfer. Historical and current K/V both
+come from the durable `pool[page][layer][16][kv_dim]`; GQA mapping remains
+`query_head / 4`. Query tiles cannot cross request boundaries. Four-row tiles
+can reuse a fetched component across sixteen distributions, but cache effects
+mean that source-level reuse is **not a measured 16x DRAM-bandwidth reduction**.
+
+Shared-score capacity is the largest history in the call rounded up to a
+256-position boundary. For this model, the four capacities require 32/48/64/80
+KiB of shared storage per block, including the 64-position K or V tile. Driver
+resource and occupancy-calculator results are reported in the full results;
+they are not achieved occupancy. The singleton graph key includes this shared
+capacity as launch topology. Positions, tokens, and page IDs remain dynamic,
+and the existing 64-entry graph-cache limit remains in force.
+The selected kernel uses 56 registers per thread and no driver-reported
+local memory. CUDA's occupancy calculator permits two blocks per SM at
+256-score capacity and one at 1024, versus six for the reference. Those
+limits describe resource residency, not measured execution occupancy.
+
+An additional persistent K buffer was tested so attention could read the
+historical prefix through pages and the current slice through projection
+scratch. Both K and V were still stored into the durable pool before attention.
+That experiment costs exactly **786,432 bytes** at 1,024 rows and KV width 192.
+Its small timing benefit did not justify enabling it. Page-table staging is
+also disabled. Production adds only the compact segment buffers, 256 bytes
+each on host and device at sixteen requests, plus small scalar bookkeeping.
+
+### Real service, not just kernel timing
+
+These are medians from three freshly warmed, alternating baseline/candidate
+rounds. The baseline was built from an independently verified archive of the
+starting commit. Requests generate 64 tokens; p95 is the median of per-round
+request p95 values. The candidate in these runs explicitly selects the same
+exact kernel now used by default.
+
+| Workload | Reference TTFT p50 / p95, ms | Exact attention p50 / p95, ms | Reference / exact tok/s |
+|---|---:|---:|---:|
+| 16 short prompts | 16.54 / 17.05 | 16.06 / 16.71 | 8,746 / 8,917 |
+| Four 256-token prompts | 23.66 / 23.83 | 22.18 / 22.21 | 2,849 / 2,913 |
+| Four 512-token prompts | 35.59 / 48.12 | 30.04 / 40.42 | 1,903 / 2,059 |
+| Four 941-token prompts | 75.19 / 117.37 | 63.80 / 98.26 | 1,088 / 1,207 |
+| Eight 512-token prompts | 61.09 / 98.40 | 49.06 / 77.06 | 2,440 / 2,814 |
+
+The long-prompt gains repeat across rounds. Short cases are mostly unchanged;
+for example, short-8 throughput is about 0.9% lower, within the variation in
+these runs. Mixed-8 median TTFT improves while its median p95 is slightly
+worse, 48.72 to 49.31 ms. These results do not establish universal tail-latency
+improvement. A lone 941-token arrival reduces the established decoder's median
+worst gap from 27.49 to 24.40 ms; the four-arrival HOL test has material
+arrival-order variation and its full distributions remain in the report.
+
+Loaded clock medians differ by less than 1% in each service pair, and maximum
+SM clock is 3,090 MHz throughout. They are whole-run samples, not counters
+aligned to every request. Earlier exploratory microbenchmarks include power
+changes and noisy rounds; their ranges are retained and are not substituted
+for the service evidence. Tiny singleton attention kernels can lose a few
+microseconds even though the short service workloads do not materially regress.
+
+### Controls and validation
+
+`CRUCIBLE_PREFILL_ATTN=reference` selects the preserved oracle;
+`CRUCIBLE_PREFILL_ATTN=exact` selects the production `exact-q4-k64` kernel.
+Unset uses that exact path for paged prefill with head width 64 and four query
+heads per KV head. Other geometries use the reference. There is no history
+threshold. Explicit `q*-k*` names select the rejected online experiments; the
+`exact-q*-k*`, `-hybrid`, and `-cache` variants are diagnostic ablations.
+
+The dedicated tensor command compares every candidate with the old kernel and
+includes shuffled physical pages, nonzero offsets, future poisoning, distinct
+GQA heads, and persistent descriptor reuse. Exact variants use a bitwise gate.
+The selected kernel also passed 1,084 complete-model exact sequences with 24
+fixed-seed fuzz sets and zero final-logit difference, including mixed sampling,
+cancellation, and page reuse. Commands and the complete regression record are
+in the results document:
+
+```bash
+engine/target/release/llm-engine gpu-prefill-attention-check --fuzz 128
+engine/target/release/llm-engine gpu-prefill-attention-bench --variants exact-q4-k64 --iters 50 --trials 5
+engine/target/release/llm-engine gpu-packed-prefill-check export/120m --steps 16 --fuzz 24
+```
+
+The final tensor run covers 53 fixed and 128 fuzz cases: 8,688 reference
+comparisons, 960 future-poison checks and 6,000 composition, permutation and
+page-remap checks across the variant inventory. All 36 Exact variants match
+86,522,880 output elements each bit for bit. The production-default int8
+model passes the full 16-step corpus; the separate f32 path passes 847 exact
+sequences in its four-step corpus. Paged held-out CE matches the reference
+at printed precision for contexts 32, 256 and 941 (31, 63 and 17 scored
+positions respectively); the historical decode CE remains `3.720334`.
+
+The dedicated microbenchmark covers 25 shapes, including all requested
+lengths through 1024, ragged groups and 64-row chunks at nonzero offsets.
+In its five paired rounds, 4 x 256 temporary attention replay measures
+576.84 us reference versus 360.98 us selected, with a median within-round
+ratio of 1.62 (range 1.43–1.74). Power and clocks changed during this run,
+so these are descriptive kernel observations, not controlled-clock speedup
+evidence. The independent, closely matched service A/B determines the default.
+
+### Scheduler and graph decisions
+
+Three rounds re-evaluated aggregate budgets 256/512/1024 and chunk caps
+64/128/256/off under the selected kernel. One resumed round ran at a different
+clock envelope, so the report compares policies within each round. Chunk
+128 reduced the 941-token arrival's worst decoder gap by a median 55.6%,
+but increased that arrival's TTFT by 184%. Smaller budgets also worsened
+long-prompt tails. **Packing stays on, budget stays 1024, and chunk cap stays
+off.** Singleton graphs remain enabled.
+
+Temporary graphs of the complete packed greedy computation reduced the
+selected path's synchronized host time relative to full eager calls by
+14.1% for 16 x 16 and 17.7% for 4 x 256 in the longer profile runs. These
+graphs include final selection; replay excludes metadata upload, readback
+and capture cost. The difference is not pure launch overhead. A production
+transformer-only graph would keep selection outside and use bounded topology
+keys for rows, request count, query-grid extent, score capacity and variant.
+Capture amortization and cache hit rates under ragged service were not measured,
+so **packed serving graphs remain off**.
+
+### What the final profile and regressions establish
+
+Both the original 20-pass profiles and the repeated 100-pass profiles retain
+clock differences between baseline and candidate. They are excluded from
+causal stage-speedup claims. The selected kernel's own longer profile is
+still useful for locating work: at 4 x 256, attention takes 3.953 ms,
+gate/up GEMMs 3.801 ms, Q/K/V GEMMs 2.661 ms and down GEMMs 2.586 ms.
+Attention remains the largest individual category, close to gate/up; this
+milestone reduces the service bottleneck without claiming to eliminate all
+attention cost. For 16 x 16, attention is only 0.240 ms of the 8.930 ms
+instrumented total, and GEMMs dominate. No next-stage optimization is included.
+
+All four required Rust build/check commands and existing GPU suites pass.
+The HTTP oracle matches 384 sequences. Native, OpenAI, Anthropic and TUI
+regressions pass 42/125/125/19 checks, including both official SDKs. All five
+surfaces demonstrably share one 94-row packed batch. The 60-second stable
+run handles 2,100 submissions with 124 requested cancellations and no
+overload responses. The 30-second overload run handles 3,000 submissions,
+returns 1,207 bounded overload responses and never exceeds its queue limit
+of 64. Both finish with zero runtime failures and all 1,024 pages free;
+the separate 32-page pressure test also reclaims every page. WSL sanitizer
+and hardware-counter limitations remain explicit in the full report.
+
 ## Against llama.cpp and vLLM
 
 ```bash

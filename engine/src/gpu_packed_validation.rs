@@ -5,7 +5,7 @@
 //! physical pages, chunk offsets and row order all vary independently.
 
 use anyhow::{bail, ensure, Context, Result};
-use llm_engine::gpu::TOPK_MAX;
+use llm_engine::gpu::{PrefillAttentionVariant, TOPK_MAX};
 use llm_engine::gpu_model::{GpuModel, PackedPrefillRequest, Precision};
 use llm_engine::paged::{SequencePages, PAGE_TOKENS};
 use llm_engine::runtime::{FinishReason, Request, Runtime};
@@ -303,6 +303,7 @@ fn runtime_checks(
     concurrent_specs: &[Spec],
     references: &BTreeMap<u64, (Vec<usize>, Vec<f32>)>,
 ) -> Result<usize> {
+    let attention = model.prefill_attention();
     let mut runtime = Runtime::new(model)?;
     runtime.set_batched_prefill(true);
     runtime.set_chunked_prefill(true);
@@ -461,6 +462,7 @@ fn runtime_checks(
     // Physical capacity is fixed before Runtime constructs its reservation
     // ledger; reconfiguring the model underneath a live runtime is invalid.
     let mut pressure_model = GpuModel::load_with(cfg.clone(), weights, cfg.block_size, precision)?;
+    pressure_model.set_prefill_attention(attention)?;
     pressure_model.enable_paging(32, 16)?;
     let mut runtime = Runtime::new(pressure_model)?;
     runtime.set_batched_prefill(true);
@@ -597,7 +599,196 @@ fn malformed_metadata_check(model: &mut GpuModel, cfg: &Config) -> Result<usize>
     Ok(rejected)
 }
 
-pub fn check(dir: PathBuf, quant: &str, steps: usize, fuzz: usize) -> Result<()> {
+/// Replay one boundary-corpus request with a fixed oracle token history. This
+/// deliberately has no tolerance gate: it explains a failed strict check and
+/// leaves the normal generated-sequence/RNG checks unchanged.
+fn diagnose_request(
+    cfg: &Config,
+    reference: &mut GpuModel,
+    candidate: &mut GpuModel,
+    steps: usize,
+    id: u64,
+) -> Result<()> {
+    ensure!((100..=118).contains(&id), "diagnose-request supports boundary corpus IDs 100..=118");
+    ensure!(steps <= 32, "diagnose-request is bounded to at most 32 generated tokens");
+    let lengths = [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 941];
+    let corpus: Vec<_> = lengths.iter().enumerate()
+        .map(|(i, &len)| spec(100 + i as u64, len, cfg.vocab_size, steps)).collect();
+    let specs = if id <= 115 { &corpus[..16] } else { &corpus[3..] };
+    let target = specs.iter().position(|s| s.id == id).context("diagnostic target missing")?;
+    let spec = &specs[target];
+    let attention = candidate.prefill_attention();
+    println!("diagnose_request,id={id},prompt_len={},temperature={},top_k={},seed={},steps={steps},chunk=32,permutation=0,prefixes=false,requests={}",
+        spec.prompt.len(), spec.config.temperature, spec.config.top_k, spec.config.seed, specs.len());
+    println!("diagnose_history: every candidate decode consumes the monolithic Reference token at the preceding step; RNG starts from the same request seed in each pass");
+
+    let mut sequence = allocate(reference, spec.prompt.len() + steps)?;
+    let table = sequence.table_padded(reference.table_stride());
+    let mut logits = reference.prefill_chunk(&spec.prompt, &table, 0, true)?;
+    let mut oracle_logits = Vec::with_capacity(steps);
+    let mut oracle_tokens = Vec::with_capacity(steps);
+    let mut rng = Rng::new(spec.config.seed);
+    for generated in 0..steps {
+        let token = sampling::sample(&logits, &spec.config, &mut rng);
+        oracle_tokens.push(token);
+        oracle_logits.push(logits);
+        if generated + 1 < steps {
+            logits = diagnostic_decode(reference, &table, spec.prompt.len() + generated, token)?;
+        } else {
+            break;
+        }
+    }
+    sequence.release(reference.page_pool_mut())?;
+    println!("diagnose_oracle_tokens,{oracle_tokens:?}");
+
+    // The Reference packed control separates effects of packed/chunked GEMM
+    // execution from differences introduced by the attention candidate.
+    for (label, variant) in [("packed_reference", PrefillAttentionVariant::Reference), ("packed_candidate", attention)] {
+        candidate.set_prefill_attention(variant)?;
+        let (mut sequences, tables, mut logits) = diagnostic_prefill(candidate, cfg, specs, target)?;
+        let mut rng = Rng::new(spec.config.seed);
+        let mut oracle_rng = Rng::new(spec.config.seed);
+        let mut first_difference = None;
+        for generated in 0..steps {
+            let before = rng.state();
+            let mut draw_rng = rng.clone();
+            let draw = if spec.config.temperature > 0.0 { Some(draw_rng.next_f32()) } else { None };
+            let got = sampling::sample(&logits, &spec.config, &mut rng);
+            let expected = sampling::sample(&oracle_logits[generated], &spec.config, &mut oracle_rng);
+            ensure!(expected == oracle_tokens[generated], "diagnostic oracle replay changed");
+            ensure!(rng.state() == oracle_rng.state(), "diagnostic RNG advancement differs at token {}", generated + 1);
+            if got != expected && first_difference.is_none() {
+                first_difference = Some(generated + 1);
+            }
+            let expected_logits = &oracle_logits[generated];
+            ensure!(logits.len() == expected_logits.len() && logits.iter().all(|x| x.is_finite())
+                && expected_logits.iter().all(|x| x.is_finite()), "invalid diagnostic logits");
+            let mut max_abs = 0.0f64;
+            let mut squared = 0.0f64;
+            let mut bit_differences = 0usize;
+            let mut worst = 0usize;
+            for (index, (&a, &b)) in expected_logits.iter().zip(&logits).enumerate() {
+                let difference = (a as f64 - b as f64).abs();
+                if difference > max_abs { max_abs = difference; worst = index; }
+                squared += difference * difference;
+                bit_differences += usize::from(a.to_bits() != b.to_bits());
+            }
+            let rms = (squared / logits.len() as f64).sqrt();
+            let draw_text = draw.map(|d| format!("{d:.9}")).unwrap_or_else(|| "none".into());
+            println!("diagnose_step,{label},variant={},token={},input={},expected={expected},got={got},equal={},max_abs={max_abs:.9e},rms={rms:.9e},different_bits={bit_differences},worst_id={worst},worst_reference={:.9e},worst_candidate={:.9e},rng_before={before},rng_after={},draw={draw_text}",
+                variant.name(), generated + 1, if generated == 0 { spec.prompt[spec.prompt.len() - 1] } else { oracle_tokens[generated - 1] },
+                expected == got, expected_logits[worst], logits[worst], rng.state());
+            if generated == 0 || got != expected {
+                diagnostic_sampling("reference", expected_logits, &spec.config, expected, got, draw);
+                diagnostic_sampling(label, &logits, &spec.config, got, expected, draw);
+                let expected_ids: std::collections::BTreeSet<_> = sampling::top_k(expected_logits, spec.config.top_k)
+                    .into_iter().map(|(id, _)| id).collect();
+                let overlap = sampling::top_k(&logits, spec.config.top_k).iter()
+                    .filter(|(id, _)| expected_ids.contains(id)).count();
+                println!("diagnose_candidates,{label},token={},top_k_overlap={overlap}/{}", generated + 1, expected_ids.len());
+            }
+            if generated + 1 < steps {
+                logits = diagnostic_decode(candidate, &tables[target], spec.prompt.len() + generated, expected)?;
+            }
+        }
+        for seq in sequences.iter_mut().rev() { seq.release(candidate.page_pool_mut())?; }
+        ensure!(candidate.page_pool().used_pages() == 0, "diagnostic pages leaked");
+        println!("diagnose_first_different_choice,{label},{}", first_difference.map(|s| s.to_string()).unwrap_or_else(|| "none".into()));
+    }
+    candidate.set_prefill_attention(attention)?;
+    println!("Diagnostic complete; run the unmodified strict check without --diagnose-request for the acceptance result.");
+    Ok(())
+}
+
+fn diagnostic_decode(model: &mut GpuModel, table: &[i32], position: usize, token: usize) -> Result<Vec<f32>> {
+    let mut tables = vec![0; model.max_batch() * model.table_stride()];
+    tables[..table.len()].copy_from_slice(table);
+    Ok(model.decode_batch_mixed(&[token], &[position], &tables, &[(position + 1) as i32], &[], &[0])?.full)
+}
+
+fn diagnostic_prefill(
+    model: &mut GpuModel,
+    cfg: &Config,
+    specs: &[Spec],
+    target: usize,
+) -> Result<(Vec<SequencePages>, Vec<Vec<i32>>, Vec<f32>)> {
+    let mut sequences = Vec::new();
+    for spec in specs { sequences.push(allocate(model, spec.prompt.len() + spec.config.max_tokens)?); }
+    let tables: Vec<_> = sequences.iter().map(|s| s.table_padded(model.table_stride())).collect();
+    let mut consumed = vec![0; specs.len()];
+    let mut target_logits = None;
+    while consumed.iter().zip(specs).any(|(&n, s)| n < s.prompt.len()) {
+        let mut remaining = cfg.block_size;
+        let mut plan = Vec::new();
+        for (index, spec) in specs.iter().enumerate() {
+            if consumed[index] == spec.prompt.len() { continue; }
+            let len = 32.min(spec.prompt.len() - consumed[index]).min(remaining);
+            if len == 0 { break; }
+            plan.push((index, consumed[index], len));
+            remaining -= len;
+        }
+        ensure!(!plan.is_empty(), "diagnostic packed plan made no progress");
+        let descriptors: Vec<_> = plan.iter().map(|&(index, start, len)| PackedPrefillRequest {
+            tokens: &specs[index].prompt[start..start + len], page_table: &tables[index],
+            pos_offset: start, want_logits: start + len == specs[index].prompt.len(),
+        }).collect();
+        let finals: Vec<_> = plan.iter().filter_map(|&(index, start, len)|
+            (start + len == specs[index].prompt.len()).then_some(index)).collect();
+        let topk_rows: Vec<_> = finals.iter().enumerate().filter_map(|(row, &index)| {
+            let c = &specs[index].config;
+            (c.temperature > 0.0 && c.top_k <= TOPK_MAX).then_some((row, c.top_k))
+        }).collect();
+        let full_rows: Vec<_> = finals.iter().enumerate().filter_map(|(row, &index)| {
+            let c = &specs[index].config;
+            (c.temperature > 0.0 && c.top_k > TOPK_MAX).then_some(row)
+        }).collect();
+        model.prefill_packed(&descriptors, &topk_rows, &full_rows)?;
+        if !finals.is_empty() {
+            let rows: Vec<_> = (0..finals.len()).collect();
+            let diagnostic = model.prefill_packed(&descriptors, &[], &rows)?.full;
+            if let Some(row) = finals.iter().position(|&index| index == target) {
+                target_logits = Some(diagnostic[row * cfg.vocab_size..(row + 1) * cfg.vocab_size].to_vec());
+            }
+        }
+        for (index, _, len) in plan { consumed[index] += len; }
+    }
+    Ok((sequences, tables, target_logits.context("diagnostic final row missing")?))
+}
+
+fn diagnostic_sampling(label: &str, logits: &[f32], config: &GenerationConfig, chosen: usize, other: usize, draw: Option<f32>) {
+    let k = config.top_k.clamp(1, logits.len());
+    let ranked = sampling::top_k(logits, (k + 1).min(logits.len()));
+    let candidates = &ranked[..k];
+    let best = candidates[0].1;
+    let gap = if k < ranked.len() { candidates[k - 1].1 - ranked[k].1 } else { f32::NAN };
+    let top_gap = if ranked.len() > 1 { best - ranked[1].1 } else { f32::NAN };
+    println!("diagnose_distribution,{label},top1_gap={top_gap:.9e},topk_cutoff_gap={gap:.9e},selected_logit={:.9e},other_logit={:.9e},selected_minus_other={:.9e}",
+        logits[chosen], logits[other], logits[chosen] - logits[other]);
+    if config.temperature <= 0.0 {
+        for (rank, &(id, value)) in candidates.iter().enumerate() {
+            if rank < 8 || id == chosen || id == other {
+                println!("diagnose_candidate,{label},rank={},id={id},logit={value:.9e},chosen={},other={}",
+                    rank + 1, id == chosen, id == other);
+            }
+        }
+        return;
+    }
+    let weights: Vec<_> = candidates.iter().map(|(_, value)| ((*value - best) / config.temperature).exp()).collect();
+    let sum: f64 = weights.iter().map(|&w| w as f64).sum();
+    let mut cumulative = 0.0f64;
+    for (rank, (&(id, value), &weight)) in candidates.iter().zip(&weights).enumerate() {
+        let lower = cumulative / sum;
+        cumulative += weight as f64;
+        let upper = cumulative / sum;
+        if rank < 8 || id == chosen || id == other {
+            let margin = draw.map(|d| ((d as f64) - lower).min(upper - d as f64)).unwrap_or(f64::NAN);
+            println!("diagnose_candidate,{label},rank={},id={id},logit={value:.9e},probability={:.9e},cdf_lower={lower:.12},cdf_upper={upper:.12},draw_margin={margin:.9e},chosen={},other={}",
+                rank + 1, weight as f64 / sum, id == chosen, id == other);
+        }
+    }
+}
+
+pub fn check(dir: PathBuf, quant: &str, steps: usize, fuzz: usize, diagnostic: Option<u64>) -> Result<()> {
     let cfg = Config::from_file(dir.join("config.json"))?;
     ensure!(
         steps > 0 && cfg.block_size > steps + 941,
@@ -606,7 +797,12 @@ pub fn check(dir: PathBuf, quant: &str, steps: usize, fuzz: usize) -> Result<()>
     let weights = Weights::open(dir.join("model.safetensors"))?;
     let precision = Precision::parse(quant).context("unknown precision")?;
     let mut reference = load(&cfg, &weights, precision)?;
+    reference.set_prefill_attention(PrefillAttentionVariant::Reference)?;
     let mut candidate = load(&cfg, &weights, precision)?;
+    println!("Attention A/B: canonical reference versus {}; precision {quant}; exact token and seeded RNG comparison", candidate.prefill_attention().name());
+    if let Some(id) = diagnostic {
+        return diagnose_request(&cfg, &mut reference, &mut candidate, steps, id);
+    }
     malformed_metadata_check(&mut candidate, &cfg)?;
     let lengths = [
         1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 941,

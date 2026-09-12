@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use cudarc::driver::{CudaEvent, CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{attn_chunks, Gpu, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{attn_chunks, Gpu, PrefillAttentionVariant, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
 use crate::ops::RopeTable;
 use crate::paged::{PagePool, SequencePages, PAGE_TOKENS};
 use crate::quant::QuantTensor;
@@ -212,6 +212,8 @@ struct PrefillScratch {
     normed: CudaSlice<f32>,
     q: CudaSlice<f32>,
     kv: CudaSlice<f32>,
+    // Retained rotated K only for the explicit hybrid attention experiment.
+    current_k: Option<CudaSlice<f32>>,
     attn: CudaSlice<f32>,
     proj: CudaSlice<f32>,
     gate: CudaSlice<f32>,
@@ -233,6 +235,11 @@ pub struct PackedPrefillRequest<'a> {
 struct PackedPrefillScratch {
     owners: CudaSlice<i32>,
     positions: CudaSlice<i32>,
+    segments: CudaSlice<i32>,
+    host_segments: Vec<i32>,
+    requests: usize,
+    max_chunk: usize,
+    max_history: usize,
     final_rows: CudaSlice<i32>,
     host_tokens: Vec<i32>,
     host_owners: Vec<i32>,
@@ -394,15 +401,14 @@ pub struct GpuModel {
     /// the lm_head projection. Folding both into one graph would put that work
     /// back, which the previous milestone removed on purpose.
     ///
-    /// A chunk's offset into its prompt is *not* in the key: it lives in the
-    /// parameter buffer, so full chunks of the same size share one graph
-    /// however far into a prompt they are. That is what makes chunked prefill
-    /// cheap to cache -- every full chunk is one key -- while monolithic
-    /// prefill needs a key per distinct prompt length.
-    prefill_graphs: HashMap<(usize, bool), CudaGraph>,
+    /// Positions and pages stay dynamic. Exact attention also keys the bounded
+    /// shared-score capacity (256/512/768/1024 for this model), since that changes
+    /// launch topology. Full chunks reuse a graph within each capacity bucket;
+    /// the existing 64-entry limit still bounds the whole cache.
+    prefill_graphs: HashMap<(usize, bool, usize), CudaGraph>,
     /// Keys whose capture failed. Retrying every call would pay the failure
     /// cost forever; eager execution is correct, so it is the fallback.
-    prefill_graph_failed: HashSet<(usize, bool)>,
+    prefill_graph_failed: HashSet<(usize, bool, usize)>,
     use_prefill_graph: bool,
     prefill_graphs_captured: usize,
     prefill_graph_capture_secs: f64,
@@ -434,6 +440,10 @@ pub struct GpuModel {
     use_graph: bool,
 
     prefill_scratch: PrefillScratch,
+    prefill_attention: PrefillAttentionVariant,
+    // Exact attention's bounded shared-score allocation is graph topology.
+    // Actual positions and page IDs remain dynamic descriptor contents.
+    prefill_score_capacity: usize,
     packed_prefill: Option<PackedPrefillScratch>,
 
     /// Split-position attention, versus one block per head.
@@ -524,6 +534,10 @@ impl GpuModel {
         let d = cfg.n_embd;
         let kv_dim = cfg.n_kv_head * cfg.head_dim();
 
+        let prefill_attention: PrefillAttentionVariant = std::env::var("CRUCIBLE_PREFILL_ATTN")
+            .unwrap_or_else(|_| "exact-q4-k64".to_owned()).parse()?;
+        let hybrid = prefill_attention.uses_hybrid();
+
         Ok(Self {
             tok_emb: upload("tok_emb.weight")?,
             precision,
@@ -550,6 +564,7 @@ impl GpuModel {
                 normed: gpu.alloc(capacity * d)?,
                 q: gpu.alloc(capacity * d)?,
                 kv: gpu.alloc(capacity * kv_dim)?,
+                current_k: if hybrid { Some(gpu.alloc(capacity * kv_dim)?) } else { None },
                 attn: gpu.alloc(capacity * d)?,
                 proj: gpu.alloc(capacity * d)?,
                 gate: gpu.alloc(capacity * hidden)?,
@@ -557,6 +572,8 @@ impl GpuModel {
                 last: gpu.alloc(d)?,
             },
             packed_prefill: None,
+            prefill_attention,
+            prefill_score_capacity: 0,
             k_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             v_cache: gpu.alloc(cfg.n_layer * capacity * kv_dim)?,
             // Paging starts switched off and unallocated; `enable_paging`
@@ -688,6 +705,11 @@ impl GpuModel {
         self.packed_prefill = Some(PackedPrefillScratch {
             owners: self.gpu.to_device_i32(&vec![0; self.capacity])?,
             positions: self.gpu.to_device_i32(&vec![0; self.capacity])?,
+            segments: self.gpu.to_device_i32(&vec![0; 4 * max_batch])?,
+            host_segments: vec![0; 4 * max_batch],
+            requests: 0,
+            max_chunk: 0,
+            max_history: 0,
             final_rows: self.gpu.to_device_i32(&vec![0; max_batch])?,
             host_tokens: vec![0; self.capacity],
             host_owners: vec![0; self.capacity],
@@ -822,6 +844,33 @@ impl GpuModel {
         self.use_prefill_graph
     }
 
+    /// Diagnostic attention A/B control. Changing code or scratch addresses
+    /// invalidates singleton captures; no request identity enters graph keys.
+    pub fn set_prefill_attention(&mut self, variant: PrefillAttentionVariant) -> Result<()> {
+        variant.validate()?;
+        self.gpu.sync()?;
+        self.invalidate_prefill_graphs();
+        if let Some(p) = self.packed_prefill.as_mut() {
+            p.prepared_shape = None;
+        }
+        if variant.uses_hybrid() && self.prefill_scratch.current_k.is_none()
+        {
+            self.prefill_scratch.current_k = Some(self.gpu.alloc(
+                self.capacity * self.cfg.n_kv_head * self.cfg.head_dim())?);
+        }
+        self.prefill_attention = variant;
+        Ok(())
+    }
+
+    pub fn prefill_attention(&self) -> PrefillAttentionVariant {
+        self.prefill_attention
+    }
+
+    fn tiled_prefill_attention(&self) -> bool {
+        self.use_paged && !self.prefill_attention.is_reference()
+            && self.cfg.head_dim() == 64 && self.cfg.n_head == 4 * self.cfg.n_kv_head
+    }
+
     /// Graphs captured, replays served, and the wall time capture cost.
     pub fn prefill_graph_stats(&self) -> (usize, usize, f64) {
         (
@@ -845,7 +894,7 @@ impl GpuModel {
         want_logits: bool,
         iters: usize,
     ) -> Result<f64> {
-        let key = (len, want_logits);
+        let key = (len, want_logits, self.prefill_score_capacity);
         if !self.prefill_graphs.contains_key(&key) {
             bail!("no captured prefill graph for {len} tokens; run one first");
         }
@@ -2163,6 +2212,9 @@ impl GpuModel {
         }
         let p = self.packed_prefill.as_mut().expect("paging allocates packed metadata");
         p.prepared_shape = None;
+        p.requests = 0;
+        p.max_chunk = 0;
+        p.max_history = 0;
         p.page_owner.fill(-1);
         p.selection_kind.fill(0);
         self.host_tables.fill(0);
@@ -2200,6 +2252,10 @@ impl GpuModel {
             }
             let start = owner * self.table_stride;
             self.host_tables[start..start + self.table_stride].copy_from_slice(chunk.page_table);
+            p.host_segments[4 * owner..4 * owner + 4].copy_from_slice(&[
+                rows as i32, chunk.tokens.len() as i32, chunk.pos_offset as i32, owner as i32]);
+            p.max_chunk = p.max_chunk.max(chunk.tokens.len());
+            p.max_history = p.max_history.max(end);
             if chunk.want_logits {
                 p.host_final_rows[finals] = (packed_end - 1) as i32;
                 finals += 1;
@@ -2228,6 +2284,10 @@ impl GpuModel {
         for &(row, k) in topk_rows {
             self.host_row_k[row] = k as i32;
         }
+        p.requests = chunks.len();
+        self.prefill_score_capacity = if matches!(self.prefill_attention, PrefillAttentionVariant::Exact { .. }) {
+            (p.max_history.div_ceil(256) * 256).min(self.table_stride * PAGE_TOKENS)
+        } else { 0 };
         Ok((rows, finals))
     }
 
@@ -2242,6 +2302,9 @@ impl GpuModel {
         self.gpu.write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
         self.gpu.write_i32(&mut p.owners, &p.host_owners[..rows])?;
         self.gpu.write_i32(&mut p.positions, &p.host_positions[..rows])?;
+        if !self.prefill_attention.is_reference() {
+            self.gpu.write_i32(&mut p.segments, &p.host_segments[..4 * p.requests])?;
+        }
         self.gpu.write_i32(&mut self.page_tables, &self.host_tables)?;
         if finals != 0 {
             self.gpu.write_i32(&mut p.final_rows, &p.host_final_rows[..finals])?;
@@ -2388,10 +2451,23 @@ impl GpuModel {
     /// Queue or replay the shared reference topology without choosing a host
     /// result representation. Full-logit and compact singleton APIs share it.
     fn run_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
+        self.prefill_score_capacity = if self.tiled_prefill_attention()
+            && matches!(self.prefill_attention, PrefillAttentionVariant::Exact { .. }) {
+            ((t + self.host_params[PARAM_PREFILL_POS] as usize).div_ceil(256) * 256)
+                .min(self.table_stride * PAGE_TOKENS)
+        } else { 0 };
+        if self.tiled_prefill_attention() {
+            let p = self.packed_prefill.as_mut().expect("paging allocates descriptors");
+            p.host_segments[..4].copy_from_slice(&[
+                0, t as i32, self.host_params[PARAM_PREFILL_POS], 0]);
+            p.requests = 1;
+            p.max_chunk = t;
+            self.gpu.write_i32(&mut p.segments, &p.host_segments[..4])?;
+        }
         // Capture-or-replay, on exactly the sequence eager execution issues.
         // Only the paged path is eligible: the contiguous fallback still takes
         // its offset by value, and it is the legacy single-sequence path.
-        let key = (t, want_logits);
+        let key = (t, want_logits, self.prefill_score_capacity);
         if self.use_prefill_graph && self.use_paged {
             if !self.prefill_graphs.contains_key(&key)
                 && !self.prefill_graph_failed.contains(&key)
@@ -2465,6 +2541,8 @@ impl GpuModel {
         let cfg = &self.cfg;
         let (d, hd, n_head, n_kv) = (cfg.n_embd, cfg.head_dim(), cfg.n_head, cfg.n_kv_head);
         let kv_dim = n_kv * hd;
+        let tiled_attention = self.tiled_prefill_attention();
+        let hybrid_attention = tiled_attention && self.prefill_attention.uses_hybrid();
 
         {
             let p = &mut self.prefill_scratch;
@@ -2484,26 +2562,29 @@ impl GpuModel {
 
             // K and V go through a dense [T, kv_dim] buffer and are then placed
             // into the cache, so prefill and decode share one cache layout.
-            self.gpu.gemm(&layer.k_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
+            let current_k = if hybrid_attention {
+                p.current_k.as_mut().expect("hybrid scratch allocated before inference")
+            } else { &mut p.kv };
+            self.gpu.gemm(&layer.k_proj.view(), &p.normed, current_k, t, kv_dim, d, false)?;
             mark!("qkv_gemm");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.rope_rows(&mut p.kv, &self.rope_cos, &self.rope_sin,
+                self.gpu.rope_rows(current_k, &self.rope_cos, &self.rope_sin,
                     &meta.positions, t, n_kv, hd, kv_dim)?;
             } else {
-                self.gpu.rope_batch(&mut p.kv, &self.rope_cos, &self.rope_sin,
+                self.gpu.rope_batch(current_k, &self.rope_cos, &self.rope_sin,
                     t, n_kv, hd, kv_dim, &self.params)?;
             }
             mark!("rope");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.cache_store_packed_paged(&p.kv, &mut self.k_pool, &self.page_tables,
+                self.gpu.cache_store_packed_paged(current_k, &mut self.k_pool, &self.page_tables,
                     &meta.owners, &meta.positions, t, kv_dim, self.table_stride, cfg.n_layer, l)?;
             } else if self.use_paged {
-                self.gpu.cache_store_paged(&p.kv, &mut self.k_pool, &self.page_tables,
+                self.gpu.cache_store_paged(current_k, &mut self.k_pool, &self.page_tables,
                                            t, kv_dim, cfg.n_layer, l, &self.params)?;
             } else {
-                self.gpu.cache_store(&p.kv, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
+                self.gpu.cache_store(current_k, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
             }
             mark!("kv_store");
 
@@ -2533,7 +2614,14 @@ impl GpuModel {
             }
             mark!("rope");
 
-            if packed {
+            if tiled_attention {
+                let meta = self.packed_prefill.as_ref().expect("attention descriptors");
+                self.gpu.attention_prefill_tiled(&p.q, &self.k_pool, &self.v_pool,
+                    p.current_k.as_ref().unwrap_or(&p.kv), &p.kv, &mut p.attn,
+                    &self.page_tables, &meta.segments, meta.requests, meta.max_chunk,
+                    self.table_stride, n_head, n_kv, hd, cfg.n_layer, l, kv_dim,
+                    self.prefill_attention, self.prefill_score_capacity)?;
+            } else if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
                 self.gpu.attention_prefill_packed(&p.q, &self.k_pool, &self.v_pool,
                     &mut p.attn, &self.page_tables, &meta.owners, &meta.positions,
