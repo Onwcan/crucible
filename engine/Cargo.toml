@@ -9,7 +9,7 @@ repository = "https://github.com/Onwcan/crucible"
 [dependencies]
 # Zero-copy checkpoint access: safetensors gives byte ranges into a memory
 # mapped file, so loading a multi-GB model costs no deserialisation pass.
-safetensors = "0.4"
+safetensors = "0.8"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
