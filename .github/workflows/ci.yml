@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TARGET_DIR: engine/target
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install stable Rust
+        id: rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+          printf 'cache-id=%s\n' "$(rustc -vV | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      # Pre-existing whole-crate drift is reserved for a separate formatting commit.
+      # Remove continue-on-error and the warning step after normalization is green.
+      - name: Rust formatting (informational until normalization)
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
+      - name: Report formatting debt
+        if: steps.fmt.outcome == 'failure'
+        run: echo '::warning title=Rust formatting debt::rustfmt failed; inspect its diff above. Formatting is informational until the dedicated normalization commit, not a passing required gate.'
+      - name: Check Python, JSON, documentation and repository hygiene
+        run: python scripts/ci_source.py
+      - name: Test the CI checks
+        run: python -m unittest discover -s tests -p 'test_ci_*.py'
+      - name: Check bootstrap shell syntax and diagnostics
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends shellcheck
+          fi
+          shellcheck --severity=warning scripts/setup_wsl.sh
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-quality-${{ steps.rust.outputs.cache-id }}-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-quality-${{ steps.rust.outputs.cache-id }}-
+      - name: Clippy correctness and suspicious-code gate
+        run: cargo clippy --manifest-path engine/Cargo.toml --all-targets --locked -- -D clippy::correctness -D clippy::suspicious
+      - name: Verify checks left the checkout clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        id: rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+          printf 'cache-id=%s\n' "$(rustc -vV | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ steps.rust.outputs.cache-id }}-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ steps.rust.outputs.cache-id }}-
+      - name: CPU and headless TUI tests
+        run: cargo test --manifest-path engine/Cargo.toml --locked
+      - name: Verify tests left the checkout clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+
+  feature-checks:
+    name: feature-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        id: rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+          printf 'cache-id=%s\n' "$(rustc -vV | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-features-${{ steps.rust.outputs.cache-id }}-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-features-${{ steps.rust.outputs.cache-id }}-
+      - name: Core without optional features
+        run: cargo test --manifest-path engine/Cargo.toml --no-default-features --locked
+      - name: TUI without CUDA
+        run: cargo check --manifest-path engine/Cargo.toml --no-default-features --features tui --locked
+      # cudarc's documented binding-version override avoids nvcc detection.
+      # These tests exercise host protocol code, never NVRTC or GPU kernels.
+      - name: CUDA binding compilation and host protocol tests
+        env:
+          CUDARC_CUDA_VERSION: '13020'
+          CUDA_VISIBLE_DEVICES: '-1'
+        run: cargo test --manifest-path engine/Cargo.toml --features cuda --locked
+      - name: Verify checks left the checkout clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"
+
+  dependency-audit:
+    name: dependency-audit (informational)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Advisory policy starts informational; this is not a required merge check.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit the lockfile against RustSec
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/cargo-audit-0.22.2"
+          mkdir -p "$tool_dir"
+          curl --fail --location --retry 3 --output "$tool_dir/archive.tgz" \
+            'https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz'
+          printf '%s  %s\n' '7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428' "$tool_dir/archive.tgz" | sha256sum --check --strict
+          tar -xzf "$tool_dir/archive.tgz" --directory "$tool_dir" --strip-components=1 \
+            cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit
+          "$tool_dir/cargo-audit" audit --file engine/Cargo.lock
+      - name: Verify audit left the checkout clean
+        run: test -z "$(git status --porcelain --untracked-files=all)"

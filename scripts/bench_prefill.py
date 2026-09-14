@@ -81,7 +81,7 @@ def run(binary: str, model: str, seq: int, gemm: str) -> float | None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--binary", default="./target/release/llm-engine")
-    p.add_argument("--model", default="/home/onur/llm-lab/export/120m")
+    p.add_argument("--model", default="export/120m")
     p.add_argument("--seqs", default="128,256,512,1024")
     p.add_argument("--trials", type=int, default=5)
     p.add_argument("--only", default=None,

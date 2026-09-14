@@ -1,5 +1,7 @@
 # crucible
 
+[![CI](https://github.com/Onwcan/crucible/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Onwcan/crucible/actions/workflows/ci.yml)
+
 Training small language models from scratch and building a custom inference
 engine, targeting **NVIDIA Blackwell (`sm_120`)** hardware.
 
@@ -3239,10 +3241,19 @@ equivalent.
 `test_causality` verifies that editing token *t* leaves every output before *t*
 bit-identical, which catches a broken mask that a falling loss curve would hide.
 
-The engine has its own suites, which need a GPU and a running server:
+The engine's Rust unit and mock-server suites run without a GPU. With cudarc's
+binding-version override, this also covers host code behind the CUDA feature:
 
 ```bash
-cd engine && cargo test --features cuda        # unit + mock-server tests
+cargo test --manifest-path engine/Cargo.toml --locked
+CUDARC_CUDA_VERSION=13020 CUDA_VISIBLE_DEVICES=-1 cargo test --manifest-path engine/Cargo.toml --features cuda --locked
+```
+
+Real kernel checks need a GPU; HTTP and TUI checks also need a provisioned model,
+tokenizer, and running server:
+
+```bash
+cd engine
 ./target/release/llm-engine gpu-validate       # every kernel against the CPU reference
 python ../scripts/test_serve.py --port 8080    # native HTTP
 python ../scripts/test_openai.py --port 8080 --sdk /path/to/python
@@ -3260,6 +3271,24 @@ Both suites also check what shape tests cannot: streamed text equal to
 non-streamed across split UTF-8, cross-protocol prompt equivalence, seeded
 determinism, disconnect cancellation, and that requests from every protocol
 share decode steps in one scheduler.
+
+## Continuous integration
+
+[Hosted CI](.github/workflows/ci.yml) reports existing Rust formatting debt
+informationally until a separate normalization commit, and gates Clippy correctness
+and suspicious-code diagnostics, locked CPU tests, feature isolation, and
+Python/JSON/documentation/repository hygiene. CUDA-feature Rust compilation and
+host protocol tests run without a toolkit or GPU; kernel execution and NVRTC
+correctness are covered only by the separate GPU suite.
+
+[Optional GPU CI](.github/workflows/gpu-ci.yml) is prepared for manual dispatch
+on trusted `main` with local assets and a provisioned NVIDIA runner in a group
+restricted to this workflow/ref. It offers smoke, full, and native-Linux
+sanitizer modes. That independent runner access policy must be configured before
+registration to keep public PR workflows off the GPU machine. The first GitHub runs are pending until
+commit and push. See [CONTRIBUTING.md](CONTRIBUTING.md) for exact
+commands and setup, and the [CI report](docs/ci-results.md) for validation status.
+Performance measurements remain separate from CI correctness gates.
 
 ## Roadmap
 
@@ -3316,6 +3345,7 @@ share decode steps in one scheduler.
 - [x] Per-launch tile dispatch — measured, now the default: ties at seq 128,
       +5.8% / +11.9% / +18.5% at 256/512/1024, bit-identical output
 - [ ] vLLM comparison — blocked: WSL2 does not expose UVA, needs native Linux
+- [x] Hosted CPU/source CI and optional manual GPU workflow prepared; first GitHub runs pending
 
 ## License
 

@@ -1,0 +1,51 @@
+name: GPU CI
+
+# Repository code runs on a private machine: never add public PR triggers here.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: CUDA correctness suite
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
+          - sanitizer
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: GPU correctness (${{ inputs.mode }})
+    # Dispatch only trusted main. Checkout uses this event's SHA, with no PR ref input.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # The group must independently allow only this workflow at refs/heads/main.
+    # Labels alone cannot stop a PR from modifying another workflow to target it.
+    runs-on:
+      group: crucible-trusted
+      labels: [self-hosted, linux, x64, nvidia, crucible-gpu]
+    timeout-minutes: ${{ inputs.mode == 'sanitizer' && 90 || 60 }}
+    env:
+      CI_GPU_MODE: ${{ inputs.mode }}
+      # These are local runner assets, configured as repository variables, not downloads.
+      CRUCIBLE_MODEL_PATH: ${{ vars.CRUCIBLE_MODEL_PATH }}
+      CRUCIBLE_TOKENIZER_PATH: ${{ vars.CRUCIBLE_TOKENIZER_PATH }}
+      CRUCIBLE_HELDOUT_PATH: ${{ vars.CRUCIBLE_HELDOUT_PATH }}
+      CRUCIBLE_OPENAI_PYTHON: ${{ vars.CRUCIBLE_OPENAI_PYTHON }}
+      CRUCIBLE_ANTHROPIC_PYTHON: ${{ vars.CRUCIBLE_ANTHROPIC_PYTHON }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Preflight and run CUDA correctness
+        shell: bash
+        run: python3 scripts/ci_gpu.py --mode "$CI_GPU_MODE"
