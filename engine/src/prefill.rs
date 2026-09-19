@@ -22,7 +22,10 @@ pub fn validate_request(
     if pages > pool_pages {
         bail!("request needs {pages} KV pages but pool capacity is {pool_pages}");
     }
-    if let Some(token) = prompt.iter().find(|&&id| id >= vocab || id > i32::MAX as usize) {
+    if let Some(token) = prompt
+        .iter()
+        .find(|&&id| id >= vocab || id > i32::MAX as usize)
+    {
         bail!("request token {token} outside vocabulary {vocab}");
     }
     Ok(())
@@ -460,7 +463,10 @@ mod tests {
         assert!(validate_request(&[1], &GenerationConfig::greedy(0), 100, 1024, 64).is_err());
         assert!(validate_request(&[1; 16], &GenerationConfig::greedy(2), 100, 1024, 1).is_err());
         assert!(validate_request(&[1; 16], &GenerationConfig::greedy(2), 100, 16, 64).is_err());
-        let bad_sampling = GenerationConfig { temperature: f32::NAN, ..config };
+        let bad_sampling = GenerationConfig {
+            temperature: f32::NAN,
+            ..config
+        };
         assert!(validate_request(&[1], &bad_sampling, 100, 1024, 64).is_err());
     }
 
@@ -470,8 +476,11 @@ mod tests {
         let prefilling = [9, 87];
         let active = [5, 16];
         for duplicate in [42, 100, 9, 87, 5, 16] {
-            assert!(validate_request_identity(duplicate,
-                pending.into_iter().chain(prefilling).chain(active)).is_err());
+            assert!(validate_request_identity(
+                duplicate,
+                pending.into_iter().chain(prefilling).chain(active)
+            )
+            .is_err());
         }
         // Slot permutation and removal have no bearing on identity.
         assert!(validate_request_identity(16, [5, 16]).is_err());

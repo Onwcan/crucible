@@ -30,8 +30,10 @@ use std::time::{Duration, Instant};
 
 use crate::gpu_model::{GpuModel, PackedPrefillRequest};
 use crate::paged::SequencePages;
-use crate::prefill::{request_page_reservation, validate_request, validate_request_identity,
-    PageReservations, PrefillBatchPlan, PrefillBudget, PrefillWork};
+use crate::prefill::{
+    request_page_reservation, validate_request, validate_request_identity, PageReservations,
+    PrefillBatchPlan, PrefillBudget, PrefillWork,
+};
 use crate::sampling::{self, GenerationConfig, Rng};
 
 /// Work submitted to the runtime.
@@ -207,7 +209,8 @@ pub const DEFAULT_PREFILL_TOKEN_BUDGET: usize = 1024;
 
 fn env_positive(name: &str, default: usize, capacity: usize) -> Result<usize> {
     let value = match std::env::var(name) {
-        Ok(v) => v.parse::<usize>()
+        Ok(v) => v
+            .parse::<usize>()
             .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?,
         Err(std::env::VarError::NotPresent) => default.min(capacity),
         Err(e) => bail!("could not read {name}: {e}"),
@@ -227,11 +230,19 @@ impl Runtime {
         }
         let max_batch = model.max_batch();
         let capacity = model.prefill_token_capacity();
-        let prefill_chunk = env_positive("CRUCIBLE_PREFILL_CHUNK", DEFAULT_PREFILL_CHUNK, capacity)?;
+        let prefill_chunk =
+            env_positive("CRUCIBLE_PREFILL_CHUNK", DEFAULT_PREFILL_CHUNK, capacity)?;
         let prefill_token_budget = env_positive(
-            "CRUCIBLE_PREFILL_TOKEN_BUDGET", DEFAULT_PREFILL_TOKEN_BUDGET, capacity)?;
+            "CRUCIBLE_PREFILL_TOKEN_BUDGET",
+            DEFAULT_PREFILL_TOKEN_BUDGET,
+            capacity,
+        )?;
         let request_capacity = model.prefill_request_capacity();
-        let max_prefill_requests = env_positive("CRUCIBLE_MAX_PREFILL_REQUESTS", request_capacity, request_capacity)?;
+        let max_prefill_requests = env_positive(
+            "CRUCIBLE_MAX_PREFILL_REQUESTS",
+            request_capacity,
+            request_capacity,
+        )?;
         let prefill_tables = vec![0; max_batch * model.table_stride()];
         let page_reservations = PageReservations::new(model.page_pool().n_pages());
         Ok(Self {
@@ -277,25 +288,37 @@ impl Runtime {
         self.batched_prefill = on;
     }
 
-    pub fn batched_prefill(&self) -> bool { self.batched_prefill }
+    pub fn batched_prefill(&self) -> bool {
+        self.batched_prefill
+    }
 
     /// Borrow the most recently executed packed-policy plan without copying it.
     /// Inspect only when the returned StepInfo has prefill_batches > 0 and
     /// batched_prefill is enabled; decode-only steps retain the previous plan.
-    pub fn last_prefill_plan(&self) -> &PrefillBatchPlan { &self.prefill_plan }
+    pub fn last_prefill_plan(&self) -> &PrefillBatchPlan {
+        &self.prefill_plan
+    }
 
     pub fn set_prefill_token_budget(&mut self, tokens: usize) -> Result<()> {
-        self.prefill_budget(tokens, self.max_prefill_requests).validate(
-            self.model.prefill_token_capacity(), self.model.prefill_request_capacity())?;
+        self.prefill_budget(tokens, self.max_prefill_requests)
+            .validate(
+                self.model.prefill_token_capacity(),
+                self.model.prefill_request_capacity(),
+            )?;
         self.prefill_token_budget = tokens;
         Ok(())
     }
 
-    pub fn prefill_token_budget(&self) -> usize { self.prefill_token_budget }
+    pub fn prefill_token_budget(&self) -> usize {
+        self.prefill_token_budget
+    }
 
     pub fn set_max_prefill_requests(&mut self, requests: usize) -> Result<()> {
-        self.prefill_budget(self.prefill_token_budget, requests).validate(
-            self.model.prefill_token_capacity(), self.model.prefill_request_capacity())?;
+        self.prefill_budget(self.prefill_token_budget, requests)
+            .validate(
+                self.model.prefill_token_capacity(),
+                self.model.prefill_request_capacity(),
+            )?;
         self.max_prefill_requests = requests;
         Ok(())
     }
@@ -304,7 +327,11 @@ impl Runtime {
         PrefillBudget {
             tokens,
             requests,
-            chunk: if self.chunked_prefill { self.prefill_chunk } else { self.model.prefill_token_capacity() },
+            chunk: if self.chunked_prefill {
+                self.prefill_chunk
+            } else {
+                self.model.prefill_token_capacity()
+            },
         }
     }
 
@@ -316,11 +343,21 @@ impl Runtime {
     /// Reject malformed work and duplicate live identity before queue or KV
     /// state changes. A rejected caller cannot invalidate neighboring requests.
     pub fn submit(&mut self, req: Request) -> Result<()> {
-        validate_request(&req.prompt, &req.config, self.model.cfg.vocab_size,
-            self.model.prefill_token_capacity(), self.model.page_pool().n_pages())?;
-        validate_request_identity(req.id, self.pending.iter().map(|r| r.id)
-            .chain(self.prefilling.iter().map(|r| r.id))
-            .chain(self.active.iter().map(|r| r.id)))?;
+        validate_request(
+            &req.prompt,
+            &req.config,
+            self.model.cfg.vocab_size,
+            self.model.prefill_token_capacity(),
+            self.model.page_pool().n_pages(),
+        )?;
+        validate_request_identity(
+            req.id,
+            self.pending
+                .iter()
+                .map(|r| r.id)
+                .chain(self.prefilling.iter().map(|r| r.id))
+                .chain(self.active.iter().map(|r| r.id)),
+        )?;
         self.pending.push_back(req);
         Ok(())
     }
@@ -361,9 +398,21 @@ impl Runtime {
     /// when a long prompt is being consumed.
     pub fn residency(&self) -> (usize, usize) {
         let pages: usize = self.active.iter().map(|a| a.seq.n_pages()).sum::<usize>()
-            + self.prefilling.iter().map(|p| p.seq.n_pages()).sum::<usize>();
-        let wasted: usize = self.active.iter().map(|a| a.seq.wasted_slots()).sum::<usize>()
-            + self.prefilling.iter().map(|p| p.seq.wasted_slots()).sum::<usize>();
+            + self
+                .prefilling
+                .iter()
+                .map(|p| p.seq.n_pages())
+                .sum::<usize>();
+        let wasted: usize = self
+            .active
+            .iter()
+            .map(|a| a.seq.wasted_slots())
+            .sum::<usize>()
+            + self
+                .prefilling
+                .iter()
+                .map(|p| p.seq.wasted_slots())
+                .sum::<usize>();
         (pages, wasted)
     }
 
@@ -444,19 +493,27 @@ impl Runtime {
         // into the batch, so counting only `active` would let the scheduler
         // over-admit and then find no room.
         while self.active.len() + self.prefilling.len() < self.max_batch {
-            let Some(req) = self.pending.front() else { break };
+            let Some(req) = self.pending.front() else {
+                break;
+            };
             if req.prompt.is_empty() {
                 bail!("request {} has an empty prompt", req.id);
             }
 
             let reservation = request_page_reservation(
-                req.prompt.len(), req.config.max_tokens, self.model.prefill_token_capacity())?;
+                req.prompt.len(),
+                req.config.max_tokens,
+                self.model.prefill_token_capacity(),
+            )?;
             if !self.page_reservations.try_reserve(reservation)? {
                 break;
             }
 
             let mut seq = SequencePages::new();
-            if seq.grow(self.model.page_pool_mut(), req.prompt.len()).is_err() {
+            if seq
+                .grow(self.model.page_pool_mut(), req.prompt.len())
+                .is_err()
+            {
                 self.page_reservations.release(reservation)?;
                 // Not enough pages right now. Leave it queued; a retirement
                 // later this step or next will free some.
@@ -489,11 +546,7 @@ impl Runtime {
     /// chunk. Nothing is recomputed and nothing is missed, and because the
     /// kernel walks that range in the same order regardless of where the chunk
     /// boundaries fall, the cache it produces does not depend on them.
-    fn advance_prefill(
-        &mut self,
-        info: &mut StepInfo,
-        budget: usize,
-    ) -> Result<(usize, usize)> {
+    fn advance_prefill(&mut self, info: &mut StepInfo, budget: usize) -> Result<(usize, usize)> {
         let mut tokens = 0usize;
         let mut chunks = 0usize;
         let stride = self.model.table_stride();
@@ -501,7 +554,9 @@ impl Runtime {
         // One chunk per call in the chunked policy; the control path passes an
         // unbounded budget and loops until the prompt is gone.
         loop {
-            let Some(p) = self.prefilling.front() else { break };
+            let Some(p) = self.prefilling.front() else {
+                break;
+            };
             let remaining = p.prompt.len() - p.done;
             let take = remaining.min(budget.max(1));
             let last = take == remaining;
@@ -539,7 +594,10 @@ impl Runtime {
             // first token, and its RNG is created here and used immediately --
             // the first sampled token draws the first random number, exactly as
             // running alone would.
-            let p = self.prefilling.pop_front().expect("prefill front was executed");
+            let p = self
+                .prefilling
+                .pop_front()
+                .expect("prefill front was executed");
             let mut rng = Rng::new(p.config.seed);
             let first = sampling::sample(&logits, &p.config, &mut rng);
             info.tokens.push((id, first));
@@ -572,11 +630,14 @@ impl Runtime {
         }
         let planning_started = Instant::now();
         let budget = self.prefill_budget(self.prefill_token_budget, self.max_prefill_requests);
-        self.prefill_plan.build(self.prefilling.iter().map(|p| PrefillWork {
-            request_id: p.id,
-            prompt_len: p.prompt.len(),
-            done: p.done,
-        }), budget)?;
+        self.prefill_plan.build(
+            self.prefilling.iter().map(|p| PrefillWork {
+                request_id: p.id,
+                prompt_len: p.prompt.len(),
+                done: p.done,
+            }),
+            budget,
+        )?;
         let stride = self.model.table_stride();
         let count = self.prefill_plan.slices.len();
         self.prefill_tables[..count * stride].fill(0);
@@ -586,17 +647,30 @@ impl Runtime {
         let vocab = self.model.cfg.vocab_size;
         let cap = self.model.topk_capacity();
         let device_topk = self.model.device_topk();
-        for (i, (p, slice)) in self.prefilling.iter().zip(&self.prefill_plan.slices).enumerate() {
+        for (i, (p, slice)) in self
+            .prefilling
+            .iter()
+            .zip(&self.prefill_plan.slices)
+            .enumerate()
+        {
             if p.id != slice.request_id || p.done != slice.prompt_start {
-                bail!("prefill plan no longer matches request {}", slice.request_id);
+                bail!(
+                    "prefill plan no longer matches request {}",
+                    slice.request_id
+                );
             }
             let table = &mut self.prefill_tables[i * stride..(i + 1) * stride];
-            for (out, page) in table.iter_mut().zip(p.seq.pages()) { *out = *page as i32; }
+            for (out, page) in table.iter_mut().zip(p.seq.pages()) {
+                *out = *page as i32;
+            }
             if slice.is_final {
                 if !p.config.is_greedy() {
                     let k = p.config.top_k.clamp(1, vocab);
-                    if device_topk && k <= cap { topk_rows.push((final_row, k)); }
-                    else { full_rows.push(final_row); }
+                    if device_topk && k <= cap {
+                        topk_rows.push((final_row, k));
+                    } else {
+                        full_rows.push(final_row);
+                    }
                 }
                 final_row += 1;
             }
@@ -604,13 +678,18 @@ impl Runtime {
         // Token data is borrowed from resident prompts. Only the small array
         // of request views is temporary; token and page metadata capacity is
         // persistent, and the GPU owns all its scratch allocations.
-        let chunks: Vec<_> = self.prefilling.iter().zip(&self.prefill_plan.slices)
-            .enumerate().map(|(i, (p, slice))| PackedPrefillRequest {
+        let chunks: Vec<_> = self
+            .prefilling
+            .iter()
+            .zip(&self.prefill_plan.slices)
+            .enumerate()
+            .map(|(i, (p, slice))| PackedPrefillRequest {
                 tokens: &p.prompt[slice.prompt_start..slice.prompt_start + slice.len],
                 page_table: &self.prefill_tables[i * stride..(i + 1) * stride],
                 pos_offset: slice.prompt_start,
                 want_logits: slice.is_final,
-            }).collect();
+            })
+            .collect();
         // Paired measurements put the crossover at two requests: a singleton
         // benefits from the existing exact-length graph, while two or more
         // requests amortize the transformer over their combined token rows.
@@ -621,7 +700,8 @@ impl Runtime {
         let selection = if packed {
             self.model.prefill_packed(&chunks, &topk_rows, &full_rows)?
         } else {
-            self.model.prefill_single_mixed(&chunks[0], &topk_rows, &full_rows)?
+            self.model
+                .prefill_single_mixed(&chunks[0], &topk_rows, &full_rows)?
         };
         info.prefill_execution_duration = started.elapsed();
         drop(chunks);
@@ -629,7 +709,10 @@ impl Runtime {
         final_row = 0;
         let mut full_index = 0;
         for slice in &self.prefill_plan.slices {
-            let mut p = self.prefilling.pop_front().expect("one queue entry per planned slice");
+            let mut p = self
+                .prefilling
+                .pop_front()
+                .expect("one queue entry per planned slice");
             debug_assert_eq!(p.id, slice.request_id);
             p.done += slice.len;
             if !slice.is_final {
@@ -649,7 +732,12 @@ impl Runtime {
                 let mut candidates = Vec::with_capacity(k);
                 for j in 0..k {
                     let id = selection.cand_ids[base + j];
-                    if id < 0 { bail!("packed top-k returned fewer than {k} candidates for request {}", p.id); }
+                    if id < 0 {
+                        bail!(
+                            "packed top-k returned fewer than {k} candidates for request {}",
+                            p.id
+                        );
+                    }
                     candidates.push((id as usize, selection.cand_vals[base + j]));
                 }
                 sampling::sample_candidates(&candidates, &p.config, &mut rng)
@@ -737,51 +825,53 @@ impl Runtime {
 
         // The transformer forward pass stays batched regardless: only token
         // selection diverges, after the logits exist.
-        let (next, d2h): (Vec<usize>, usize) =
-            if topk_rows.is_empty() && full_rows.is_empty() && self.model.device_argmax() {
-                // Unchanged greedy fast path: n * 4 bytes back, no logits move.
-                let ids = self
-                    .model
-                    .decode_batch_tokens(&tokens, &positions, &tables, &lens)?;
-                let bytes = n * std::mem::size_of::<i32>();
-                (ids, bytes)
-            } else {
-                let sel = self.model.decode_batch_mixed(
-                    &tokens, &positions, &tables, &lens, &topk_rows, &full_rows,
-                )?;
-                let mut k_of_row = vec![0usize; n];
-                for &(r, k) in &topk_rows {
-                    k_of_row[r] = k;
-                }
-                let mut out = Vec::with_capacity(n);
-                let mut full_chunks = sel.full.chunks_exact(vocab);
-                let mut next_full = full_rows.iter().copied().peekable();
-                for (i, a) in self.active.iter_mut().enumerate() {
-                    if a.config.is_greedy() {
-                        out.push(sel.ids[i]);
-                    } else if next_full.peek() == Some(&i) {
-                        next_full.next();
-                        let row = full_chunks.next().expect("one row per full request");
-                        out.push(sampling::sample(row, &a.config, &mut a.rng));
-                    } else {
-                        // Already in canonical order, so the sampler consumes
-                        // these exactly as it consumes a host-built candidate
-                        // list -- same function, same arithmetic, same token.
-                        let k = k_of_row[i];
-                        let base = i * cap;
-                        let mut cands = Vec::with_capacity(k);
-                        for j in 0..k {
-                            let id = sel.cand_ids[base + j];
-                            if id < 0 {
-                                bail!("device top-k returned {j} candidates for row {i}, wanted {k}");
-                            }
-                            cands.push((id as usize, sel.cand_vals[base + j]));
+        let (next, d2h): (Vec<usize>, usize) = if topk_rows.is_empty()
+            && full_rows.is_empty()
+            && self.model.device_argmax()
+        {
+            // Unchanged greedy fast path: n * 4 bytes back, no logits move.
+            let ids = self
+                .model
+                .decode_batch_tokens(&tokens, &positions, &tables, &lens)?;
+            let bytes = n * std::mem::size_of::<i32>();
+            (ids, bytes)
+        } else {
+            let sel = self
+                .model
+                .decode_batch_mixed(&tokens, &positions, &tables, &lens, &topk_rows, &full_rows)?;
+            let mut k_of_row = vec![0usize; n];
+            for &(r, k) in &topk_rows {
+                k_of_row[r] = k;
+            }
+            let mut out = Vec::with_capacity(n);
+            let mut full_chunks = sel.full.chunks_exact(vocab);
+            let mut next_full = full_rows.iter().copied().peekable();
+            for (i, a) in self.active.iter_mut().enumerate() {
+                if a.config.is_greedy() {
+                    out.push(sel.ids[i]);
+                } else if next_full.peek() == Some(&i) {
+                    next_full.next();
+                    let row = full_chunks.next().expect("one row per full request");
+                    out.push(sampling::sample(row, &a.config, &mut a.rng));
+                } else {
+                    // Already in canonical order, so the sampler consumes
+                    // these exactly as it consumes a host-built candidate
+                    // list -- same function, same arithmetic, same token.
+                    let k = k_of_row[i];
+                    let base = i * cap;
+                    let mut cands = Vec::with_capacity(k);
+                    for j in 0..k {
+                        let id = sel.cand_ids[base + j];
+                        if id < 0 {
+                            bail!("device top-k returned {j} candidates for row {i}, wanted {k}");
                         }
-                        out.push(sampling::sample_candidates(&cands, &a.config, &mut a.rng));
+                        cands.push((id as usize, sel.cand_vals[base + j]));
                     }
+                    out.push(sampling::sample_candidates(&cands, &a.config, &mut a.rng));
                 }
-                (out, sel.d2h_bytes)
-            };
+            }
+            (out, sel.d2h_bytes)
+        };
 
         for (a, tok) in self.active.iter_mut().zip(next) {
             a.next_token = tok;

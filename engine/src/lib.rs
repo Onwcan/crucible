@@ -27,9 +27,9 @@ pub mod prefill;
 pub mod protocol;
 // Token selection, shared by the CLI and the batched runtime so the two cannot
 // drift apart.
-pub mod sampling;
 pub mod ops;
 pub mod quant;
+pub mod sampling;
 // Compatibility adapters. Gated with the service, since each is an adapter over
 // it and has no meaning without one. Siblings, not layers: neither is built on
 // the other, and what they share lives in `chat_template`.
@@ -41,9 +41,9 @@ pub mod openai;
 pub mod runtime;
 #[cfg(feature = "cuda")]
 pub mod server;
+pub mod tokenizer;
 #[cfg(feature = "tui")]
 pub mod tui;
-pub mod tokenizer;
 pub mod weights;
 
 pub use cache::KvCache;

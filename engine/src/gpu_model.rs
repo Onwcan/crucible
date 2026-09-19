@@ -16,7 +16,10 @@ use anyhow::{bail, Result};
 use cudarc::driver::{CudaEvent, CudaGraph, CudaSlice};
 
 use crate::config::Config;
-use crate::gpu::{attn_chunks, Gpu, PrefillAttentionVariant, Proj2, TOPK_MAX, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS, PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO};
+use crate::gpu::{
+    attn_chunks, Gpu, PrefillAttentionVariant, Proj2, PARAM_COUNT, PARAM_POS, PARAM_PREFILL_POS,
+    PARAM_SEQ, PARAM_SLOT, PARAM_TOKEN, PARAM_ZERO, TOPK_MAX,
+};
 use crate::ops::RopeTable;
 use crate::paged::{PagePool, SequencePages, PAGE_TOKENS};
 use crate::quant::QuantTensor;
@@ -54,24 +57,33 @@ impl PackedPrefillEvents {
     fn new(gpu: &Gpu, boundaries: usize) -> Result<Self> {
         let mut events = Vec::with_capacity(boundaries + 1);
         for _ in 0..=boundaries {
-            events.push(gpu.ctx.new_event(Some(
-                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-            )).map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))?);
+            events.push(
+                gpu.ctx
+                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))?,
+            );
         }
-        Ok(Self { events, labels: Vec::with_capacity(boundaries) })
+        Ok(Self {
+            events,
+            labels: Vec::with_capacity(boundaries),
+        })
     }
 
     fn start(&mut self, gpu: &Gpu) -> Result<()> {
         self.labels.clear();
-        self.events[0].record(&gpu.stream)
+        self.events[0]
+            .record(&gpu.stream)
             .map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))
     }
 
     fn mark(&mut self, gpu: &Gpu, name: &'static str) -> Result<()> {
         let next = self.labels.len() + 1;
-        let event = self.events.get(next)
+        let event = self
+            .events
+            .get(next)
             .ok_or_else(|| anyhow::anyhow!("packed profiling event capacity exceeded"))?;
-        event.record(&gpu.stream)
+        event
+            .record(&gpu.stream)
             .map_err(|e| anyhow::anyhow!("CUDA profiling event: {e:?}"))?;
         self.labels.push(name);
         Ok(())
@@ -82,12 +94,17 @@ impl PackedPrefillEvents {
     /// synchronization is inserted into the model's execution.
     fn accumulate(&self, report: &mut PackedPrefillProfile, iters: usize) -> Result<()> {
         for (index, &name) in self.labels.iter().enumerate() {
-            let elapsed = self.events[index].elapsed_ms(&self.events[index + 1])
+            let elapsed = self.events[index]
+                .elapsed_ms(&self.events[index + 1])
                 .map_err(|e| anyhow::anyhow!("CUDA profiling elapsed time: {e:?}"))?;
             let stage = match report.stages.iter().position(|s| s.name == name) {
                 Some(index) => &mut report.stages[index],
                 None => {
-                    report.stages.push(PackedPrefillStage { name, calls: 0, milliseconds: 0.0 });
+                    report.stages.push(PackedPrefillStage {
+                        name,
+                        calls: 0,
+                        milliseconds: 0.0,
+                    });
                     report.stages.last_mut().expect("just inserted")
                 }
             };
@@ -97,7 +114,8 @@ impl PackedPrefillEvents {
         report.device_milliseconds += self.events[0]
             .elapsed_ms(&self.events[self.labels.len()])
             .map_err(|e| anyhow::anyhow!("CUDA profiling elapsed time: {e:?}"))?
-            as f64 / iters as f64;
+            as f64
+            / iters as f64;
         Ok(())
     }
 }
@@ -127,7 +145,10 @@ impl Precision {
 /// nothing measurable.
 enum Proj {
     F32(CudaSlice<f32>),
-    Int8 { data: CudaSlice<i8>, scales: CudaSlice<f32> },
+    Int8 {
+        data: CudaSlice<i8>,
+        scales: CudaSlice<f32>,
+    },
 }
 
 impl Proj {
@@ -483,10 +504,16 @@ impl GpuModel {
         precision: Precision,
     ) -> Result<Self> {
         if cfg.pos_encoding != "rope" {
-            bail!("the GPU path currently implements rope only, not {}", cfg.pos_encoding);
+            bail!(
+                "the GPU path currently implements rope only, not {}",
+                cfg.pos_encoding
+            );
         }
         if cfg.norm != "rmsnorm" {
-            bail!("the GPU path currently implements rmsnorm only, not {}", cfg.norm);
+            bail!(
+                "the GPU path currently implements rmsnorm only, not {}",
+                cfg.norm
+            );
         }
         if cfg.norm_placement != "pre" {
             bail!("the GPU path currently implements pre-norm only");
@@ -535,7 +562,8 @@ impl GpuModel {
         let kv_dim = cfg.n_kv_head * cfg.head_dim();
 
         let prefill_attention: PrefillAttentionVariant = std::env::var("CRUCIBLE_PREFILL_ATTN")
-            .unwrap_or_else(|_| "exact-q4-k64".to_owned()).parse()?;
+            .unwrap_or_else(|_| "exact-q4-k64".to_owned())
+            .parse()?;
         let hybrid = prefill_attention.uses_hybrid();
 
         Ok(Self {
@@ -564,7 +592,11 @@ impl GpuModel {
                 normed: gpu.alloc(capacity * d)?,
                 q: gpu.alloc(capacity * d)?,
                 kv: gpu.alloc(capacity * kv_dim)?,
-                current_k: if hybrid { Some(gpu.alloc(capacity * kv_dim)?) } else { None },
+                current_k: if hybrid {
+                    Some(gpu.alloc(capacity * kv_dim)?)
+                } else {
+                    None
+                },
                 attn: gpu.alloc(capacity * d)?,
                 proj: gpu.alloc(capacity * d)?,
                 gate: gpu.alloc(capacity * hidden)?,
@@ -658,7 +690,8 @@ impl GpuModel {
         if max_batch == 0 || max_batch > Gpu::GEMV_BATCH_MAX {
             bail!("max_batch must be in 1..={}", Gpu::GEMV_BATCH_MAX);
         }
-        let batch_rows = max_batch.checked_next_power_of_two()
+        let batch_rows = max_batch
+            .checked_next_power_of_two()
             .ok_or_else(|| anyhow::anyhow!("max_batch exceeds representable GEMV capacity"))?;
         // PAGE_TOKENS is duplicated as a compile-time constant in the kernels
         // so translation is a shift rather than a division. If the two ever
@@ -853,10 +886,11 @@ impl GpuModel {
         if let Some(p) = self.packed_prefill.as_mut() {
             p.prepared_shape = None;
         }
-        if variant.uses_hybrid() && self.prefill_scratch.current_k.is_none()
-        {
-            self.prefill_scratch.current_k = Some(self.gpu.alloc(
-                self.capacity * self.cfg.n_kv_head * self.cfg.head_dim())?);
+        if variant.uses_hybrid() && self.prefill_scratch.current_k.is_none() {
+            self.prefill_scratch.current_k = Some(
+                self.gpu
+                    .alloc(self.capacity * self.cfg.n_kv_head * self.cfg.head_dim())?,
+            );
         }
         self.prefill_attention = variant;
         Ok(())
@@ -867,8 +901,10 @@ impl GpuModel {
     }
 
     fn tiled_prefill_attention(&self) -> bool {
-        self.use_paged && !self.prefill_attention.is_reference()
-            && self.cfg.head_dim() == 64 && self.cfg.n_head == 4 * self.cfg.n_kv_head
+        self.use_paged
+            && !self.prefill_attention.is_reference()
+            && self.cfg.head_dim() == 64
+            && self.cfg.n_head == 4 * self.cfg.n_kv_head
     }
 
     /// Graphs captured, replays served, and the wall time capture cost.
@@ -986,17 +1022,21 @@ impl GpuModel {
         let vocab = self.cfg.vocab_size;
         for _ in 0..5 {
             if device_argmax {
-                self.gpu.to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
+                self.gpu
+                    .to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
             } else {
-                self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
+                self.gpu
+                    .to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
             }
         }
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             if device_argmax {
-                self.gpu.to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
+                self.gpu
+                    .to_host_i32_n(&self.batch.as_ref().unwrap().argmax_ids, n)?;
             } else {
-                self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
+                self.gpu
+                    .to_host_n(&self.batch.as_ref().unwrap().logits, n * vocab)?;
             }
         }
         Ok(t0.elapsed().as_secs_f64() / iters as f64)
@@ -1026,9 +1066,7 @@ impl GpuModel {
         force_gemm: bool,
     ) -> Result<()> {
         match w {
-            Proj::Int8 { data, scales }
-                if !force_gemm && cols % 4 == 0 =>
-            {
+            Proj::Int8 { data, scales } if !force_gemm && cols % 4 == 0 => {
                 gpu.gemv_batch_i8(data, scales, x, y, rows, cols, batch, accumulate)
             }
             // f32 weights, non-vectorizable widths and explicitly forced
@@ -1132,7 +1170,9 @@ impl GpuModel {
         self.upload_batch(tokens, positions, tables, lens, &[])?;
         self.run_decode_batch(n, false)?;
         let rows = n * self.cfg.vocab_size;
-        return self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits, rows);
+        return self
+            .gpu
+            .to_host_n(&self.batch.as_ref().unwrap().logits, rows);
     }
 
     /// One decode step returning only the argmax token id per request.
@@ -1247,7 +1287,10 @@ impl GpuModel {
 
     /// Decode and completed prefill rows share the same per-row D2H routing.
     fn read_batch_selection(
-        &self, n: usize, topk: bool, full_rows: &[usize],
+        &self,
+        n: usize,
+        topk: bool,
+        full_rows: &[usize],
     ) -> Result<DecodeSelection> {
         let vocab = self.cfg.vocab_size;
         let b = self.batch.as_ref().expect("paging allocates batch scratch");
@@ -1279,7 +1322,13 @@ impl GpuModel {
         }
         d2h += full_rows.len() * vocab * std::mem::size_of::<f32>();
 
-        Ok(DecodeSelection { ids, cand_vals, cand_ids, full, d2h_bytes: d2h })
+        Ok(DecodeSelection {
+            ids,
+            cand_vals,
+            cand_ids,
+            full,
+            d2h_bytes: d2h,
+        })
     }
 
     /// Bytes copied device-to-host by one step on each path.
@@ -1320,7 +1369,9 @@ impl GpuModel {
                 self.graph_capture_secs += t0.elapsed().as_secs_f64();
                 self.graphs_captured += 1;
             }
-            let g = self.batch_graphs[slot].as_ref().expect("just captured above");
+            let g = self.batch_graphs[slot]
+                .as_ref()
+                .expect("just captured above");
             self.gpu.graph_launch(g)?;
         } else {
             self.queue_decode_batch(n, topk)?;
@@ -1346,73 +1397,193 @@ impl GpuModel {
 
         {
             let b = self.batch.as_mut().expect("batch scratch");
-            self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
+            self.gpu
+                .embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
         }
 
         let force_gemm = self.force_decode_gemm;
         for (l, layer) in self.layers.iter().enumerate() {
             let b = self.batch.as_mut().expect("batch scratch");
 
-            self.gpu.rmsnorm_batch(&b.x, &layer.attn_norm, &mut b.normed, n, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm_batch(&b.x, &layer.attn_norm, &mut b.normed, n, d, NORM_EPS)?;
 
             // K/V go through a dense [n, kv_dim] block and are then scattered,
             // one row per request, into that request's own page.
-            Self::project_batch(&self.gpu, &layer.k_proj, &b.normed, &mut b.kv,
-                                kv_dim, d, n, false, force_gemm)?;
-            self.gpu.rope_rows(&mut b.kv, &self.rope_cos, &self.rope_sin,
-                               &b.positions, n, n_kv, hd, kv_dim)?;
-            self.gpu.cache_store_rows_paged(&b.kv, &mut self.k_pool, &self.page_tables,
-                                            &b.positions, n, kv_dim, self.table_stride,
-                                            cfg.n_layer, l)?;
+            Self::project_batch(
+                &self.gpu,
+                &layer.k_proj,
+                &b.normed,
+                &mut b.kv,
+                kv_dim,
+                d,
+                n,
+                false,
+                force_gemm,
+            )?;
+            self.gpu.rope_rows(
+                &mut b.kv,
+                &self.rope_cos,
+                &self.rope_sin,
+                &b.positions,
+                n,
+                n_kv,
+                hd,
+                kv_dim,
+            )?;
+            self.gpu.cache_store_rows_paged(
+                &b.kv,
+                &mut self.k_pool,
+                &self.page_tables,
+                &b.positions,
+                n,
+                kv_dim,
+                self.table_stride,
+                cfg.n_layer,
+                l,
+            )?;
 
-            Self::project_batch(&self.gpu, &layer.v_proj, &b.normed, &mut b.kv,
-                                kv_dim, d, n, false, force_gemm)?;
-            self.gpu.cache_store_rows_paged(&b.kv, &mut self.v_pool, &self.page_tables,
-                                            &b.positions, n, kv_dim, self.table_stride,
-                                            cfg.n_layer, l)?;
+            Self::project_batch(
+                &self.gpu,
+                &layer.v_proj,
+                &b.normed,
+                &mut b.kv,
+                kv_dim,
+                d,
+                n,
+                false,
+                force_gemm,
+            )?;
+            self.gpu.cache_store_rows_paged(
+                &b.kv,
+                &mut self.v_pool,
+                &self.page_tables,
+                &b.positions,
+                n,
+                kv_dim,
+                self.table_stride,
+                cfg.n_layer,
+                l,
+            )?;
 
-            Self::project_batch(&self.gpu, &layer.q_proj, &b.normed, &mut b.q,
-                                d, d, n, false, force_gemm)?;
-            self.gpu.rope_rows(&mut b.q, &self.rope_cos, &self.rope_sin,
-                               &b.positions, n, n_head, hd, d)?;
+            Self::project_batch(
+                &self.gpu,
+                &layer.q_proj,
+                &b.normed,
+                &mut b.q,
+                d,
+                d,
+                n,
+                false,
+                force_gemm,
+            )?;
+            self.gpu.rope_rows(
+                &mut b.q,
+                &self.rope_cos,
+                &self.rope_sin,
+                &b.positions,
+                n,
+                n_head,
+                hd,
+                d,
+            )?;
 
             self.gpu.attention_decode_paged(
-                &b.q, &self.k_pool, &self.v_pool, &mut b.attn,
-                &self.page_tables, &self.seq_lens,
-                n, n_head, n_kv, hd, self.table_stride,
-                cfg.n_layer, l, kv_dim, self.capacity,
+                &b.q,
+                &self.k_pool,
+                &self.v_pool,
+                &mut b.attn,
+                &self.page_tables,
+                &self.seq_lens,
+                n,
+                n_head,
+                n_kv,
+                hd,
+                self.table_stride,
+                cfg.n_layer,
+                l,
+                kv_dim,
+                self.capacity,
             )?;
 
             // Residual folded into the projection, the same fusion the
             // single-request decode path uses: one kernel instead of two, and
             // no [batch, d] intermediate.
-            Self::project_batch(&self.gpu, &layer.o_proj, &b.attn, &mut b.x,
-                                d, d, n, true, force_gemm)?;
+            Self::project_batch(
+                &self.gpu,
+                &layer.o_proj,
+                &b.attn,
+                &mut b.x,
+                d,
+                d,
+                n,
+                true,
+                force_gemm,
+            )?;
 
-            self.gpu.rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
             match &layer.gate_proj {
                 Some(gate) => {
-                    Self::project_batch(&self.gpu, gate, &b.normed, &mut b.gate,
-                                        self.hidden, d, n, false, force_gemm)?;
-                    Self::project_batch(&self.gpu, &layer.up_proj, &b.normed, &mut b.up,
-                                        self.hidden, d, n, false, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        gate,
+                        &b.normed,
+                        &mut b.gate,
+                        self.hidden,
+                        d,
+                        n,
+                        false,
+                        force_gemm,
+                    )?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.up_proj,
+                        &b.normed,
+                        &mut b.up,
+                        self.hidden,
+                        d,
+                        n,
+                        false,
+                        force_gemm,
+                    )?;
                     self.gpu.swiglu_batch(&mut b.gate, &b.up, n * self.hidden)?;
                 }
                 None => bail!("the GPU path currently implements swiglu only"),
             }
-            Self::project_batch(&self.gpu, &layer.down_proj, &b.gate, &mut b.x,
-                                d, self.hidden, n, true, force_gemm)?;
+            Self::project_batch(
+                &self.gpu,
+                &layer.down_proj,
+                &b.gate,
+                &mut b.x,
+                d,
+                self.hidden,
+                n,
+                true,
+                force_gemm,
+            )?;
         }
 
         let b = self.batch.as_mut().expect("batch scratch");
-        self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
-        Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
-                            cfg.vocab_size, d, n, false, force_gemm)?;
+        self.gpu
+            .rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
+        Self::project_batch(
+            &self.gpu,
+            &self.tok_emb,
+            &b.normed,
+            &mut b.logits,
+            cfg.vocab_size,
+            d,
+            n,
+            false,
+            force_gemm,
+        )?;
         // Inside the graph, so the token ids are ready the moment replay ends
         // and the step's only transfer is n * 4 bytes. Runs unconditionally:
         // the full-logit path ignores the result, and a single graph per batch
         // size then serves both paths.
-        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, n, cfg.vocab_size)?;
+        self.gpu
+            .argmax_rows(&b.logits, &mut b.argmax_ids, n, cfg.vocab_size)?;
         // Candidate extraction only when some row wants it, so an all-greedy
         // step executes exactly the sequence it did before sampling existed.
         // *Which* rows want it, and with what k, still comes from `row_k` -- a
@@ -1421,8 +1592,14 @@ impl GpuModel {
         // presence of the launch is baked in, and that is what the two graphs
         // per batch size are for.
         if topk {
-            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids,
-                               n, cfg.vocab_size)?;
+            self.gpu.topk_rows(
+                &b.logits,
+                &b.row_k,
+                &mut b.cand_vals,
+                &mut b.cand_ids,
+                n,
+                cfg.vocab_size,
+            )?;
         }
         Ok(())
     }
@@ -1537,50 +1714,154 @@ impl GpuModel {
             };
             let s = &mut self.scratch;
 
-            self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
 
             // K and V land directly in the cache; the slot offset comes from
             // the parameter buffer so the graph stays valid as pos advances.
             if self.use_paged {
-                Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_pool,
-                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_pool,
-                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                self.gpu.rope_at(&mut self.k_pool, &self.rope_cos, &self.rope_sin,
-                                 n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.k_proj,
+                    &s.normed,
+                    &mut self.k_pool,
+                    kv_dim,
+                    d,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                    false,
+                )?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.v_proj,
+                    &s.normed,
+                    &mut self.v_pool,
+                    kv_dim,
+                    d,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                    false,
+                )?;
+                self.gpu.rope_at(
+                    &mut self.k_pool,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    n_kv,
+                    hd,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                )?;
             } else {
-                Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
-                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
-                                  kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
-                                 n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.k_proj,
+                    &s.normed,
+                    &mut self.k_cache,
+                    kv_dim,
+                    d,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                    false,
+                )?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.v_proj,
+                    &s.normed,
+                    &mut self.v_cache,
+                    kv_dim,
+                    d,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                    false,
+                )?;
+                self.gpu.rope_at(
+                    &mut self.k_cache,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    n_kv,
+                    hd,
+                    &self.params,
+                    layer_base,
+                    PARAM_SLOT,
+                )?;
             }
 
-            Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
-                              d, d, &self.params, 0, PARAM_ZERO, false)?;
-            self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
-                             n_head, hd, &self.params, 0, PARAM_ZERO)?;
+            Self::project_dyn(
+                &self.gpu,
+                &layer.q_proj,
+                &s.normed,
+                &mut s.q,
+                d,
+                d,
+                &self.params,
+                0,
+                PARAM_ZERO,
+                false,
+            )?;
+            self.gpu.rope_at(
+                &mut s.q,
+                &self.rope_cos,
+                &self.rope_sin,
+                n_head,
+                hd,
+                &self.params,
+                0,
+                PARAM_ZERO,
+            )?;
 
             if self.use_paged {
                 self.gpu.attention_decode_paged(
-                    &s.q, &self.k_pool, &self.v_pool, &mut s.attn,
-                    &self.page_tables, &self.seq_lens,
-                    1, n_head, n_kv, hd, self.table_stride,
-                    cfg.n_layer, l, kv_dim, self.capacity,
+                    &s.q,
+                    &self.k_pool,
+                    &self.v_pool,
+                    &mut s.attn,
+                    &self.page_tables,
+                    &self.seq_lens,
+                    1,
+                    n_head,
+                    n_kv,
+                    hd,
+                    self.table_stride,
+                    cfg.n_layer,
+                    l,
+                    kv_dim,
+                    self.capacity,
                 )?;
             } else if self.split_attention {
                 self.gpu.attention_split(
-                    &s.q, &self.k_cache, &self.v_cache,
-                    &mut s.partial_o, &mut s.partial_m, &mut s.partial_l,
-                    &mut s.attn, n_head, n_kv, hd, &self.params,
-                    self.capacity, kv_dim, layer_base,
+                    &s.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &mut s.partial_o,
+                    &mut s.partial_m,
+                    &mut s.partial_l,
+                    &mut s.attn,
+                    n_head,
+                    n_kv,
+                    hd,
+                    &self.params,
+                    self.capacity,
+                    kv_dim,
+                    layer_base,
                 )?;
             } else {
                 self.gpu.attention_decode(
-                    &s.q, &self.k_cache, &self.v_cache, &mut s.attn,
-                    n_head, n_kv, hd, &self.params,
-                    self.capacity, kv_dim, layer_base,
+                    &s.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &mut s.attn,
+                    n_head,
+                    n_kv,
+                    hd,
+                    &self.params,
+                    self.capacity,
+                    kv_dim,
+                    layer_base,
                 )?;
             }
 
@@ -1588,15 +1869,36 @@ impl GpuModel {
             // stream, removing a kernel. Only the warp-per-row path supports
             // it, so f32 keeps the separate add.
             if self.precision == Precision::Int8 {
-                Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.x,
-                                  d, d, &self.params, 0, PARAM_ZERO, true)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.o_proj,
+                    &s.attn,
+                    &mut s.x,
+                    d,
+                    d,
+                    &self.params,
+                    0,
+                    PARAM_ZERO,
+                    true,
+                )?;
             } else {
-                Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
-                                  d, d, &self.params, 0, PARAM_ZERO, false)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.o_proj,
+                    &s.attn,
+                    &mut s.proj,
+                    d,
+                    d,
+                    &self.params,
+                    0,
+                    PARAM_ZERO,
+                    false,
+                )?;
                 self.gpu.add_inplace(&mut s.x, &s.proj, d)?;
             }
 
-            self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
             match &layer.gate_proj {
                 // One kernel instead of three: both projections and the
                 // elementwise product, with no hidden-sized intermediates.
@@ -1611,19 +1913,50 @@ impl GpuModel {
                 None => bail!("the GPU path currently implements swiglu only"),
             }
             if self.precision == Precision::Int8 {
-                Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.x,
-                                  d, self.hidden, &self.params, 0, PARAM_ZERO, true)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.down_proj,
+                    &s.gate,
+                    &mut s.x,
+                    d,
+                    self.hidden,
+                    &self.params,
+                    0,
+                    PARAM_ZERO,
+                    true,
+                )?;
             } else {
-                Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
-                                  d, self.hidden, &self.params, 0, PARAM_ZERO, false)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &layer.down_proj,
+                    &s.gate,
+                    &mut s.mlp_out,
+                    d,
+                    self.hidden,
+                    &self.params,
+                    0,
+                    PARAM_ZERO,
+                    false,
+                )?;
                 self.gpu.add_inplace(&mut s.x, &s.mlp_out, d)?;
             }
         }
 
         let s = &mut self.scratch;
-        self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
-        Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
-                          cfg.vocab_size, d, &self.params, 0, PARAM_ZERO, false)?;
+        self.gpu
+            .rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
+        Self::project_dyn(
+            &self.gpu,
+            &self.tok_emb,
+            &s.normed,
+            &mut s.logits,
+            cfg.vocab_size,
+            d,
+            &self.params,
+            0,
+            PARAM_ZERO,
+            false,
+        )?;
         Ok(())
     }
 
@@ -1674,8 +2007,7 @@ impl GpuModel {
             ("lm_head".into(), 1),
             ("logits_copy".into(), 1),
         ];
-        let mut totals: Vec<(String, f64)> =
-            calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
+        let mut totals: Vec<(String, f64)> = calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
 
         let mut host_tok = vec![0i32; self.max_batch];
         let mut host_pos = vec![0i32; self.max_batch];
@@ -1709,69 +2041,175 @@ impl GpuModel {
 
             timed!(0, {
                 let b = self.batch.as_mut().expect("batch scratch");
-                self.gpu.embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
+                self.gpu
+                    .embed_batch(&self.tok_emb.view(), &b.tokens, &mut b.x, n, d)?;
             });
 
             for (l, layer) in self.layers.iter().enumerate() {
                 let b = self.batch.as_mut().expect("batch scratch");
                 timed!(1, {
-                    self.gpu.rmsnorm_batch(&b.x, &layer.attn_norm, &mut b.normed, n, d, NORM_EPS)?;
+                    self.gpu.rmsnorm_batch(
+                        &b.x,
+                        &layer.attn_norm,
+                        &mut b.normed,
+                        n,
+                        d,
+                        NORM_EPS,
+                    )?;
                 });
                 timed!(2, {
-                    Self::project_batch(&self.gpu, &layer.k_proj, &b.normed, &mut b.kv,
-                                        kv_dim, d, n, false, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.k_proj,
+                        &b.normed,
+                        &mut b.kv,
+                        kv_dim,
+                        d,
+                        n,
+                        false,
+                        force_gemm,
+                    )?;
                 });
                 timed!(3, {
-                    self.gpu.rope_rows(&mut b.kv, &self.rope_cos, &self.rope_sin,
-                                       &b.positions, n, n_kv, hd, kv_dim)?;
+                    self.gpu.rope_rows(
+                        &mut b.kv,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                        &b.positions,
+                        n,
+                        n_kv,
+                        hd,
+                        kv_dim,
+                    )?;
                 });
                 timed!(4, {
-                    self.gpu.cache_store_rows_paged(&b.kv, &mut self.k_pool, &self.page_tables,
-                                                    &b.positions, n, kv_dim, self.table_stride,
-                                                    cfg.n_layer, l)?;
+                    self.gpu.cache_store_rows_paged(
+                        &b.kv,
+                        &mut self.k_pool,
+                        &self.page_tables,
+                        &b.positions,
+                        n,
+                        kv_dim,
+                        self.table_stride,
+                        cfg.n_layer,
+                        l,
+                    )?;
                 });
                 timed!(2, {
-                    Self::project_batch(&self.gpu, &layer.v_proj, &b.normed, &mut b.kv,
-                                        kv_dim, d, n, false, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.v_proj,
+                        &b.normed,
+                        &mut b.kv,
+                        kv_dim,
+                        d,
+                        n,
+                        false,
+                        force_gemm,
+                    )?;
                 });
                 timed!(4, {
-                    self.gpu.cache_store_rows_paged(&b.kv, &mut self.v_pool, &self.page_tables,
-                                                    &b.positions, n, kv_dim, self.table_stride,
-                                                    cfg.n_layer, l)?;
+                    self.gpu.cache_store_rows_paged(
+                        &b.kv,
+                        &mut self.v_pool,
+                        &self.page_tables,
+                        &b.positions,
+                        n,
+                        kv_dim,
+                        self.table_stride,
+                        cfg.n_layer,
+                        l,
+                    )?;
                 });
                 timed!(2, {
-                    Self::project_batch(&self.gpu, &layer.q_proj, &b.normed, &mut b.q,
-                                        d, d, n, false, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.q_proj,
+                        &b.normed,
+                        &mut b.q,
+                        d,
+                        d,
+                        n,
+                        false,
+                        force_gemm,
+                    )?;
                 });
                 timed!(3, {
-                    self.gpu.rope_rows(&mut b.q, &self.rope_cos, &self.rope_sin,
-                                       &b.positions, n, n_head, hd, d)?;
+                    self.gpu.rope_rows(
+                        &mut b.q,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                        &b.positions,
+                        n,
+                        n_head,
+                        hd,
+                        d,
+                    )?;
                 });
                 timed!(5, {
                     self.gpu.attention_decode_paged(
-                        &b.q, &self.k_pool, &self.v_pool, &mut b.attn,
-                        &self.page_tables, &self.seq_lens,
-                        n, n_head, n_kv, hd, self.table_stride,
-                        cfg.n_layer, l, kv_dim, self.capacity,
+                        &b.q,
+                        &self.k_pool,
+                        &self.v_pool,
+                        &mut b.attn,
+                        &self.page_tables,
+                        &self.seq_lens,
+                        n,
+                        n_head,
+                        n_kv,
+                        hd,
+                        self.table_stride,
+                        cfg.n_layer,
+                        l,
+                        kv_dim,
+                        self.capacity,
                     )?;
                 });
                 // Residual fused into the projection, as decode_batch does.
                 timed!(6, {
-                    Self::project_batch(&self.gpu, &layer.o_proj, &b.attn, &mut b.x,
-                                        d, d, n, true, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.o_proj,
+                        &b.attn,
+                        &mut b.x,
+                        d,
+                        d,
+                        n,
+                        true,
+                        force_gemm,
+                    )?;
                 });
                 timed!(1, {
-                    self.gpu.rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
+                    self.gpu
+                        .rmsnorm_batch(&b.x, &layer.mlp_norm, &mut b.normed, n, d, NORM_EPS)?;
                 });
                 match &layer.gate_proj {
                     Some(gate) => {
                         timed!(7, {
-                            Self::project_batch(&self.gpu, gate, &b.normed, &mut b.gate,
-                                                self.hidden, d, n, false, force_gemm)?;
+                            Self::project_batch(
+                                &self.gpu,
+                                gate,
+                                &b.normed,
+                                &mut b.gate,
+                                self.hidden,
+                                d,
+                                n,
+                                false,
+                                force_gemm,
+                            )?;
                         });
                         timed!(7, {
-                            Self::project_batch(&self.gpu, &layer.up_proj, &b.normed, &mut b.up,
-                                                self.hidden, d, n, false, force_gemm)?;
+                            Self::project_batch(
+                                &self.gpu,
+                                &layer.up_proj,
+                                &b.normed,
+                                &mut b.up,
+                                self.hidden,
+                                d,
+                                n,
+                                false,
+                                force_gemm,
+                            )?;
                         });
                         timed!(8, {
                             self.gpu.swiglu_batch(&mut b.gate, &b.up, n * self.hidden)?;
@@ -1780,22 +2218,42 @@ impl GpuModel {
                     None => bail!("the GPU path currently implements swiglu only"),
                 }
                 timed!(9, {
-                    Self::project_batch(&self.gpu, &layer.down_proj, &b.gate, &mut b.x,
-                                        d, self.hidden, n, true, force_gemm)?;
+                    Self::project_batch(
+                        &self.gpu,
+                        &layer.down_proj,
+                        &b.gate,
+                        &mut b.x,
+                        d,
+                        self.hidden,
+                        n,
+                        true,
+                        force_gemm,
+                    )?;
                 });
             }
 
             let b = self.batch.as_mut().expect("batch scratch");
             timed!(1, {
-                self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
+                self.gpu
+                    .rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, n, d, NORM_EPS)?;
             });
             timed!(11, {
-                Self::project_batch(&self.gpu, &self.tok_emb, &b.normed, &mut b.logits,
-                                    cfg.vocab_size, d, n, false, force_gemm)?;
+                Self::project_batch(
+                    &self.gpu,
+                    &self.tok_emb,
+                    &b.normed,
+                    &mut b.logits,
+                    cfg.vocab_size,
+                    d,
+                    n,
+                    false,
+                    force_gemm,
+                )?;
             });
             timed!(12, {
-                let _ = self.gpu.to_host_n(&self.batch.as_ref().unwrap().logits,
-                                           n * cfg.vocab_size)?;
+                let _ = self
+                    .gpu
+                    .to_host_n(&self.batch.as_ref().unwrap().logits, n * cfg.vocab_size)?;
             });
         }
 
@@ -1804,7 +2262,11 @@ impl GpuModel {
             .enumerate()
             .map(|(i, (_, raw))| {
                 let c = calls[i].1;
-                if c == 0 { 0.0 } else { raw / iters as f64 / c as f64 }
+                if c == 0 {
+                    0.0
+                } else {
+                    raw / iters as f64 / c as f64
+                }
             })
             .collect();
 
@@ -1818,7 +2280,11 @@ impl GpuModel {
         let mut stages = Vec::new();
         for (i, (name, raw)) in totals.into_iter().enumerate() {
             let c = calls[i].1;
-            let overhead = if name == "logits_copy" { 0.0 } else { sync_cost };
+            let overhead = if name == "logits_copy" {
+                0.0
+            } else {
+                sync_cost
+            };
             stages.push(Stage {
                 name,
                 calls: c,
@@ -1908,8 +2374,7 @@ impl GpuModel {
             ("lm_head".into(), 1),
             ("logits_copy".into(), 1),
         ];
-        let mut totals: Vec<(String, f64)> =
-            calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
+        let mut totals: Vec<(String, f64)> = calls.iter().map(|(n, _)| (n.clone(), 0.0)).collect();
 
         for _ in 0..iters {
             let pos = self.cache_len;
@@ -1943,38 +2408,115 @@ impl GpuModel {
                 let s = &mut self.scratch;
 
                 timed!(1, {
-                    self.gpu.rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
+                    self.gpu
+                        .rmsnorm(&s.x, &layer.attn_norm, &mut s.normed, d, NORM_EPS)?;
                 });
                 timed!(2, {
-                    Self::project_dyn(&self.gpu, &layer.k_proj, &s.normed, &mut self.k_cache,
-                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                    Self::project_dyn(&self.gpu, &layer.v_proj, &s.normed, &mut self.v_cache,
-                                      kv_dim, d, &self.params, layer_base, PARAM_SLOT, false)?;
-                    Self::project_dyn(&self.gpu, &layer.q_proj, &s.normed, &mut s.q,
-                                      d, d, &self.params, 0, PARAM_ZERO, false)?;
+                    Self::project_dyn(
+                        &self.gpu,
+                        &layer.k_proj,
+                        &s.normed,
+                        &mut self.k_cache,
+                        kv_dim,
+                        d,
+                        &self.params,
+                        layer_base,
+                        PARAM_SLOT,
+                        false,
+                    )?;
+                    Self::project_dyn(
+                        &self.gpu,
+                        &layer.v_proj,
+                        &s.normed,
+                        &mut self.v_cache,
+                        kv_dim,
+                        d,
+                        &self.params,
+                        layer_base,
+                        PARAM_SLOT,
+                        false,
+                    )?;
+                    Self::project_dyn(
+                        &self.gpu,
+                        &layer.q_proj,
+                        &s.normed,
+                        &mut s.q,
+                        d,
+                        d,
+                        &self.params,
+                        0,
+                        PARAM_ZERO,
+                        false,
+                    )?;
                 });
                 timed!(3, {
-                    self.gpu.rope_at(&mut self.k_cache, &self.rope_cos, &self.rope_sin,
-                                     n_kv, hd, &self.params, layer_base, PARAM_SLOT)?;
-                    self.gpu.rope_at(&mut s.q, &self.rope_cos, &self.rope_sin,
-                                     n_head, hd, &self.params, 0, PARAM_ZERO)?;
+                    self.gpu.rope_at(
+                        &mut self.k_cache,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                        n_kv,
+                        hd,
+                        &self.params,
+                        layer_base,
+                        PARAM_SLOT,
+                    )?;
+                    self.gpu.rope_at(
+                        &mut s.q,
+                        &self.rope_cos,
+                        &self.rope_sin,
+                        n_head,
+                        hd,
+                        &self.params,
+                        0,
+                        PARAM_ZERO,
+                    )?;
                 });
                 timed!(4, {
                     self.gpu.attention_split(
-                        &s.q, &self.k_cache, &self.v_cache,
-                        &mut s.partial_o, &mut s.partial_m, &mut s.partial_l,
-                        &mut s.attn, n_head, n_kv, hd, &self.params,
-                        self.capacity, kv_dim, layer_base,
+                        &s.q,
+                        &self.k_cache,
+                        &self.v_cache,
+                        &mut s.partial_o,
+                        &mut s.partial_m,
+                        &mut s.partial_l,
+                        &mut s.attn,
+                        n_head,
+                        n_kv,
+                        hd,
+                        &self.params,
+                        self.capacity,
+                        kv_dim,
+                        layer_base,
                     )?;
                 });
                 timed!(5, {
                     if int8 {
                         // Residual folded into the projection.
-                        Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.x,
-                                          d, d, &self.params, 0, PARAM_ZERO, true)?;
+                        Self::project_dyn(
+                            &self.gpu,
+                            &layer.o_proj,
+                            &s.attn,
+                            &mut s.x,
+                            d,
+                            d,
+                            &self.params,
+                            0,
+                            PARAM_ZERO,
+                            true,
+                        )?;
                     } else {
-                        Self::project_dyn(&self.gpu, &layer.o_proj, &s.attn, &mut s.proj,
-                                          d, d, &self.params, 0, PARAM_ZERO, false)?;
+                        Self::project_dyn(
+                            &self.gpu,
+                            &layer.o_proj,
+                            &s.attn,
+                            &mut s.proj,
+                            d,
+                            d,
+                            &self.params,
+                            0,
+                            PARAM_ZERO,
+                            false,
+                        )?;
                     }
                 });
                 if !int8 {
@@ -1983,7 +2525,8 @@ impl GpuModel {
                     });
                 }
                 timed!(1, {
-                    self.gpu.rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
+                    self.gpu
+                        .rmsnorm(&s.x, &layer.mlp_norm, &mut s.normed, d, NORM_EPS)?;
                 });
                 timed!(6, {
                     match &layer.gate_proj {
@@ -1998,11 +2541,31 @@ impl GpuModel {
                         None => bail!("swiglu only"),
                     }
                     if int8 {
-                        Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.x,
-                                          d, self.hidden, &self.params, 0, PARAM_ZERO, true)?;
+                        Self::project_dyn(
+                            &self.gpu,
+                            &layer.down_proj,
+                            &s.gate,
+                            &mut s.x,
+                            d,
+                            self.hidden,
+                            &self.params,
+                            0,
+                            PARAM_ZERO,
+                            true,
+                        )?;
                     } else {
-                        Self::project_dyn(&self.gpu, &layer.down_proj, &s.gate, &mut s.mlp_out,
-                                          d, self.hidden, &self.params, 0, PARAM_ZERO, false)?;
+                        Self::project_dyn(
+                            &self.gpu,
+                            &layer.down_proj,
+                            &s.gate,
+                            &mut s.mlp_out,
+                            d,
+                            self.hidden,
+                            &self.params,
+                            0,
+                            PARAM_ZERO,
+                            false,
+                        )?;
                     }
                 });
                 if !int8 {
@@ -2014,9 +2577,20 @@ impl GpuModel {
 
             timed!(8, {
                 let s = &mut self.scratch;
-                self.gpu.rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
-                Self::project_dyn(&self.gpu, &self.tok_emb, &s.normed, &mut s.logits,
-                                  cfg.vocab_size, d, &self.params, 0, PARAM_ZERO, false)?;
+                self.gpu
+                    .rmsnorm(&s.x, &self.final_norm, &mut s.normed, d, NORM_EPS)?;
+                Self::project_dyn(
+                    &self.gpu,
+                    &self.tok_emb,
+                    &s.normed,
+                    &mut s.logits,
+                    cfg.vocab_size,
+                    d,
+                    &self.params,
+                    0,
+                    PARAM_ZERO,
+                    false,
+                )?;
             });
 
             let t0 = std::time::Instant::now();
@@ -2044,7 +2618,11 @@ impl GpuModel {
         let mut stages = Vec::new();
         for (i, (name, raw)) in totals.into_iter().enumerate() {
             let n = calls[i].1;
-            let overhead = if name == "logits_copy" { 0.0 } else { sync_cost };
+            let overhead = if name == "logits_copy" {
+                0.0
+            } else {
+                sync_cost
+            };
             stages.push(Stage {
                 name,
                 calls: n,
@@ -2087,8 +2665,7 @@ impl GpuModel {
         if let Some(p) = self.packed_prefill.as_mut() {
             p.prepared_shape = None;
         }
-        self.host_tables[..self.table_stride]
-            .copy_from_slice(&table[..self.table_stride]);
+        self.host_tables[..self.table_stride].copy_from_slice(&table[..self.table_stride]);
         self.host_lens[0] = len as i32;
         let (ht, hl) = (self.host_tables.clone(), self.host_lens.clone());
         self.gpu.write_i32(&mut self.page_tables, &ht)?;
@@ -2147,8 +2724,10 @@ impl GpuModel {
     /// The inference thread owns this call through completion: cancellation is
     /// observed at the next scheduler boundary, never inside this sequence.
     pub fn prefill_packed(
-        &mut self, chunks: &[PackedPrefillRequest<'_>],
-        topk_rows: &[(usize, usize)], full_rows: &[usize],
+        &mut self,
+        chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
     ) -> Result<DecodeSelection> {
         let (rows, finals) = self.upload_packed_prefill(chunks, topk_rows, full_rows)?;
         self.queue_packed_prefill(rows, finals, !topk_rows.is_empty())?;
@@ -2156,8 +2735,13 @@ impl GpuModel {
             // A bounded batch has completed before pages can be cancelled and
             // recycled. This also keeps non-final execution time honest.
             self.gpu.sync()?;
-            return Ok(DecodeSelection { ids: Vec::new(), cand_vals: Vec::new(),
-                cand_ids: Vec::new(), full: Vec::new(), d2h_bytes: 0 });
+            return Ok(DecodeSelection {
+                ids: Vec::new(),
+                cand_vals: Vec::new(),
+                cand_ids: Vec::new(),
+                full: Vec::new(),
+                d2h_bytes: 0,
+            });
         }
         self.read_batch_selection(finals, !topk_rows.is_empty(), full_rows)
     }
@@ -2166,51 +2750,86 @@ impl GpuModel {
     /// retaining compact first-token selection. The logits transfer below is
     /// device-to-device into existing scratch, never a full host readback.
     pub fn prefill_single_mixed(
-        &mut self, chunk: &PackedPrefillRequest<'_>,
-        topk_rows: &[(usize, usize)], full_rows: &[usize],
+        &mut self,
+        chunk: &PackedPrefillRequest<'_>,
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
     ) -> Result<DecodeSelection> {
-        let (rows, finals) = self.prepare_packed_prefill(
-            std::slice::from_ref(chunk), topk_rows, full_rows)?;
-        let p = self.packed_prefill.as_ref().expect("paging allocates metadata");
-        self.gpu.write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
-        self.gpu.write_i32(&mut self.page_tables, &self.host_tables)?;
+        let (rows, finals) =
+            self.prepare_packed_prefill(std::slice::from_ref(chunk), topk_rows, full_rows)?;
+        let p = self
+            .packed_prefill
+            .as_ref()
+            .expect("paging allocates metadata");
+        self.gpu
+            .write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
+        self.gpu
+            .write_i32(&mut self.page_tables, &self.host_tables)?;
         self.host_params[PARAM_PREFILL_POS] = chunk.pos_offset as i32;
         self.gpu.write_i32(&mut self.params, &self.host_params)?;
         // Keep decode's cached row_k contents truthful even for a non-final
         // slice; a later decode may reuse exactly this sampling composition.
-        self.gpu.write_i32(&mut self.batch.as_mut().expect("paging").row_k, &self.host_row_k)?;
+        self.gpu.write_i32(
+            &mut self.batch.as_mut().expect("paging").row_k,
+            &self.host_row_k,
+        )?;
         self.run_prefill(rows, chunk.want_logits)?;
         if finals == 0 {
             self.gpu.sync()?;
-            return Ok(DecodeSelection { ids: Vec::new(), cand_vals: Vec::new(),
-                cand_ids: Vec::new(), full: Vec::new(), d2h_bytes: 0 });
+            return Ok(DecodeSelection {
+                ids: Vec::new(),
+                cand_vals: Vec::new(),
+                cand_ids: Vec::new(),
+                full: Vec::new(),
+                d2h_bytes: 0,
+            });
         }
-        let b = self.batch.as_mut().expect("paging allocates selection scratch");
+        let b = self
+            .batch
+            .as_mut()
+            .expect("paging allocates selection scratch");
         let vocab = self.cfg.vocab_size;
-        self.gpu.copy_rows(&self.scratch.logits.slice(..vocab), &mut b.logits, vocab)?;
-        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, 1, vocab)?;
+        self.gpu
+            .copy_rows(&self.scratch.logits.slice(..vocab), &mut b.logits, vocab)?;
+        self.gpu
+            .argmax_rows(&b.logits, &mut b.argmax_ids, 1, vocab)?;
         if !topk_rows.is_empty() {
-            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids, 1, vocab)?;
+            self.gpu.topk_rows(
+                &b.logits,
+                &b.row_k,
+                &mut b.cand_vals,
+                &mut b.cand_ids,
+                1,
+                vocab,
+            )?;
         }
         self.read_batch_selection(1, !topk_rows.is_empty(), full_rows)
     }
 
     fn prepare_packed_prefill(
-        &mut self, chunks: &[PackedPrefillRequest<'_>],
-        topk_rows: &[(usize, usize)], full_rows: &[usize],
+        &mut self,
+        chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
     ) -> Result<(usize, usize)> {
         if !self.use_paged {
             bail!("packed prefill requires paging");
         }
         if chunks.is_empty() || chunks.len() > self.prefill_request_capacity() {
-            bail!("packed prefill needs 1..={} requests, got {}",
-                self.prefill_request_capacity(), chunks.len());
+            bail!(
+                "packed prefill needs 1..={} requests, got {}",
+                self.prefill_request_capacity(),
+                chunks.len()
+            );
         }
         let token_capacity = self.prefill_token_capacity();
         if self.table_stride > i32::MAX as usize {
             bail!("packed page-table stride exceeds kernel index range");
         }
-        let p = self.packed_prefill.as_mut().expect("paging allocates packed metadata");
+        let p = self
+            .packed_prefill
+            .as_mut()
+            .expect("paging allocates packed metadata");
         p.prepared_shape = None;
         p.requests = 0;
         p.max_chunk = 0;
@@ -2221,17 +2840,25 @@ impl GpuModel {
         let mut rows = 0usize;
         let mut finals = 0usize;
         for (owner, chunk) in chunks.iter().enumerate() {
-            let end = chunk.pos_offset.checked_add(chunk.tokens.len())
+            let end = chunk
+                .pos_offset
+                .checked_add(chunk.tokens.len())
                 .ok_or_else(|| anyhow::anyhow!("packed position overflow"))?;
-            let packed_end = rows.checked_add(chunk.tokens.len())
+            let packed_end = rows
+                .checked_add(chunk.tokens.len())
                 .ok_or_else(|| anyhow::anyhow!("packed row count overflow"))?;
-            if chunk.tokens.is_empty() || end > self.capacity || end > i32::MAX as usize
+            if chunk.tokens.is_empty()
+                || end > self.capacity
+                || end > i32::MAX as usize
                 || packed_end > token_capacity
             {
                 bail!("packed chunk/batch exceeds {token_capacity} token capacity or is empty");
             }
             if chunk.page_table.len() != self.table_stride {
-                bail!("packed page table must contain {} entries", self.table_stride);
+                bail!(
+                    "packed page table must contain {} entries",
+                    self.table_stride
+                );
             }
             for &page in &chunk.page_table[..end.div_ceil(PAGE_TOKENS)] {
                 if page < 0 || page as usize >= p.page_owner.len() {
@@ -2244,7 +2871,10 @@ impl GpuModel {
             }
             for (local, &token) in chunk.tokens.iter().enumerate() {
                 if token >= self.cfg.vocab_size || token > i32::MAX as usize {
-                    bail!("packed token {token} outside vocabulary {}", self.cfg.vocab_size);
+                    bail!(
+                        "packed token {token} outside vocabulary {}",
+                        self.cfg.vocab_size
+                    );
                 }
                 p.host_tokens[rows + local] = token as i32;
                 p.host_owners[rows + local] = owner as i32;
@@ -2253,7 +2883,11 @@ impl GpuModel {
             let start = owner * self.table_stride;
             self.host_tables[start..start + self.table_stride].copy_from_slice(chunk.page_table);
             p.host_segments[4 * owner..4 * owner + 4].copy_from_slice(&[
-                rows as i32, chunk.tokens.len() as i32, chunk.pos_offset as i32, owner as i32]);
+                rows as i32,
+                chunk.tokens.len() as i32,
+                chunk.pos_offset as i32,
+                owner as i32,
+            ]);
             p.max_chunk = p.max_chunk.max(chunk.tokens.len());
             p.max_history = p.max_history.max(end);
             if chunk.want_logits {
@@ -2262,7 +2896,10 @@ impl GpuModel {
             }
             rows = packed_end;
         }
-        if finals.checked_mul(self.cfg.vocab_size).is_none_or(|n| n > i32::MAX as usize) {
+        if finals
+            .checked_mul(self.cfg.vocab_size)
+            .is_none_or(|n| n > i32::MAX as usize)
+        {
             bail!("packed final logits exceed kernel index range");
         }
         for &(row, k) in topk_rows {
@@ -2285,31 +2922,49 @@ impl GpuModel {
             self.host_row_k[row] = k as i32;
         }
         p.requests = chunks.len();
-        self.prefill_score_capacity = if matches!(self.prefill_attention, PrefillAttentionVariant::Exact { .. }) {
+        self.prefill_score_capacity = if matches!(
+            self.prefill_attention,
+            PrefillAttentionVariant::Exact { .. }
+        ) {
             (p.max_history.div_ceil(256) * 256).min(self.table_stride * PAGE_TOKENS)
-        } else { 0 };
+        } else {
+            0
+        };
         Ok((rows, finals))
     }
 
     fn upload_packed_prefill(
-        &mut self, chunks: &[PackedPrefillRequest<'_>],
-        topk_rows: &[(usize, usize)], full_rows: &[usize],
+        &mut self,
+        chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
     ) -> Result<(usize, usize)> {
         let (rows, finals) = self.prepare_packed_prefill(chunks, topk_rows, full_rows)?;
-        let p = self.packed_prefill.as_mut().expect("paging allocates metadata");
+        let p = self
+            .packed_prefill
+            .as_mut()
+            .expect("paging allocates metadata");
         // Every consumed element is overwritten, including row_k zeros. Stale
         // capacity beyond these exact launch counts is never semantic input.
-        self.gpu.write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
+        self.gpu
+            .write_i32(&mut self.prefill_scratch.tokens, &p.host_tokens[..rows])?;
         self.gpu.write_i32(&mut p.owners, &p.host_owners[..rows])?;
-        self.gpu.write_i32(&mut p.positions, &p.host_positions[..rows])?;
+        self.gpu
+            .write_i32(&mut p.positions, &p.host_positions[..rows])?;
         if !self.prefill_attention.is_reference() {
-            self.gpu.write_i32(&mut p.segments, &p.host_segments[..4 * p.requests])?;
+            self.gpu
+                .write_i32(&mut p.segments, &p.host_segments[..4 * p.requests])?;
         }
-        self.gpu.write_i32(&mut self.page_tables, &self.host_tables)?;
+        self.gpu
+            .write_i32(&mut self.page_tables, &self.host_tables)?;
         if finals != 0 {
-            self.gpu.write_i32(&mut p.final_rows, &p.host_final_rows[..finals])?;
+            self.gpu
+                .write_i32(&mut p.final_rows, &p.host_final_rows[..finals])?;
         }
-        self.gpu.write_i32(&mut self.batch.as_mut().expect("paging").row_k, &self.host_row_k)?;
+        self.gpu.write_i32(
+            &mut self.batch.as_mut().expect("paging").row_k,
+            &self.host_row_k,
+        )?;
         p.prepared_shape = Some((rows, finals));
         Ok((rows, finals))
     }
@@ -2319,7 +2974,10 @@ impl GpuModel {
     }
 
     fn queue_packed_prefill_impl<const PROFILE: bool>(
-        &mut self, rows: usize, finals: usize, topk: bool,
+        &mut self,
+        rows: usize,
+        finals: usize,
+        topk: bool,
         mut events: Option<&mut PackedPrefillEvents>,
     ) -> Result<()> {
         self.queue_prefill_transformer_impl::<PROFILE>(rows, true, events.as_deref_mut())?;
@@ -2329,25 +2987,54 @@ impl GpuModel {
         macro_rules! mark {
             ($name:literal) => {
                 if PROFILE {
-                    events.as_deref_mut().expect("profiling requires events").mark(&self.gpu, $name)?;
+                    events
+                        .as_deref_mut()
+                        .expect("profiling requires events")
+                        .mark(&self.gpu, $name)?;
                 }
             };
         }
-        let b = self.batch.as_mut().expect("paging allocates final-row scratch");
-        let p = self.packed_prefill.as_ref().expect("paging allocates metadata");
+        let b = self
+            .batch
+            .as_mut()
+            .expect("paging allocates final-row scratch");
+        let p = self
+            .packed_prefill
+            .as_ref()
+            .expect("paging allocates metadata");
         let d = self.cfg.n_embd;
-        self.gpu.gather_prefill_rows(&self.prefill_scratch.x, &mut b.x, &p.final_rows, finals, d)?;
+        self.gpu.gather_prefill_rows(
+            &self.prefill_scratch.x,
+            &mut b.x,
+            &p.final_rows,
+            finals,
+            d,
+        )?;
         mark!("final_gather");
-        self.gpu.rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, finals, d, NORM_EPS)?;
+        self.gpu
+            .rmsnorm_batch(&b.x, &self.final_norm, &mut b.normed, finals, d, NORM_EPS)?;
         mark!("final_norm");
-        self.gpu.project_final_rows(&self.tok_emb.view(), &b.normed, &mut b.logits,
-            self.cfg.vocab_size, d, finals)?;
+        self.gpu.project_final_rows(
+            &self.tok_emb.view(),
+            &b.normed,
+            &mut b.logits,
+            self.cfg.vocab_size,
+            d,
+            finals,
+        )?;
         mark!("final_head");
-        self.gpu.argmax_rows(&b.logits, &mut b.argmax_ids, finals, self.cfg.vocab_size)?;
+        self.gpu
+            .argmax_rows(&b.logits, &mut b.argmax_ids, finals, self.cfg.vocab_size)?;
         mark!("argmax");
         if topk {
-            self.gpu.topk_rows(&b.logits, &b.row_k, &mut b.cand_vals, &mut b.cand_ids,
-                finals, self.cfg.vocab_size)?;
+            self.gpu.topk_rows(
+                &b.logits,
+                &b.row_k,
+                &mut b.cand_vals,
+                &mut b.cand_ids,
+                finals,
+                self.cfg.vocab_size,
+            )?;
             mark!("topk");
         }
         Ok(())
@@ -2360,8 +3047,11 @@ impl GpuModel {
     /// to serving. Event insertion can perturb short stages; compare these
     /// proportions with the uninstrumented wall/replay timings before acting.
     pub fn profile_packed_prefill(
-        &mut self, chunks: &[PackedPrefillRequest<'_>],
-        topk_rows: &[(usize, usize)], full_rows: &[usize], iters: usize,
+        &mut self,
+        chunks: &[PackedPrefillRequest<'_>],
+        topk_rows: &[(usize, usize)],
+        full_rows: &[usize],
+        iters: usize,
     ) -> Result<PackedPrefillProfile> {
         if iters == 0 {
             bail!("packed profiling needs at least one iteration");
@@ -2373,12 +3063,25 @@ impl GpuModel {
         // Warm the event records as well as the kernels, outside the samples.
         self.gpu.sync()?;
         events.start(&self.gpu)?;
-        self.queue_packed_prefill_impl::<true>(rows, finals, !topk_rows.is_empty(), Some(&mut events))?;
+        self.queue_packed_prefill_impl::<true>(
+            rows,
+            finals,
+            !topk_rows.is_empty(),
+            Some(&mut events),
+        )?;
         self.gpu.sync()?;
-        let mut report = PackedPrefillProfile { stages: Vec::new(), device_milliseconds: 0.0 };
+        let mut report = PackedPrefillProfile {
+            stages: Vec::new(),
+            device_milliseconds: 0.0,
+        };
         for _ in 0..iters {
             events.start(&self.gpu)?;
-            self.queue_packed_prefill_impl::<true>(rows, finals, !topk_rows.is_empty(), Some(&mut events))?;
+            self.queue_packed_prefill_impl::<true>(
+                rows,
+                finals,
+                !topk_rows.is_empty(),
+                Some(&mut events),
+            )?;
             self.gpu.sync()?;
             events.accumulate(&mut report, iters)?;
         }
@@ -2392,7 +3095,11 @@ impl GpuModel {
     /// call. It is dropped on return and never populates a serving graph cache.
     /// Capture cost is excluded; this isolates device execution from submission.
     pub fn time_packed_replay(&mut self, rows: usize, finals: usize, iters: usize) -> Result<f64> {
-        if rows == 0 || rows > self.capacity || finals > self.prefill_request_capacity() || iters == 0 {
+        if rows == 0
+            || rows > self.capacity
+            || finals > self.prefill_request_capacity()
+            || iters == 0
+        {
             bail!("invalid packed replay benchmark shape");
         }
         if self.packed_prefill.as_ref().and_then(|p| p.prepared_shape) != Some((rows, finals)) {
@@ -2404,10 +3111,14 @@ impl GpuModel {
         let graph = self.gpu.end_capture();
         queued?;
         let graph = graph?;
-        for _ in 0..3 { self.gpu.graph_launch(&graph)?; }
+        for _ in 0..3 {
+            self.gpu.graph_launch(&graph)?;
+        }
         self.gpu.sync()?;
         let start = std::time::Instant::now();
-        for _ in 0..iters { self.gpu.graph_launch(&graph)?; }
+        for _ in 0..iters {
+            self.gpu.graph_launch(&graph)?;
+        }
         self.gpu.sync()?;
         Ok(start.elapsed().as_secs_f64() / iters as f64)
     }
@@ -2452,14 +3163,26 @@ impl GpuModel {
     /// result representation. Full-logit and compact singleton APIs share it.
     fn run_prefill(&mut self, t: usize, want_logits: bool) -> Result<()> {
         self.prefill_score_capacity = if self.tiled_prefill_attention()
-            && matches!(self.prefill_attention, PrefillAttentionVariant::Exact { .. }) {
+            && matches!(
+                self.prefill_attention,
+                PrefillAttentionVariant::Exact { .. }
+            ) {
             ((t + self.host_params[PARAM_PREFILL_POS] as usize).div_ceil(256) * 256)
                 .min(self.table_stride * PAGE_TOKENS)
-        } else { 0 };
+        } else {
+            0
+        };
         if self.tiled_prefill_attention() {
-            let p = self.packed_prefill.as_mut().expect("paging allocates descriptors");
+            let p = self
+                .packed_prefill
+                .as_mut()
+                .expect("paging allocates descriptors");
             p.host_segments[..4].copy_from_slice(&[
-                0, t as i32, self.host_params[PARAM_PREFILL_POS], 0]);
+                0,
+                t as i32,
+                self.host_params[PARAM_PREFILL_POS],
+                0,
+            ]);
             p.requests = 1;
             p.max_chunk = t;
             self.gpu.write_i32(&mut p.segments, &p.host_segments[..4])?;
@@ -2529,12 +3252,18 @@ impl GpuModel {
     }
 
     fn queue_prefill_transformer_impl<const PROFILE: bool>(
-        &mut self, t: usize, packed: bool, mut events: Option<&mut PackedPrefillEvents>,
+        &mut self,
+        t: usize,
+        packed: bool,
+        mut events: Option<&mut PackedPrefillEvents>,
     ) -> Result<()> {
         macro_rules! mark {
             ($name:literal) => {
                 if PROFILE {
-                    events.as_deref_mut().expect("profiling requires events").mark(&self.gpu, $name)?;
+                    events
+                        .as_deref_mut()
+                        .expect("profiling requires events")
+                        .mark(&self.gpu, $name)?;
                 }
             };
         }
@@ -2546,7 +3275,8 @@ impl GpuModel {
 
         {
             let p = &mut self.prefill_scratch;
-            self.gpu.embed_batch(&self.tok_emb.view(), &p.tokens, &mut p.x, t, d)?;
+            self.gpu
+                .embed_batch(&self.tok_emb.view(), &p.tokens, &mut p.x, t, d)?;
         }
         mark!("embed");
 
@@ -2557,109 +3287,290 @@ impl GpuModel {
             let pos_offset = self.host_params[PARAM_PREFILL_POS] as usize;
             let p = &mut self.prefill_scratch;
 
-            self.gpu.rmsnorm_batch(&p.x, &layer.attn_norm, &mut p.normed, t, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm_batch(&p.x, &layer.attn_norm, &mut p.normed, t, d, NORM_EPS)?;
             mark!("norm");
 
             // K and V go through a dense [T, kv_dim] buffer and are then placed
             // into the cache, so prefill and decode share one cache layout.
             let current_k = if hybrid_attention {
-                p.current_k.as_mut().expect("hybrid scratch allocated before inference")
-            } else { &mut p.kv };
-            self.gpu.gemm(&layer.k_proj.view(), &p.normed, current_k, t, kv_dim, d, false)?;
+                p.current_k
+                    .as_mut()
+                    .expect("hybrid scratch allocated before inference")
+            } else {
+                &mut p.kv
+            };
+            self.gpu.gemm(
+                &layer.k_proj.view(),
+                &p.normed,
+                current_k,
+                t,
+                kv_dim,
+                d,
+                false,
+            )?;
             mark!("qkv_gemm");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.rope_rows(current_k, &self.rope_cos, &self.rope_sin,
-                    &meta.positions, t, n_kv, hd, kv_dim)?;
+                self.gpu.rope_rows(
+                    current_k,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    &meta.positions,
+                    t,
+                    n_kv,
+                    hd,
+                    kv_dim,
+                )?;
             } else {
-                self.gpu.rope_batch(current_k, &self.rope_cos, &self.rope_sin,
-                    t, n_kv, hd, kv_dim, &self.params)?;
+                self.gpu.rope_batch(
+                    current_k,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    t,
+                    n_kv,
+                    hd,
+                    kv_dim,
+                    &self.params,
+                )?;
             }
             mark!("rope");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.cache_store_packed_paged(current_k, &mut self.k_pool, &self.page_tables,
-                    &meta.owners, &meta.positions, t, kv_dim, self.table_stride, cfg.n_layer, l)?;
+                self.gpu.cache_store_packed_paged(
+                    current_k,
+                    &mut self.k_pool,
+                    &self.page_tables,
+                    &meta.owners,
+                    &meta.positions,
+                    t,
+                    kv_dim,
+                    self.table_stride,
+                    cfg.n_layer,
+                    l,
+                )?;
             } else if self.use_paged {
-                self.gpu.cache_store_paged(current_k, &mut self.k_pool, &self.page_tables,
-                                           t, kv_dim, cfg.n_layer, l, &self.params)?;
+                self.gpu.cache_store_paged(
+                    current_k,
+                    &mut self.k_pool,
+                    &self.page_tables,
+                    t,
+                    kv_dim,
+                    cfg.n_layer,
+                    l,
+                    &self.params,
+                )?;
             } else {
-                self.gpu.cache_store(current_k, &mut self.k_cache, t, kv_dim, layer_base, pos_offset)?;
+                self.gpu.cache_store(
+                    current_k,
+                    &mut self.k_cache,
+                    t,
+                    kv_dim,
+                    layer_base,
+                    pos_offset,
+                )?;
             }
             mark!("kv_store");
 
-            self.gpu.gemm(&layer.v_proj.view(), &p.normed, &mut p.kv, t, kv_dim, d, false)?;
+            self.gpu.gemm(
+                &layer.v_proj.view(),
+                &p.normed,
+                &mut p.kv,
+                t,
+                kv_dim,
+                d,
+                false,
+            )?;
             mark!("qkv_gemm");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.cache_store_packed_paged(&p.kv, &mut self.v_pool, &self.page_tables,
-                    &meta.owners, &meta.positions, t, kv_dim, self.table_stride, cfg.n_layer, l)?;
+                self.gpu.cache_store_packed_paged(
+                    &p.kv,
+                    &mut self.v_pool,
+                    &self.page_tables,
+                    &meta.owners,
+                    &meta.positions,
+                    t,
+                    kv_dim,
+                    self.table_stride,
+                    cfg.n_layer,
+                    l,
+                )?;
             } else if self.use_paged {
-                self.gpu.cache_store_paged(&p.kv, &mut self.v_pool, &self.page_tables,
-                                           t, kv_dim, cfg.n_layer, l, &self.params)?;
+                self.gpu.cache_store_paged(
+                    &p.kv,
+                    &mut self.v_pool,
+                    &self.page_tables,
+                    t,
+                    kv_dim,
+                    cfg.n_layer,
+                    l,
+                    &self.params,
+                )?;
             } else {
-                self.gpu.cache_store(&p.kv, &mut self.v_cache, t, kv_dim, layer_base, pos_offset)?;
+                self.gpu.cache_store(
+                    &p.kv,
+                    &mut self.v_cache,
+                    t,
+                    kv_dim,
+                    layer_base,
+                    pos_offset,
+                )?;
             }
             mark!("kv_store");
 
-            self.gpu.gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
+            self.gpu
+                .gemm(&layer.q_proj.view(), &p.normed, &mut p.q, t, d, d, false)?;
             mark!("qkv_gemm");
             if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.rope_rows(&mut p.q, &self.rope_cos, &self.rope_sin,
-                    &meta.positions, t, n_head, hd, d)?;
+                self.gpu.rope_rows(
+                    &mut p.q,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    &meta.positions,
+                    t,
+                    n_head,
+                    hd,
+                    d,
+                )?;
             } else {
-                self.gpu.rope_batch(&mut p.q, &self.rope_cos, &self.rope_sin,
-                    t, n_head, hd, d, &self.params)?;
+                self.gpu.rope_batch(
+                    &mut p.q,
+                    &self.rope_cos,
+                    &self.rope_sin,
+                    t,
+                    n_head,
+                    hd,
+                    d,
+                    &self.params,
+                )?;
             }
             mark!("rope");
 
             if tiled_attention {
                 let meta = self.packed_prefill.as_ref().expect("attention descriptors");
-                self.gpu.attention_prefill_tiled(&p.q, &self.k_pool, &self.v_pool,
-                    p.current_k.as_ref().unwrap_or(&p.kv), &p.kv, &mut p.attn,
-                    &self.page_tables, &meta.segments, meta.requests, meta.max_chunk,
-                    self.table_stride, n_head, n_kv, hd, cfg.n_layer, l, kv_dim,
-                    self.prefill_attention, self.prefill_score_capacity)?;
+                self.gpu.attention_prefill_tiled(
+                    &p.q,
+                    &self.k_pool,
+                    &self.v_pool,
+                    p.current_k.as_ref().unwrap_or(&p.kv),
+                    &p.kv,
+                    &mut p.attn,
+                    &self.page_tables,
+                    &meta.segments,
+                    meta.requests,
+                    meta.max_chunk,
+                    self.table_stride,
+                    n_head,
+                    n_kv,
+                    hd,
+                    cfg.n_layer,
+                    l,
+                    kv_dim,
+                    self.prefill_attention,
+                    self.prefill_score_capacity,
+                )?;
             } else if packed {
                 let meta = self.packed_prefill.as_ref().expect("packed metadata");
-                self.gpu.attention_prefill_packed(&p.q, &self.k_pool, &self.v_pool,
-                    &mut p.attn, &self.page_tables, &meta.owners, &meta.positions,
-                    t, self.table_stride, n_head, n_kv, hd, cfg.n_layer, l, kv_dim, self.capacity)?;
+                self.gpu.attention_prefill_packed(
+                    &p.q,
+                    &self.k_pool,
+                    &self.v_pool,
+                    &mut p.attn,
+                    &self.page_tables,
+                    &meta.owners,
+                    &meta.positions,
+                    t,
+                    self.table_stride,
+                    n_head,
+                    n_kv,
+                    hd,
+                    cfg.n_layer,
+                    l,
+                    kv_dim,
+                    self.capacity,
+                )?;
             } else if self.use_paged {
-                self.gpu.attention_prefill_paged(&p.q, &self.k_pool, &self.v_pool,
-                                                 &mut p.attn, &self.page_tables,
-                                                 t, n_head, n_kv, hd,
-                                                 cfg.n_layer, l, kv_dim,
-                                                 self.capacity, &self.params)?;
+                self.gpu.attention_prefill_paged(
+                    &p.q,
+                    &self.k_pool,
+                    &self.v_pool,
+                    &mut p.attn,
+                    &self.page_tables,
+                    t,
+                    n_head,
+                    n_kv,
+                    hd,
+                    cfg.n_layer,
+                    l,
+                    kv_dim,
+                    self.capacity,
+                    &self.params,
+                )?;
             } else {
-                self.gpu.attention_prefill(&p.q, &self.k_cache, &self.v_cache, &mut p.attn,
-                                           t, n_head, n_kv, hd, self.capacity,
-                                           kv_dim, layer_base, pos_offset)?;
+                self.gpu.attention_prefill(
+                    &p.q,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &mut p.attn,
+                    t,
+                    n_head,
+                    n_kv,
+                    hd,
+                    self.capacity,
+                    kv_dim,
+                    layer_base,
+                    pos_offset,
+                )?;
             }
             mark!("attention");
 
-            self.gpu.gemm(&layer.o_proj.view(), &p.attn, &mut p.proj, t, d, d, false)?;
+            self.gpu
+                .gemm(&layer.o_proj.view(), &p.attn, &mut p.proj, t, d, d, false)?;
             mark!("o_gemm");
             self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
             mark!("residual");
 
-            self.gpu.rmsnorm_batch(&p.x, &layer.mlp_norm, &mut p.normed, t, d, NORM_EPS)?;
+            self.gpu
+                .rmsnorm_batch(&p.x, &layer.mlp_norm, &mut p.normed, t, d, NORM_EPS)?;
             mark!("norm");
             match &layer.gate_proj {
                 Some(gate) => {
-                    self.gpu.gemm(&gate.view(), &p.normed, &mut p.gate, t, self.hidden, d, false)?;
+                    self.gpu.gemm(
+                        &gate.view(),
+                        &p.normed,
+                        &mut p.gate,
+                        t,
+                        self.hidden,
+                        d,
+                        false,
+                    )?;
                     mark!("ffn_gate_up_gemm");
-                    self.gpu.gemm(&layer.up_proj.view(), &p.normed, &mut p.up,
-                                  t, self.hidden, d, false)?;
+                    self.gpu.gemm(
+                        &layer.up_proj.view(),
+                        &p.normed,
+                        &mut p.up,
+                        t,
+                        self.hidden,
+                        d,
+                        false,
+                    )?;
                     mark!("ffn_gate_up_gemm");
                     self.gpu.swiglu_batch(&mut p.gate, &p.up, t * self.hidden)?;
                     mark!("swiglu");
                 }
                 None => bail!("the GPU path currently implements swiglu only"),
             }
-            self.gpu.gemm(&layer.down_proj.view(), &p.gate, &mut p.proj,
-                          t, d, self.hidden, false)?;
+            self.gpu.gemm(
+                &layer.down_proj.view(),
+                &p.gate,
+                &mut p.proj,
+                t,
+                d,
+                self.hidden,
+                false,
+            )?;
             mark!("down_gemm");
             self.gpu.add_inplace(&mut p.x, &p.proj, t * d)?;
             mark!("residual");
@@ -2681,11 +3592,25 @@ impl GpuModel {
             let last_row = p.x.slice((t - 1) * d..t * d);
             self.gpu.copy_rows(&last_row, &mut self.scratch.normed, d)?;
         }
-        self.gpu.rmsnorm(&self.scratch.normed, &self.final_norm,
-                         &mut self.scratch.x, d, NORM_EPS)?;
-        Self::project_dyn(&self.gpu, &self.tok_emb, &self.scratch.x,
-                          &mut self.scratch.logits, self.cfg.vocab_size, d,
-                          &self.params, 0, PARAM_ZERO, false)?;
+        self.gpu.rmsnorm(
+            &self.scratch.normed,
+            &self.final_norm,
+            &mut self.scratch.x,
+            d,
+            NORM_EPS,
+        )?;
+        Self::project_dyn(
+            &self.gpu,
+            &self.tok_emb,
+            &self.scratch.x,
+            &mut self.scratch.logits,
+            self.cfg.vocab_size,
+            d,
+            &self.params,
+            0,
+            PARAM_ZERO,
+            false,
+        )?;
         Ok(())
     }
 

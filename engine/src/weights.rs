@@ -23,8 +23,8 @@ impl Weights {
         // SAFETY: the mapping is read-only and lives as long as this struct.
         // A concurrent writer truncating the file would be undefined behaviour,
         // but checkpoints are immutable once exported.
-        let mmap = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("mapping {}", path.display()))?;
+        let mmap =
+            unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))?;
         Ok(Self { mmap })
     }
 

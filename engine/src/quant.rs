@@ -55,7 +55,12 @@ impl QuantTensor {
             }
         }
 
-        Self { data, scales, rows, cols }
+        Self {
+            data,
+            scales,
+            rows,
+            cols,
+        }
     }
 
     /// Bytes held, including scales.
@@ -118,7 +123,10 @@ mod tests {
                 data.push(f(r, c));
             }
         }
-        Tensor { shape: vec![rows, cols], data }
+        Tensor {
+            shape: vec![rows, cols],
+            data,
+        }
     }
 
     #[test]
@@ -128,7 +136,11 @@ mod tests {
         let err = q.error_vs(&t);
         // int8 over a symmetric range gives roughly 1/127 resolution; RMS
         // relative error well under 1% is the expected outcome.
-        assert!(err.rms_relative < 0.01, "rms relative error {}", err.rms_relative);
+        assert!(
+            err.rms_relative < 0.01,
+            "rms relative error {}",
+            err.rms_relative
+        );
     }
 
     #[test]
@@ -137,10 +149,17 @@ mod tests {
         // keep the small rows accurate; a single tensor-wide scale would not.
         let t = tensor(4, 32, |r, c| {
             let base = ((c % 7) as f32 - 3.0) / 100.0;
-            if r == 0 { base * 10_000.0 } else { base }
+            if r == 0 {
+                base * 10_000.0
+            } else {
+                base
+            }
         });
         let q = QuantTensor::from_tensor(&t);
-        assert!(q.scales[0] > q.scales[1] * 100.0, "outlier row should have its own scale");
+        assert!(
+            q.scales[0] > q.scales[1] * 100.0,
+            "outlier row should have its own scale"
+        );
         assert!(q.error_vs(&t).rms_relative < 0.01);
     }
 

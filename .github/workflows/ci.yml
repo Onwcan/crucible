@@ -44,15 +44,8 @@ jobs:
           rustc --version
           cargo --version
           printf 'cache-id=%s\n' "$(rustc -vV | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      # Pre-existing whole-crate drift is reserved for a separate formatting commit.
-      # Remove continue-on-error and the warning step after normalization is green.
-      - name: Rust formatting (informational until normalization)
-        id: fmt
-        continue-on-error: true
+      - name: Check Rust formatting
         run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
-      - name: Report formatting debt
-        if: steps.fmt.outcome == 'failure'
-        run: echo '::warning title=Rust formatting debt::rustfmt failed; inspect its diff above. Formatting is informational until the dedicated normalization commit, not a passing required gate.'
       - name: Check Python, JSON, documentation and repository hygiene
         run: python scripts/ci_source.py
       - name: Test the CI checks

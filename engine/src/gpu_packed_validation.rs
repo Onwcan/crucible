@@ -338,14 +338,20 @@ fn runtime_checks(
             widths.dedup();
             ensure!(widths == [16, 8],
                 "concurrent decode did not exercise 16 -> 8: graph={graph} reverse={reverse} widths={widths:?}");
-            ensure!(trace.iter().filter(|s| s.prefill_batches > 0).count() == 1
-                && trace[0].prefill_final_rows == 16,
-                "concurrent requests did not finish prefill together");
+            ensure!(
+                trace.iter().filter(|s| s.prefill_batches > 0).count() == 1
+                    && trace[0].prefill_final_rows == 16,
+                "concurrent requests did not finish prefill together"
+            );
             let completed = runtime.completed();
             ensure!(completed.len() == 16, "concurrent completion count changed");
             for expected in concurrent_specs {
                 let matches: Vec<_> = completed.iter().filter(|c| c.id == expected.id).collect();
-                ensure!(matches.len() == 1, "concurrent completion missing/duplicated {}", expected.id);
+                ensure!(
+                    matches.len() == 1,
+                    "concurrent completion missing/duplicated {}",
+                    expected.id
+                );
                 let completion = matches[0];
                 ensure!(completion.reason == FinishReason::Length
                     && completion.tokens == references[&expected.id].0,
@@ -353,8 +359,10 @@ fn runtime_checks(
                     expected.id, references[&expected.id].0, completion.tokens);
                 comparisons += 1;
             }
-            ensure!(runtime.free_pages() == runtime.model().page_pool().n_pages(),
-                "concurrent decode leaked pages");
+            ensure!(
+                runtime.free_pages() == runtime.model().page_pool().n_pages(),
+                "concurrent decode leaked pages"
+            );
         }
     }
     runtime.model_mut().set_batch_graph(original_batch_graph);
@@ -432,7 +440,10 @@ fn runtime_checks(
             "runtime leaked pages"
         );
     }
-    println!("  cancellation at 0/1/3/6 boundaries and immediate page reuse: {} exact survivors", comparisons - cancellation_start);
+    println!(
+        "  cancellation at 0/1/3/6 boundaries and immediate page reuse: {} exact survivors",
+        comparisons - cancellation_start
+    );
     for batched in [false, true] {
         runtime.set_batched_prefill(batched);
         for spec in specs.iter().take(5) {
@@ -516,23 +527,41 @@ fn malformed_metadata_check(model: &mut GpuModel, cfg: &Config) -> Result<usize>
     let expected = model.prefill_chunk(&work.prompt, &work_table, 0, true)?;
     let mut decode_tables = vec![0; model.max_batch() * model.table_stride()];
     decode_tables[..model.table_stride()].copy_from_slice(&anchor_table);
-    let anchor_next = model.decode_batch_mixed(
-        &[anchor_token], &[33], &decode_tables, &[34], &[], &[0])?.full;
-    let good = PackedPrefillRequest { tokens: &work.prompt, page_table: &work_table,
-        pos_offset: 0, want_logits: true };
-    let same_bits = |a: &[f32], b: &[f32]| a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    let anchor_next = model
+        .decode_batch_mixed(&[anchor_token], &[33], &decode_tables, &[34], &[], &[0])?
+        .full;
+    let good = PackedPrefillRequest {
+        tokens: &work.prompt,
+        page_table: &work_table,
+        pos_offset: 0,
+        want_logits: true,
+    };
+    let same_bits = |a: &[f32], b: &[f32]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
     let recover = |model: &mut GpuModel, label: &str| -> Result<()> {
-        let after = model.decode_batch_mixed(
-            &[anchor_token], &[33], &decode_tables, &[34], &[], &[0])?.full;
-        ensure!(same_bits(&after, &anchor_next), "{label}: malformed input changed unrelated resident KV");
+        let after = model
+            .decode_batch_mixed(&[anchor_token], &[33], &decode_tables, &[34], &[], &[0])?
+            .full;
+        ensure!(
+            same_bits(&after, &anchor_next),
+            "{label}: malformed input changed unrelated resident KV"
+        );
         let packed = model.prefill_packed(std::slice::from_ref(&good), &[], &[0])?;
-        ensure!(same_bits(&packed.full, &expected), "{label}: packed recovery logits changed");
+        ensure!(
+            same_bits(&packed.full, &expected),
+            "{label}: packed recovery logits changed"
+        );
         let single = model.prefill_single_mixed(&good, &[], &[0])?;
-        ensure!(same_bits(&single.full, &expected), "{label}: singleton recovery logits changed");
+        ensure!(
+            same_bits(&single.full, &expected),
+            "{label}: singleton recovery logits changed"
+        );
         let compact = model.prefill_single_mixed(&good, &[], &[])?;
-        ensure!(compact.ids == vec![sampling::argmax(&expected)] && compact.d2h_bytes == 4,
-            "{label}: singleton recovery lost greedy compact selection");
+        ensure!(
+            compact.ids == vec![sampling::argmax(&expected)] && compact.d2h_bytes == 4,
+            "{label}: singleton recovery lost greedy compact selection"
+        );
         Ok(())
     };
     let old_graph = model.prefill_graph();
@@ -540,61 +569,158 @@ fn malformed_metadata_check(model: &mut GpuModel, cfg: &Config) -> Result<usize>
     let mut rejected = 0usize;
     macro_rules! reject {
         ($label:literal, $call:expr) => {{
-            ensure!($call.is_err(), concat!($label, ": malformed metadata accepted"));
+            ensure!(
+                $call.is_err(),
+                concat!($label, ": malformed metadata accepted")
+            );
             recover(model, $label)?;
             rejected += 1;
         }};
     }
     reject!("paging batch capacity", model.enable_paging(1, 17));
     reject!("empty batch", model.prefill_packed(&[], &[], &[]));
-    let empty = PackedPrefillRequest { tokens: &[], ..good };
+    let empty = PackedPrefillRequest {
+        tokens: &[],
+        ..good
+    };
     reject!("empty chunk", model.prefill_single_mixed(&empty, &[], &[]));
-    let overflow = PackedPrefillRequest { pos_offset: usize::MAX, ..good };
-    reject!("position overflow", model.prefill_single_mixed(&overflow, &[], &[]));
-    let past_end = PackedPrefillRequest { pos_offset: cfg.block_size, ..good };
-    reject!("context overflow", model.prefill_single_mixed(&past_end, &[], &[]));
+    let overflow = PackedPrefillRequest {
+        pos_offset: usize::MAX,
+        ..good
+    };
+    reject!(
+        "position overflow",
+        model.prefill_single_mixed(&overflow, &[], &[])
+    );
+    let past_end = PackedPrefillRequest {
+        pos_offset: cfg.block_size,
+        ..good
+    };
+    reject!(
+        "context overflow",
+        model.prefill_single_mixed(&past_end, &[], &[])
+    );
     let huge_tokens = vec![0; model.prefill_token_capacity() + 1];
-    let huge = PackedPrefillRequest { tokens: &huge_tokens, ..good };
-    reject!("packed row overflow", model.prefill_packed(&[huge], &[], &[]));
-    let short = PackedPrefillRequest { page_table: &work_table[..1], ..good };
-    reject!("short page table", model.prefill_single_mixed(&short, &[], &[]));
+    let huge = PackedPrefillRequest {
+        tokens: &huge_tokens,
+        ..good
+    };
+    reject!(
+        "packed row overflow",
+        model.prefill_packed(&[huge], &[], &[])
+    );
+    let short = PackedPrefillRequest {
+        page_table: &work_table[..1],
+        ..good
+    };
+    reject!(
+        "short page table",
+        model.prefill_single_mixed(&short, &[], &[])
+    );
     let mut negative_table = work_table.clone();
     negative_table[0] = -1;
-    let negative = PackedPrefillRequest { page_table: &negative_table, ..good };
-    reject!("negative physical page", model.prefill_single_mixed(&negative, &[], &[]));
+    let negative = PackedPrefillRequest {
+        page_table: &negative_table,
+        ..good
+    };
+    reject!(
+        "negative physical page",
+        model.prefill_single_mixed(&negative, &[], &[])
+    );
     let mut outside_table = work_table.clone();
     outside_table[0] = model.page_pool().n_pages() as i32;
-    let outside = PackedPrefillRequest { page_table: &outside_table, ..good };
-    reject!("physical page outside pool", model.prefill_single_mixed(&outside, &[], &[]));
+    let outside = PackedPrefillRequest {
+        page_table: &outside_table,
+        ..good
+    };
+    reject!(
+        "physical page outside pool",
+        model.prefill_single_mixed(&outside, &[], &[])
+    );
     let mut alias_table = work_table.clone();
     alias_table[1] = alias_table[0];
-    let alias = PackedPrefillRequest { page_table: &alias_table, ..good };
-    reject!("logical page alias", model.prefill_single_mixed(&alias, &[], &[]));
-    let aliases = [PackedPrefillRequest { ..good }, PackedPrefillRequest { ..good }];
-    reject!("cross-request page alias", model.prefill_packed(&aliases, &[], &[]));
+    let alias = PackedPrefillRequest {
+        page_table: &alias_table,
+        ..good
+    };
+    reject!(
+        "logical page alias",
+        model.prefill_single_mixed(&alias, &[], &[])
+    );
+    let aliases = [
+        PackedPrefillRequest { ..good },
+        PackedPrefillRequest { ..good },
+    ];
+    reject!(
+        "cross-request page alias",
+        model.prefill_packed(&aliases, &[], &[])
+    );
     let mut bad_tokens = work.prompt.clone();
     bad_tokens[0] = cfg.vocab_size;
-    let bad_token = PackedPrefillRequest { tokens: &bad_tokens, ..good };
-    reject!("token outside vocabulary", model.prefill_single_mixed(&bad_token, &[], &[]));
+    let bad_token = PackedPrefillRequest {
+        tokens: &bad_tokens,
+        ..good
+    };
+    reject!(
+        "token outside vocabulary",
+        model.prefill_single_mixed(&bad_token, &[], &[])
+    );
     let too_many: Vec<_> = (0..=model.prefill_request_capacity())
-        .map(|_| PackedPrefillRequest { ..good }).collect();
-    reject!("request capacity", model.prefill_packed(&too_many, &[], &[]));
-    reject!("zero top-k", model.prefill_single_mixed(&good, &[(0, 0)], &[]));
-    reject!("oversize device top-k", model.prefill_single_mixed(&good, &[(0, TOPK_MAX + 1)], &[]));
-    reject!("top-k row outside finals", model.prefill_single_mixed(&good, &[(1, 5)], &[]));
-    reject!("full row outside finals", model.prefill_single_mixed(&good, &[], &[1]));
-    reject!("duplicate full row", model.prefill_single_mixed(&good, &[], &[0, 0]));
-    reject!("overlapping selection routes", model.prefill_single_mixed(&good, &[(0, 5)], &[0]));
-    let non_final = PackedPrefillRequest { want_logits: false, ..good };
-    reject!("selection without final row", model.prefill_single_mixed(&non_final, &[(0, 5)], &[]));
+        .map(|_| PackedPrefillRequest { ..good })
+        .collect();
+    reject!(
+        "request capacity",
+        model.prefill_packed(&too_many, &[], &[])
+    );
+    reject!(
+        "zero top-k",
+        model.prefill_single_mixed(&good, &[(0, 0)], &[])
+    );
+    reject!(
+        "oversize device top-k",
+        model.prefill_single_mixed(&good, &[(0, TOPK_MAX + 1)], &[])
+    );
+    reject!(
+        "top-k row outside finals",
+        model.prefill_single_mixed(&good, &[(1, 5)], &[])
+    );
+    reject!(
+        "full row outside finals",
+        model.prefill_single_mixed(&good, &[], &[1])
+    );
+    reject!(
+        "duplicate full row",
+        model.prefill_single_mixed(&good, &[], &[0, 0])
+    );
+    reject!(
+        "overlapping selection routes",
+        model.prefill_single_mixed(&good, &[(0, 5)], &[0])
+    );
+    let non_final = PackedPrefillRequest {
+        want_logits: false,
+        ..good
+    };
+    reject!(
+        "selection without final row",
+        model.prefill_single_mixed(&non_final, &[(0, 5)], &[])
+    );
     model.prefill_packed(std::slice::from_ref(&good), &[], &[])?;
-    ensure!(model.time_packed_replay(18, 1, 1).is_err(), "stale replay shape accepted");
+    ensure!(
+        model.time_packed_replay(18, 1, 1).is_err(),
+        "stale replay shape accepted"
+    );
     model.prefill_single_mixed(&good, &[], &[])?;
-    ensure!(model.time_packed_replay(17, 1, 1).is_err(), "singleton left packed replay metadata live");
+    ensure!(
+        model.time_packed_replay(17, 1, 1).is_err(),
+        "singleton left packed replay metadata live"
+    );
     model.set_prefill_graph(old_graph);
     anchor_pages.release(model.page_pool_mut())?;
     work_pages.release(model.page_pool_mut())?;
-    ensure!(model.page_pool().used_pages() == 0, "malformed-input checks leaked pages");
+    ensure!(
+        model.page_pool().used_pages() == 0,
+        "malformed-input checks leaked pages"
+    );
     println!("  {rejected} malformed descriptor/selection cases rejected; neighbor KV and packed/singleton recovery bit-exact");
     Ok(rejected)
 }
@@ -609,13 +735,31 @@ fn diagnose_request(
     steps: usize,
     id: u64,
 ) -> Result<()> {
-    ensure!((100..=118).contains(&id), "diagnose-request supports boundary corpus IDs 100..=118");
-    ensure!(steps <= 32, "diagnose-request is bounded to at most 32 generated tokens");
-    let lengths = [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 941];
-    let corpus: Vec<_> = lengths.iter().enumerate()
-        .map(|(i, &len)| spec(100 + i as u64, len, cfg.vocab_size, steps)).collect();
-    let specs = if id <= 115 { &corpus[..16] } else { &corpus[3..] };
-    let target = specs.iter().position(|s| s.id == id).context("diagnostic target missing")?;
+    ensure!(
+        (100..=118).contains(&id),
+        "diagnose-request supports boundary corpus IDs 100..=118"
+    );
+    ensure!(
+        steps <= 32,
+        "diagnose-request is bounded to at most 32 generated tokens"
+    );
+    let lengths = [
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 941,
+    ];
+    let corpus: Vec<_> = lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| spec(100 + i as u64, len, cfg.vocab_size, steps))
+        .collect();
+    let specs = if id <= 115 {
+        &corpus[..16]
+    } else {
+        &corpus[3..]
+    };
+    let target = specs
+        .iter()
+        .position(|s| s.id == id)
+        .context("diagnostic target missing")?;
     let spec = &specs[target];
     let attention = candidate.prefill_attention();
     println!("diagnose_request,id={id},prompt_len={},temperature={},top_k={},seed={},steps={steps},chunk=32,permutation=0,prefixes=false,requests={}",
@@ -643,67 +787,137 @@ fn diagnose_request(
 
     // The Reference packed control separates effects of packed/chunked GEMM
     // execution from differences introduced by the attention candidate.
-    for (label, variant) in [("packed_reference", PrefillAttentionVariant::Reference), ("packed_candidate", attention)] {
+    for (label, variant) in [
+        ("packed_reference", PrefillAttentionVariant::Reference),
+        ("packed_candidate", attention),
+    ] {
         candidate.set_prefill_attention(variant)?;
-        let (mut sequences, tables, mut logits) = diagnostic_prefill(candidate, cfg, specs, target)?;
+        let (mut sequences, tables, mut logits) =
+            diagnostic_prefill(candidate, cfg, specs, target)?;
         let mut rng = Rng::new(spec.config.seed);
         let mut oracle_rng = Rng::new(spec.config.seed);
         let mut first_difference = None;
         for generated in 0..steps {
             let before = rng.state();
             let mut draw_rng = rng.clone();
-            let draw = if spec.config.temperature > 0.0 { Some(draw_rng.next_f32()) } else { None };
+            let draw = if spec.config.temperature > 0.0 {
+                Some(draw_rng.next_f32())
+            } else {
+                None
+            };
             let got = sampling::sample(&logits, &spec.config, &mut rng);
-            let expected = sampling::sample(&oracle_logits[generated], &spec.config, &mut oracle_rng);
-            ensure!(expected == oracle_tokens[generated], "diagnostic oracle replay changed");
-            ensure!(rng.state() == oracle_rng.state(), "diagnostic RNG advancement differs at token {}", generated + 1);
+            let expected =
+                sampling::sample(&oracle_logits[generated], &spec.config, &mut oracle_rng);
+            ensure!(
+                expected == oracle_tokens[generated],
+                "diagnostic oracle replay changed"
+            );
+            ensure!(
+                rng.state() == oracle_rng.state(),
+                "diagnostic RNG advancement differs at token {}",
+                generated + 1
+            );
             if got != expected && first_difference.is_none() {
                 first_difference = Some(generated + 1);
             }
             let expected_logits = &oracle_logits[generated];
-            ensure!(logits.len() == expected_logits.len() && logits.iter().all(|x| x.is_finite())
-                && expected_logits.iter().all(|x| x.is_finite()), "invalid diagnostic logits");
+            ensure!(
+                logits.len() == expected_logits.len()
+                    && logits.iter().all(|x| x.is_finite())
+                    && expected_logits.iter().all(|x| x.is_finite()),
+                "invalid diagnostic logits"
+            );
             let mut max_abs = 0.0f64;
             let mut squared = 0.0f64;
             let mut bit_differences = 0usize;
             let mut worst = 0usize;
             for (index, (&a, &b)) in expected_logits.iter().zip(&logits).enumerate() {
                 let difference = (a as f64 - b as f64).abs();
-                if difference > max_abs { max_abs = difference; worst = index; }
+                if difference > max_abs {
+                    max_abs = difference;
+                    worst = index;
+                }
                 squared += difference * difference;
                 bit_differences += usize::from(a.to_bits() != b.to_bits());
             }
             let rms = (squared / logits.len() as f64).sqrt();
-            let draw_text = draw.map(|d| format!("{d:.9}")).unwrap_or_else(|| "none".into());
+            let draw_text = draw
+                .map(|d| format!("{d:.9}"))
+                .unwrap_or_else(|| "none".into());
             println!("diagnose_step,{label},variant={},token={},input={},expected={expected},got={got},equal={},max_abs={max_abs:.9e},rms={rms:.9e},different_bits={bit_differences},worst_id={worst},worst_reference={:.9e},worst_candidate={:.9e},rng_before={before},rng_after={},draw={draw_text}",
                 variant.name(), generated + 1, if generated == 0 { spec.prompt[spec.prompt.len() - 1] } else { oracle_tokens[generated - 1] },
                 expected == got, expected_logits[worst], logits[worst], rng.state());
             if generated == 0 || got != expected {
-                diagnostic_sampling("reference", expected_logits, &spec.config, expected, got, draw);
+                diagnostic_sampling(
+                    "reference",
+                    expected_logits,
+                    &spec.config,
+                    expected,
+                    got,
+                    draw,
+                );
                 diagnostic_sampling(label, &logits, &spec.config, got, expected, draw);
-                let expected_ids: std::collections::BTreeSet<_> = sampling::top_k(expected_logits, spec.config.top_k)
-                    .into_iter().map(|(id, _)| id).collect();
-                let overlap = sampling::top_k(&logits, spec.config.top_k).iter()
-                    .filter(|(id, _)| expected_ids.contains(id)).count();
-                println!("diagnose_candidates,{label},token={},top_k_overlap={overlap}/{}", generated + 1, expected_ids.len());
+                let expected_ids: std::collections::BTreeSet<_> =
+                    sampling::top_k(expected_logits, spec.config.top_k)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                let overlap = sampling::top_k(&logits, spec.config.top_k)
+                    .iter()
+                    .filter(|(id, _)| expected_ids.contains(id))
+                    .count();
+                println!(
+                    "diagnose_candidates,{label},token={},top_k_overlap={overlap}/{}",
+                    generated + 1,
+                    expected_ids.len()
+                );
             }
             if generated + 1 < steps {
-                logits = diagnostic_decode(candidate, &tables[target], spec.prompt.len() + generated, expected)?;
+                logits = diagnostic_decode(
+                    candidate,
+                    &tables[target],
+                    spec.prompt.len() + generated,
+                    expected,
+                )?;
             }
         }
-        for seq in sequences.iter_mut().rev() { seq.release(candidate.page_pool_mut())?; }
-        ensure!(candidate.page_pool().used_pages() == 0, "diagnostic pages leaked");
-        println!("diagnose_first_different_choice,{label},{}", first_difference.map(|s| s.to_string()).unwrap_or_else(|| "none".into()));
+        for seq in sequences.iter_mut().rev() {
+            seq.release(candidate.page_pool_mut())?;
+        }
+        ensure!(
+            candidate.page_pool().used_pages() == 0,
+            "diagnostic pages leaked"
+        );
+        println!(
+            "diagnose_first_different_choice,{label},{}",
+            first_difference
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".into())
+        );
     }
     candidate.set_prefill_attention(attention)?;
     println!("Diagnostic complete; run the unmodified strict check without --diagnose-request for the acceptance result.");
     Ok(())
 }
 
-fn diagnostic_decode(model: &mut GpuModel, table: &[i32], position: usize, token: usize) -> Result<Vec<f32>> {
+fn diagnostic_decode(
+    model: &mut GpuModel,
+    table: &[i32],
+    position: usize,
+    token: usize,
+) -> Result<Vec<f32>> {
     let mut tables = vec![0; model.max_batch() * model.table_stride()];
     tables[..table.len()].copy_from_slice(table);
-    Ok(model.decode_batch_mixed(&[token], &[position], &tables, &[(position + 1) as i32], &[], &[0])?.full)
+    Ok(model
+        .decode_batch_mixed(
+            &[token],
+            &[position],
+            &tables,
+            &[(position + 1) as i32],
+            &[],
+            &[0],
+        )?
+        .full)
 }
 
 fn diagnostic_prefill(
@@ -713,55 +927,103 @@ fn diagnostic_prefill(
     target: usize,
 ) -> Result<(Vec<SequencePages>, Vec<Vec<i32>>, Vec<f32>)> {
     let mut sequences = Vec::new();
-    for spec in specs { sequences.push(allocate(model, spec.prompt.len() + spec.config.max_tokens)?); }
-    let tables: Vec<_> = sequences.iter().map(|s| s.table_padded(model.table_stride())).collect();
+    for spec in specs {
+        sequences.push(allocate(model, spec.prompt.len() + spec.config.max_tokens)?);
+    }
+    let tables: Vec<_> = sequences
+        .iter()
+        .map(|s| s.table_padded(model.table_stride()))
+        .collect();
     let mut consumed = vec![0; specs.len()];
     let mut target_logits = None;
     while consumed.iter().zip(specs).any(|(&n, s)| n < s.prompt.len()) {
         let mut remaining = cfg.block_size;
         let mut plan = Vec::new();
         for (index, spec) in specs.iter().enumerate() {
-            if consumed[index] == spec.prompt.len() { continue; }
+            if consumed[index] == spec.prompt.len() {
+                continue;
+            }
             let len = 32.min(spec.prompt.len() - consumed[index]).min(remaining);
-            if len == 0 { break; }
+            if len == 0 {
+                break;
+            }
             plan.push((index, consumed[index], len));
             remaining -= len;
         }
         ensure!(!plan.is_empty(), "diagnostic packed plan made no progress");
-        let descriptors: Vec<_> = plan.iter().map(|&(index, start, len)| PackedPrefillRequest {
-            tokens: &specs[index].prompt[start..start + len], page_table: &tables[index],
-            pos_offset: start, want_logits: start + len == specs[index].prompt.len(),
-        }).collect();
-        let finals: Vec<_> = plan.iter().filter_map(|&(index, start, len)|
-            (start + len == specs[index].prompt.len()).then_some(index)).collect();
-        let topk_rows: Vec<_> = finals.iter().enumerate().filter_map(|(row, &index)| {
-            let c = &specs[index].config;
-            (c.temperature > 0.0 && c.top_k <= TOPK_MAX).then_some((row, c.top_k))
-        }).collect();
-        let full_rows: Vec<_> = finals.iter().enumerate().filter_map(|(row, &index)| {
-            let c = &specs[index].config;
-            (c.temperature > 0.0 && c.top_k > TOPK_MAX).then_some(row)
-        }).collect();
+        let descriptors: Vec<_> = plan
+            .iter()
+            .map(|&(index, start, len)| PackedPrefillRequest {
+                tokens: &specs[index].prompt[start..start + len],
+                page_table: &tables[index],
+                pos_offset: start,
+                want_logits: start + len == specs[index].prompt.len(),
+            })
+            .collect();
+        let finals: Vec<_> = plan
+            .iter()
+            .filter_map(|&(index, start, len)| {
+                (start + len == specs[index].prompt.len()).then_some(index)
+            })
+            .collect();
+        let topk_rows: Vec<_> = finals
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &index)| {
+                let c = &specs[index].config;
+                (c.temperature > 0.0 && c.top_k <= TOPK_MAX).then_some((row, c.top_k))
+            })
+            .collect();
+        let full_rows: Vec<_> = finals
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &index)| {
+                let c = &specs[index].config;
+                (c.temperature > 0.0 && c.top_k > TOPK_MAX).then_some(row)
+            })
+            .collect();
         model.prefill_packed(&descriptors, &topk_rows, &full_rows)?;
         if !finals.is_empty() {
             let rows: Vec<_> = (0..finals.len()).collect();
             let diagnostic = model.prefill_packed(&descriptors, &[], &rows)?.full;
             if let Some(row) = finals.iter().position(|&index| index == target) {
-                target_logits = Some(diagnostic[row * cfg.vocab_size..(row + 1) * cfg.vocab_size].to_vec());
+                target_logits =
+                    Some(diagnostic[row * cfg.vocab_size..(row + 1) * cfg.vocab_size].to_vec());
             }
         }
-        for (index, _, len) in plan { consumed[index] += len; }
+        for (index, _, len) in plan {
+            consumed[index] += len;
+        }
     }
-    Ok((sequences, tables, target_logits.context("diagnostic final row missing")?))
+    Ok((
+        sequences,
+        tables,
+        target_logits.context("diagnostic final row missing")?,
+    ))
 }
 
-fn diagnostic_sampling(label: &str, logits: &[f32], config: &GenerationConfig, chosen: usize, other: usize, draw: Option<f32>) {
+fn diagnostic_sampling(
+    label: &str,
+    logits: &[f32],
+    config: &GenerationConfig,
+    chosen: usize,
+    other: usize,
+    draw: Option<f32>,
+) {
     let k = config.top_k.clamp(1, logits.len());
     let ranked = sampling::top_k(logits, (k + 1).min(logits.len()));
     let candidates = &ranked[..k];
     let best = candidates[0].1;
-    let gap = if k < ranked.len() { candidates[k - 1].1 - ranked[k].1 } else { f32::NAN };
-    let top_gap = if ranked.len() > 1 { best - ranked[1].1 } else { f32::NAN };
+    let gap = if k < ranked.len() {
+        candidates[k - 1].1 - ranked[k].1
+    } else {
+        f32::NAN
+    };
+    let top_gap = if ranked.len() > 1 {
+        best - ranked[1].1
+    } else {
+        f32::NAN
+    };
     println!("diagnose_distribution,{label},top1_gap={top_gap:.9e},topk_cutoff_gap={gap:.9e},selected_logit={:.9e},other_logit={:.9e},selected_minus_other={:.9e}",
         logits[chosen], logits[other], logits[chosen] - logits[other]);
     if config.temperature <= 0.0 {
@@ -773,7 +1035,10 @@ fn diagnostic_sampling(label: &str, logits: &[f32], config: &GenerationConfig, c
         }
         return;
     }
-    let weights: Vec<_> = candidates.iter().map(|(_, value)| ((*value - best) / config.temperature).exp()).collect();
+    let weights: Vec<_> = candidates
+        .iter()
+        .map(|(_, value)| ((*value - best) / config.temperature).exp())
+        .collect();
     let sum: f64 = weights.iter().map(|&w| w as f64).sum();
     let mut cumulative = 0.0f64;
     for (rank, (&(id, value), &weight)) in candidates.iter().zip(&weights).enumerate() {
@@ -781,14 +1046,22 @@ fn diagnostic_sampling(label: &str, logits: &[f32], config: &GenerationConfig, c
         cumulative += weight as f64;
         let upper = cumulative / sum;
         if rank < 8 || id == chosen || id == other {
-            let margin = draw.map(|d| ((d as f64) - lower).min(upper - d as f64)).unwrap_or(f64::NAN);
+            let margin = draw
+                .map(|d| ((d as f64) - lower).min(upper - d as f64))
+                .unwrap_or(f64::NAN);
             println!("diagnose_candidate,{label},rank={},id={id},logit={value:.9e},probability={:.9e},cdf_lower={lower:.12},cdf_upper={upper:.12},draw_margin={margin:.9e},chosen={},other={}",
                 rank + 1, weight as f64 / sum, id == chosen, id == other);
         }
     }
 }
 
-pub fn check(dir: PathBuf, quant: &str, steps: usize, fuzz: usize, diagnostic: Option<u64>) -> Result<()> {
+pub fn check(
+    dir: PathBuf,
+    quant: &str,
+    steps: usize,
+    fuzz: usize,
+    diagnostic: Option<u64>,
+) -> Result<()> {
     let cfg = Config::from_file(dir.join("config.json"))?;
     ensure!(
         steps > 0 && cfg.block_size > steps + 941,
@@ -898,7 +1171,14 @@ pub fn check(dir: PathBuf, quant: &str, steps: usize, fuzz: usize, diagnostic: O
         println!("  fixed-seed fuzz set {round}: {count} requests exact");
     }
     let concurrent_specs: Vec<_> = (0..16)
-        .map(|i| spec(20_000 + i as u64, 17 + i, cfg.vocab_size, if i % 2 == 0 { 6 } else { 12 }))
+        .map(|i| {
+            spec(
+                20_000 + i as u64,
+                17 + i,
+                cfg.vocab_size,
+                if i % 2 == 0 { 6 } else { 12 },
+            )
+        })
         .collect();
     for spec in &concurrent_specs {
         references.insert(spec.id, independent(&mut reference, spec)?);
@@ -1063,8 +1343,13 @@ pub fn bench(
                     let mut stage_total = 0.0;
                     let mut operations = 0;
                     for stage in &profile.stages {
-                        println!("packed_event,{count},{chunk},{},{count},{round},{iters},{},{},{:.6}",
-                            count * chunk, stage.name, stage.calls, stage.milliseconds);
+                        println!(
+                            "packed_event,{count},{chunk},{},{count},{round},{iters},{},{},{:.6}",
+                            count * chunk,
+                            stage.name,
+                            stage.calls,
+                            stage.milliseconds
+                        );
                         stage_total += stage.milliseconds;
                         operations += stage.calls;
                     }

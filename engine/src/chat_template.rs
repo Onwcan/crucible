@@ -194,14 +194,8 @@ mod tests {
         // OpenAI carries system inside the message list, Anthropic as a
         // top-level field. Both become a leading System turn, and this is the
         // test that says the two must produce byte-identical prompts.
-        let from_openai = serialize(&[
-            t(Role::System, "be terse"),
-            t(Role::User, "hi"),
-        ]);
-        let from_anthropic = serialize(&[
-            t(Role::System, "be terse"),
-            t(Role::User, "hi"),
-        ]);
+        let from_openai = serialize(&[t(Role::System, "be terse"), t(Role::User, "hi")]);
+        let from_anthropic = serialize(&[t(Role::System, "be terse"), t(Role::User, "hi")]);
         assert_eq!(from_openai, from_anthropic);
         assert_eq!(from_openai, "System: be terse\n\nUser: hi\n\nAssistant:");
     }

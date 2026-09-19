@@ -11,7 +11,10 @@ mod gpu_packed_validation;
 mod gpu_prefill_trace;
 
 #[derive(Parser)]
-#[command(name = "llm-engine", about = "Inference engine for locally trained models")]
+#[command(
+    name = "llm-engine",
+    about = "Inference engine for locally trained models"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -102,7 +105,10 @@ enum Command {
         quant: String,
         /// Sequence lengths to check. Defaults straddle every page boundary
         /// that matters at PAGE_TOKENS=16.
-        #[arg(long, default_value = "1,7,15,16,17,31,32,33,64,127,128,129,256,511,512,1023")]
+        #[arg(
+            long,
+            default_value = "1,7,15,16,17,31,32,33,64,127,128,129,256,511,512,1023"
+        )]
         lengths: String,
         #[arg(long)]
         graph: bool,
@@ -218,7 +224,10 @@ enum Command {
         iters: usize,
         #[arg(long, default_value_t = 5)]
         trials: usize,
-        #[arg(long, default_value = "q1-k16,q1-k32,q1-k64,q2-k16,q2-k32,q2-k64,q4-k16,q4-k32,q4-k64,q2-k32-hybrid,q2-k32-cache,exact-q1-k16,exact-q1-k32,exact-q1-k64,exact-q2-k16,exact-q2-k32,exact-q2-k64,exact-q4-k16,exact-q4-k32,exact-q4-k64,exact-q2-k32-hybrid,exact-q2-k32-cache,exact-q2-k32-hybrid-cache")]
+        #[arg(
+            long,
+            default_value = "q1-k16,q1-k32,q1-k64,q2-k16,q2-k32,q2-k64,q4-k16,q4-k32,q4-k64,q2-k32-hybrid,q2-k32-cache,exact-q1-k16,exact-q1-k32,exact-q1-k64,exact-q2-k16,exact-q2-k32,exact-q2-k64,exact-q4-k16,exact-q4-k32,exact-q4-k64,exact-q2-k32-hybrid,exact-q2-k32-cache,exact-q2-k32-hybrid-cache"
+        )]
         variants: String,
         /// Comma-separated exact case names; empty runs the complete matrix.
         #[arg(long, default_value = "")]
@@ -293,7 +302,10 @@ enum Command {
         model: PathBuf,
         #[arg(long, default_value = "int8")]
         quant: String,
-        #[arg(long, default_value = "1,2,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512,941")]
+        #[arg(
+            long,
+            default_value = "1,2,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512,941"
+        )]
         lengths: String,
         #[arg(long, default_value = "32,64,128,256,37,73,131")]
         chunks: String,
@@ -311,7 +323,10 @@ enum Command {
         #[arg(long, default_value = "int8")]
         quant: String,
         /// Prompt lengths to check. Defaults straddle every page boundary.
-        #[arg(long, default_value = "1,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512")]
+        #[arg(
+            long,
+            default_value = "1,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512"
+        )]
         lengths: String,
         /// Chunk sizes to compare against monolithic prefill.
         #[arg(long, default_value = "32,64,128,256")]
@@ -348,7 +363,10 @@ enum Command {
         #[arg(long, default_value = "1,4,8,3,16,2,16,1,8,4")]
         shapes: String,
         /// Prompt lengths, cycled. Chosen around page boundaries.
-        #[arg(long, default_value = "15,16,17,31,32,33,127,128,129,255,256,511,512,513,700,900")]
+        #[arg(
+            long,
+            default_value = "15,16,17,31,32,33,127,128,129,255,256,511,512,513,700,900"
+        )]
         lengths: String,
     },
     /// Batched GEMV against the tiled GEMM, per projection shape and batch.
@@ -489,12 +507,23 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Command::GpuBench { rows, cols, iters } => llm_engine::gpu::bench(rows, cols, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuLogits { model, tokens, top, decode, quant, graph, prefill } => {
-            gpu_logits(model, &tokens, top, decode, &quant, graph, prefill)
-        }
+        Command::GpuLogits {
+            model,
+            tokens,
+            top,
+            decode,
+            quant,
+            graph,
+            prefill,
+        } => gpu_logits(model, &tokens, top, decode, &quant, graph, prefill),
         #[cfg(feature = "cuda")]
         #[cfg(feature = "cuda")]
-        Command::GpuProfile { model, quant, iters, warm } => gpu_profile(model, &quant, iters, warm),
+        Command::GpuProfile {
+            model,
+            quant,
+            iters,
+            warm,
+        } => gpu_profile(model, &quant, iters, warm),
         #[cfg(feature = "tui")]
         Command::Tui { server, max_tokens } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -526,8 +555,8 @@ fn main() -> Result<()> {
             let host: std::net::IpAddr = host
                 .parse()
                 .with_context(|| format!("invalid --host {host:?}"))?;
-            let pages = kv_pages
-                .unwrap_or_else(|| max_batch * cfg.block_size.div_ceil(PAGE_TOKENS));
+            let pages =
+                kv_pages.unwrap_or_else(|| max_batch * cfg.block_size.div_ceil(PAGE_TOKENS));
             serve(ServeOptions {
                 host,
                 port,
@@ -549,75 +578,142 @@ fn main() -> Result<()> {
             })
         }
         #[cfg(feature = "cuda")]
-        Command::GpuSampleBench { model, quant, batches, lengths, steps, trials } => {
-            gpu_sample_bench(model, &quant, &batches, &lengths, steps, trials)
-        }
+        Command::GpuSampleBench {
+            model,
+            quant,
+            batches,
+            lengths,
+            steps,
+            trials,
+        } => gpu_sample_bench(model, &quant, &batches, &lengths, steps, trials),
         #[cfg(feature = "cuda")]
-        Command::GpuTopkBench { rows, top_k, vocab, iters, trials } => {
-            gpu_topk_bench(&rows, &top_k, vocab, iters, trials)
-        }
+        Command::GpuTopkBench {
+            rows,
+            top_k,
+            vocab,
+            iters,
+            trials,
+        } => gpu_topk_bench(&rows, &top_k, vocab, iters, trials),
         #[cfg(feature = "cuda")]
         Command::GpuPrefillAttentionCheck { fuzz, seed } => {
             gpu_attention_validation::check(fuzz, seed)
         }
         #[cfg(feature = "cuda")]
-        Command::GpuPrefillAttentionBench { iters, trials, variants, cases, seed } => {
-            gpu_attention_validation::bench(iters, trials, &variants, &cases, seed)
-        }
+        Command::GpuPrefillAttentionBench {
+            iters,
+            trials,
+            variants,
+            cases,
+            seed,
+        } => gpu_attention_validation::bench(iters, trials, &variants, &cases, seed),
         #[cfg(feature = "cuda")]
-        Command::GpuPackedPrefillCheck { model, quant, steps, fuzz, diagnose_request } => {
-            gpu_packed_validation::check(model, &quant, steps, fuzz, diagnose_request)
-        }
+        Command::GpuPackedPrefillCheck {
+            model,
+            quant,
+            steps,
+            fuzz,
+            diagnose_request,
+        } => gpu_packed_validation::check(model, &quant, steps, fuzz, diagnose_request),
         #[cfg(feature = "cuda")]
-        Command::GpuPackedPrefillBench { model, quant, iters, batches, chunks, packed_only } => {
-            gpu_packed_validation::bench(model, &quant, iters, &batches, &chunks, packed_only)
-        }
+        Command::GpuPackedPrefillBench {
+            model,
+            quant,
+            iters,
+            batches,
+            chunks,
+            packed_only,
+        } => gpu_packed_validation::bench(model, &quant, iters, &batches, &chunks, packed_only),
         #[cfg(feature = "cuda")]
-        Command::GpuPrefillBench { model, quant, lengths, iters } => {
-            gpu_prefill_bench(model, &quant, &lengths, iters)
-        }
+        Command::GpuPrefillBench {
+            model,
+            quant,
+            lengths,
+            iters,
+        } => gpu_prefill_bench(model, &quant, &lengths, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuPrefillTrace { model, quant, lengths, steps, max_batch, budget, trials } => {
-            gpu_prefill_trace::trace(model, &quant, &lengths, steps, max_batch, budget, trials)
-        }
+        Command::GpuPrefillTrace {
+            model,
+            quant,
+            lengths,
+            steps,
+            max_batch,
+            budget,
+            trials,
+        } => gpu_prefill_trace::trace(model, &quant, &lengths, steps, max_batch, budget, trials),
         #[cfg(feature = "cuda")]
-        Command::GpuPrefillGraphCheck { model, quant, lengths, chunks, steps } => {
-            gpu_prefill_graph_check(model, &quant, &lengths, &chunks, steps)
-        }
+        Command::GpuPrefillGraphCheck {
+            model,
+            quant,
+            lengths,
+            chunks,
+            steps,
+        } => gpu_prefill_graph_check(model, &quant, &lengths, &chunks, steps),
         #[cfg(feature = "cuda")]
-        Command::GpuPrefillCheck { model, quant, lengths, chunks, steps } => {
-            gpu_prefill_check(model, &quant, &lengths, &chunks, steps)
-        }
+        Command::GpuPrefillCheck {
+            model,
+            quant,
+            lengths,
+            chunks,
+            steps,
+        } => gpu_prefill_check(model, &quant, &lengths, &chunks, steps),
         #[cfg(feature = "cuda")]
-        Command::GpuSampling { model, quant, steps, max_batch } => {
-            gpu_sampling(model, &quant, steps, max_batch)
-        }
+        Command::GpuSampling {
+            model,
+            quant,
+            steps,
+            max_batch,
+        } => gpu_sampling(model, &quant, steps, max_batch),
         #[cfg(feature = "cuda")]
-        Command::GpuGraphCheck { model, quant, shapes, lengths } => {
-            gpu_graph_check(model, &quant, &shapes, &lengths)
-        }
+        Command::GpuGraphCheck {
+            model,
+            quant,
+            shapes,
+            lengths,
+        } => gpu_graph_check(model, &quant, &shapes, &lengths),
         #[cfg(feature = "cuda")]
         Command::GpuGemvBench { batches, iters } => gpu_gemv_bench(&batches, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuProfileBatch { model, quant, batches, context, iters } => {
-            gpu_profile_batch(model, &quant, &batches, context, iters)
-        }
+        Command::GpuProfileBatch {
+            model,
+            quant,
+            batches,
+            context,
+            iters,
+        } => gpu_profile_batch(model, &quant, &batches, context, iters),
         #[cfg(feature = "cuda")]
-        Command::GpuServeBench { model, quant, batches, lengths, steps, trials } => {
-            gpu_serve_bench(model, &quant, &batches, &lengths, steps, trials)
-        }
+        Command::GpuServeBench {
+            model,
+            quant,
+            batches,
+            lengths,
+            steps,
+            trials,
+        } => gpu_serve_bench(model, &quant, &batches, &lengths, steps, trials),
         #[cfg(feature = "cuda")]
-        Command::GpuBatch { model, quant, lengths, steps, max_batch } => {
-            gpu_batch(model, &quant, &lengths, steps, max_batch)
-        }
+        Command::GpuBatch {
+            model,
+            quant,
+            lengths,
+            steps,
+            max_batch,
+        } => gpu_batch(model, &quant, &lengths, steps, max_batch),
         #[cfg(feature = "cuda")]
-        Command::GpuPaged { model, quant, lengths, graph } => {
-            gpu_paged(model, &quant, &lengths, graph)
-        }
+        Command::GpuPaged {
+            model,
+            quant,
+            lengths,
+            graph,
+        } => gpu_paged(model, &quant, &lengths, graph),
         #[cfg(feature = "cuda")]
-        Command::GpuEval { model, data, tokens, quant, graph, prefill_ctx, paged } => {
-            gpu_eval(model, data, tokens, &quant, graph, prefill_ctx, paged)
-        }
+        Command::GpuEval {
+            model,
+            data,
+            tokens,
+            quant,
+            graph,
+            prefill_ctx,
+            paged,
+        } => gpu_eval(model, data, tokens, &quant, graph, prefill_ctx, paged),
         Command::Generate {
             model,
             tokenizer,
@@ -628,7 +724,17 @@ fn main() -> Result<()> {
             seed,
             gpu,
             graph,
-        } => generate(model, tokenizer, &prompt, max_tokens, temperature, top_k, seed, gpu || graph, graph),
+        } => generate(
+            model,
+            tokenizer,
+            &prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            seed,
+            gpu || graph,
+            graph,
+        ),
     }
 }
 
@@ -678,11 +784,7 @@ fn generate(
     let mut backend = if use_gpu {
         #[cfg(feature = "cuda")]
         {
-            let mut m = llm_engine::gpu_model::GpuModel::load(
-                cfg.clone(),
-                &weights,
-                block_size,
-            )?;
+            let mut m = llm_engine::gpu_model::GpuModel::load(cfg.clone(), &weights, block_size)?;
             m.enable_graph(use_graph);
             Backend::Gpu(m)
         }
@@ -711,7 +813,11 @@ fn generate(
         }
     };
 
-    let mut ids: Vec<usize> = tok.encode(prompt)?.into_iter().map(|v| v as usize).collect();
+    let mut ids: Vec<usize> = tok
+        .encode(prompt)?
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
     if ids.is_empty() {
         anyhow::bail!("prompt encoded to zero tokens");
     }
@@ -719,8 +825,11 @@ fn generate(
     let mut rng = llm_engine::sampling::Rng::new(seed);
 
     println!("prompt      : {prompt:?} ({prompt_len} tokens)");
-    println!("backend     : {}{}", if use_gpu { "gpu" } else { "cpu" },
-             if use_graph { " (cuda graph)" } else { "" });
+    println!(
+        "backend     : {}{}",
+        if use_gpu { "gpu" } else { "cpu" },
+        if use_graph { " (cuda graph)" } else { "" }
+    );
     println!("sampling    : temperature {temperature}, top-k {top_k}, seed {seed}");
     println!();
     print!("{prompt}");
@@ -785,8 +894,10 @@ fn generate(
     match &backend {
         Backend::Cpu(_, c) => println!("kv cache {:.1} MB (host)", c.bytes() as f64 / 1e6),
         #[cfg(feature = "cuda")]
-        Backend::Gpu(m) => println!("device   {:.0} MB (weights + cache)",
-                                    m.device_bytes() as f64 / 1e6),
+        Backend::Gpu(m) => println!(
+            "device   {:.0} MB (weights + cache)",
+            m.device_bytes() as f64 / 1e6
+        ),
     }
     Ok(())
 }
@@ -890,10 +1001,17 @@ fn inspect(dir: PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str, graph: bool, prefill: usize) -> Result<()> {
+fn gpu_logits(
+    dir: PathBuf,
+    tokens: &str,
+    top: usize,
+    decode: usize,
+    quant: &str,
+    graph: bool,
+    prefill: usize,
+) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let precision = Precision::parse(quant)
@@ -917,11 +1035,16 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
     let started = std::time::Instant::now();
     let mut gpu_model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
     gpu_model.enable_graph(graph);
-    println!("precision   {quant}, graph {}", if graph { "on" } else { "off" });
-    println!("load        {:.0} ms, {:.0} MB weights + {:.0} MB cache",
-             started.elapsed().as_secs_f64() * 1000.0,
-             gpu_model.weight_bytes() as f64 / 1e6,
-             gpu_model.cache_bytes() as f64 / 1e6);
+    println!(
+        "precision   {quant}, graph {}",
+        if graph { "on" } else { "off" }
+    );
+    println!(
+        "load        {:.0} ms, {:.0} MB weights + {:.0} MB cache",
+        started.elapsed().as_secs_f64() * 1000.0,
+        gpu_model.weight_bytes() as f64 / 1e6,
+        gpu_model.cache_bytes() as f64 / 1e6
+    );
 
     // Prefill, timed after a warm-up pass so the measurement is not dominated
     // by first-launch costs (module load, allocator warm-up, clock ramp).
@@ -946,12 +1069,17 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
         .fold(0.0f64, f64::max);
 
     let sum: f64 = gpu_out.iter().map(|v| *v as f64).sum();
-    println!("prefill     {} tokens in {prefill_ms:.1} ms  ({:.0} tok/s)",
-             ids.len(), ids.len() as f64 / (prefill_ms / 1000.0));
+    println!(
+        "prefill     {} tokens in {prefill_ms:.1} ms  ({:.0} tok/s)",
+        ids.len(),
+        ids.len() as f64 / (prefill_ms / 1000.0)
+    );
     println!();
-    println!("logits: sum {sum:.4}, min {:.6}, max {:.6}",
-             gpu_out.iter().copied().fold(f32::INFINITY, f32::min),
-             gpu_out.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+    println!(
+        "logits: sum {sum:.4}, min {:.6}, max {:.6}",
+        gpu_out.iter().copied().fold(f32::INFINITY, f32::min),
+        gpu_out.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    );
     println!("max relative difference vs CPU reference: {max_rel:.3e}");
 
     let mut ranked: Vec<(usize, f32)> = gpu_out.iter().copied().enumerate().collect();
@@ -962,9 +1090,15 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
     println!();
     println!("top {top}:            GPU              CPU");
     for i in 0..top.min(ranked.len()) {
-        let flag = if ranked[i].0 == cpu_ranked[i].0 { " " } else { " <- ORDER DIFFERS" };
-        println!("  {:6} {:10.6}   {:6} {:10.6}{flag}",
-                 ranked[i].0, ranked[i].1, cpu_ranked[i].0, cpu_ranked[i].1);
+        let flag = if ranked[i].0 == cpu_ranked[i].0 {
+            " "
+        } else {
+            " <- ORDER DIFFERS"
+        };
+        println!(
+            "  {:6} {:10.6}   {:6} {:10.6}{flag}",
+            ranked[i].0, ranked[i].1, cpu_ranked[i].0, cpu_ranked[i].1
+        );
     }
 
     if decode > 0 {
@@ -982,15 +1116,20 @@ fn gpu_logits(dir: PathBuf, tokens: &str, top: usize, decode: usize, quant: &str
         }
         let secs = started.elapsed().as_secs_f64();
         println!();
-        println!("decode      {decode} tokens in {secs:.2} s  ({:.1} tok/s, {:.2} ms/token){}",
-                 decode as f64 / secs,
-                 secs * 1000.0 / decode as f64,
-                 if gpu_model.graph_active() { "  [graph]" } else { "" });
+        println!(
+            "decode      {decode} tokens in {secs:.2} s  ({:.1} tok/s, {:.2} ms/token){}",
+            decode as f64 / secs,
+            secs * 1000.0 / decode as f64,
+            if gpu_model.graph_active() {
+                "  [graph]"
+            } else {
+                ""
+            }
+        );
     }
 
     Ok(())
 }
-
 
 /// Deterministic pseudo-random token ids, so a failure reproduces exactly.
 #[cfg(feature = "cuda")]
@@ -1014,8 +1153,8 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
     // This command isolates storage translation and retains its original
@@ -1030,8 +1169,10 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
     model.set_paged(false);
 
     println!("page size   {PAGE_TOKENS} tokens");
-    println!("pool        {n_pages} pages, {:.2} MB",
-             model.page_pool().total_bytes() as f64 / 1e6);
+    println!(
+        "pool        {n_pages} pages, {:.2} MB",
+        model.page_pool().total_bytes() as f64 / 1e6
+    );
     println!("graph       {graph}");
     println!("attention   reference (storage parity; use gpu-prefill-attention-check for tiled numerics)");
     println!();
@@ -1046,8 +1187,10 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
     let mut worst_decode = 0.0f64;
     let mut failures = 0usize;
 
-    println!("{:>6}  {:>6}  {:>14}  {:>14}  {:>7}",
-             "len", "pages", "prefill maxdiff", "decode maxdiff", "top-1");
+    println!(
+        "{:>6}  {:>6}  {:>14}  {:>14}  {:>7}",
+        "len", "pages", "prefill maxdiff", "decode maxdiff", "top-1"
+    );
     println!("{}", "-".repeat(58));
 
     for &len in &lens {
@@ -1087,8 +1230,10 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
         worst_prefill = worst_prefill.max(d_prefill);
         worst_decode = worst_decode.max(d_decode);
 
-        println!("{len:>6}  {pages:>6}  {d_prefill:>14.3e}  {d_decode:>14.3e}  {:>7}",
-                 if top_ok { "ok" } else { "MISMATCH" });
+        println!(
+            "{len:>6}  {pages:>6}  {d_prefill:>14.3e}  {d_decode:>14.3e}  {:>7}",
+            if top_ok { "ok" } else { "MISMATCH" }
+        );
     }
 
     model.set_paged(true);
@@ -1097,8 +1242,11 @@ fn gpu_paged(dir: PathBuf, quant: &str, lengths: &str, graph: bool) -> Result<()
     println!();
     println!("worst prefill difference {worst_prefill:.3e}");
     println!("worst decode  difference {worst_decode:.3e}");
-    println!("pages free after reset: {} of {}",
-             model.page_pool().free_pages(), model.page_pool().n_pages());
+    println!(
+        "pages free after reset: {} of {}",
+        model.page_pool().free_pages(),
+        model.page_pool().n_pages()
+    );
 
     if failures > 0 {
         anyhow::bail!("{failures} length(s) disagreed with the contiguous cache");
@@ -1236,8 +1384,8 @@ fn gpu_sample_bench(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let sizes: Vec<usize> = batches
         .split(',')
@@ -1280,9 +1428,10 @@ fn gpu_sample_bench(
         ("mixed+tk", |i| i % 2 == 1, true),
     ];
 
-    let header = format!("{:>6}  {:>11}  {:>11}  {:>11}  {:>9}  {:>11}  {:>8}",
-                         "batch", "mode", "aggregate", "per-request", "step ms",
-                         "D2H/step", "vs greedy");
+    let header = format!(
+        "{:>6}  {:>11}  {:>11}  {:>11}  {:>9}  {:>11}  {:>8}",
+        "batch", "mode", "aggregate", "per-request", "step ms", "D2H/step", "vs greedy"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -1432,9 +1581,10 @@ fn gpu_topk_bench(
         gpu.sync()?;
     }
 
-    let header = format!("{:>6} {:>6} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9}",
-                         "rows", "k", "kernel us", "cand D2H", "full D2H",
-                         "host topk", "new us", "speedup");
+    let header = format!(
+        "{:>6} {:>6} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9}",
+        "rows", "k", "kernel us", "cand D2H", "full D2H", "host topk", "new us", "speedup"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -1445,56 +1595,84 @@ fn gpu_topk_bench(
             // Kernel alone.
             gpu.topk_rows(&d_logits, &d_k, &mut d_cv, &mut d_ci, n, vocab)?;
             gpu.sync()?;
-            let kernel = median((0..trials).map(|_| {
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    gpu.topk_rows(&d_logits, &d_k, &mut d_cv, &mut d_ci, n, vocab).unwrap();
-                }
-                gpu.sync().unwrap();
-                t0.elapsed().as_secs_f64() / iters as f64
-            }).collect::<Vec<_>>());
+            let kernel = median(
+                (0..trials)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            gpu.topk_rows(&d_logits, &d_k, &mut d_cv, &mut d_ci, n, vocab)
+                                .unwrap();
+                        }
+                        gpu.sync().unwrap();
+                        t0.elapsed().as_secs_f64() / iters as f64
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
             // Candidate transfer: two blocks covering every active row.
-            let cand_d2h = median((0..trials).map(|_| {
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    gpu.to_host_n(&d_cv, n * TOPK_MAX).unwrap();
-                    gpu.to_host_i32_n(&d_ci, n * TOPK_MAX).unwrap();
-                }
-                t0.elapsed().as_secs_f64() / iters as f64
-            }).collect::<Vec<_>>());
+            let cand_d2h = median(
+                (0..trials)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            gpu.to_host_n(&d_cv, n * TOPK_MAX).unwrap();
+                            gpu.to_host_i32_n(&d_ci, n * TOPK_MAX).unwrap();
+                        }
+                        t0.elapsed().as_secs_f64() / iters as f64
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
             // The path this replaces: one full logits row per sampled request.
-            let full_d2h = median((0..trials).map(|_| {
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    for r in 0..n {
-                        gpu.to_host_range(&d_logits, r * vocab, vocab).unwrap();
-                    }
-                }
-                t0.elapsed().as_secs_f64() / iters as f64
-            }).collect::<Vec<_>>());
+            let full_d2h = median(
+                (0..trials)
+                    .map(|_| {
+                        let t0 = Instant::now();
+                        for _ in 0..iters {
+                            for r in 0..n {
+                                gpu.to_host_range(&d_logits, r * vocab, vocab).unwrap();
+                            }
+                        }
+                        t0.elapsed().as_secs_f64() / iters as f64
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
             // ...and the host selection it forced, which is the larger half.
-            let cfg = GenerationConfig { max_tokens: 1, temperature: 0.8, top_k: k, seed: 1 };
-            let host_topk = median((0..trials).map(|_| {
-                let iters_h = iters.min(20);
-                let t0 = Instant::now();
-                for _ in 0..iters_h {
-                    for r in 0..n {
-                        let row = &host[r * vocab..(r + 1) * vocab];
-                        let mut rg = Rng::new(1);
-                        std::hint::black_box(sampling::sample(row, &cfg, &mut rg));
-                    }
-                }
-                t0.elapsed().as_secs_f64() / iters_h as f64
-            }).collect::<Vec<_>>());
+            let cfg = GenerationConfig {
+                max_tokens: 1,
+                temperature: 0.8,
+                top_k: k,
+                seed: 1,
+            };
+            let host_topk = median(
+                (0..trials)
+                    .map(|_| {
+                        let iters_h = iters.min(20);
+                        let t0 = Instant::now();
+                        for _ in 0..iters_h {
+                            for r in 0..n {
+                                let row = &host[r * vocab..(r + 1) * vocab];
+                                let mut rg = Rng::new(1);
+                                std::hint::black_box(sampling::sample(row, &cfg, &mut rg));
+                            }
+                        }
+                        t0.elapsed().as_secs_f64() / iters_h as f64
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
             let new = kernel + cand_d2h;
             let old = full_d2h + host_topk;
-            println!("{n:>6} {k:>6} {:>10.1}u {:>10.1}u {:>10.1}u {:>10.1}u {:>8.1}u {:>8.2}x",
-                     kernel * 1e6, cand_d2h * 1e6, full_d2h * 1e6, host_topk * 1e6,
-                     new * 1e6, old / new);
+            println!(
+                "{n:>6} {k:>6} {:>10.1}u {:>10.1}u {:>10.1}u {:>10.1}u {:>8.1}u {:>8.2}x",
+                kernel * 1e6,
+                cand_d2h * 1e6,
+                full_d2h * 1e6,
+                host_topk * 1e6,
+                new * 1e6,
+                old / new
+            );
         }
     }
 
@@ -1502,16 +1680,23 @@ fn gpu_topk_bench(
     println!();
     let zero = gpu.to_device_i32(&vec![0i32; max_rows])?;
     for &n in &counts {
-        let skip = median((0..trials).map(|_| {
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                gpu.topk_rows(&d_logits, &zero, &mut d_cv, &mut d_ci, n, vocab).unwrap();
-            }
-            gpu.sync().unwrap();
-            t0.elapsed().as_secs_f64() / iters as f64
-        }).collect::<Vec<_>>());
-        println!("rows {n:>2}: {:.2} us for an all-greedy launch (every block exits on row_k)",
-                 skip * 1e6);
+        let skip = median(
+            (0..trials)
+                .map(|_| {
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        gpu.topk_rows(&d_logits, &zero, &mut d_cv, &mut d_ci, n, vocab)
+                            .unwrap();
+                    }
+                    gpu.sync().unwrap();
+                    t0.elapsed().as_secs_f64() / iters as f64
+                })
+                .collect::<Vec<_>>(),
+        );
+        println!(
+            "rows {n:>2}: {:.2} us for an all-greedy launch (every block exits on row_k)",
+            skip * 1e6
+        );
     }
     println!();
     println!("cand D2H is two blocks of rows*{TOPK_MAX} regardless of k; full D2H is one");
@@ -1519,9 +1704,6 @@ fn gpu_topk_bench(
     println!("full-logit path then has to do, which the kernel removes as well.");
     Ok(())
 }
-
-
-
 
 /// Split a prefill into submission cost, device execution and the logits copy.
 ///
@@ -1532,14 +1714,14 @@ fn gpu_topk_bench(
 #[cfg(feature = "cuda")]
 fn gpu_prefill_bench(dir: PathBuf, quant: &str, lengths: &str, iters: usize) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
-    use llm_engine::paged::PAGE_TOKENS;
     use llm_engine::paged::SequencePages;
+    use llm_engine::paged::PAGE_TOKENS;
     use std::time::Instant;
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
     let lens: Vec<usize> = lengths
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
@@ -1554,8 +1736,10 @@ fn gpu_prefill_bench(dir: PathBuf, quant: &str, lengths: &str, iters: usize) -> 
     println!("gpu       {}", envelope());
     println!("workload  median of {iters} iterations, final chunks (logits produced)");
     println!();
-    let header = format!("{:>7} {:>11} {:>11} {:>12} {:>11} {:>9}",
-                         "tokens", "eager ms", "graph ms", "replay ms", "submit ms", "of total");
+    let header = format!(
+        "{:>7} {:>11} {:>11} {:>12} {:>11} {:>9}",
+        "tokens", "eager ms", "graph ms", "replay ms", "submit ms", "of total"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -1587,9 +1771,14 @@ fn gpu_prefill_bench(dir: PathBuf, quant: &str, lengths: &str, iters: usize) -> 
         let replay = model.time_prefill_replay(len, true, iters)?;
         let submit = eager - graph;
 
-        println!("{len:>7} {:>10.3} {:>10.3} {:>11.3} {:>10.3} {:>8.0}%",
-                 eager * 1000.0, graph * 1000.0, replay * 1000.0, submit * 1000.0,
-                 replay / graph * 100.0);
+        println!(
+            "{len:>7} {:>10.3} {:>10.3} {:>11.3} {:>10.3} {:>8.0}%",
+            eager * 1000.0,
+            graph * 1000.0,
+            replay * 1000.0,
+            submit * 1000.0,
+            replay / graph * 100.0
+        );
         seq.release(model.page_pool_mut())?;
     }
 
@@ -1621,8 +1810,8 @@ fn gpu_prefill_graph_check(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let lens: Vec<usize> = lengths
         .split(',')
@@ -1648,19 +1837,58 @@ fn gpu_prefill_graph_check(
         rt.set_prefill_chunk(chunk.max(1));
         Ok(rt)
     };
-    let run = |rt: &mut Runtime, id: u64, prompt: &[usize], config: GenerationConfig|
+    let run = |rt: &mut Runtime,
+               id: u64,
+               prompt: &[usize],
+               config: GenerationConfig|
      -> Result<Vec<usize>> {
-        rt.submit(Request { id, prompt: prompt.to_vec(), config })?;
+        rt.submit(Request {
+            id,
+            prompt: prompt.to_vec(),
+            config,
+        })?;
         rt.run_to_completion(steps * 8 + 64)?;
         Ok(rt.completed().pop().expect("one completion").tokens)
     };
 
     let configs: [(&str, GenerationConfig); 5] = [
         ("greedy", GenerationConfig::greedy(steps)),
-        ("top_k 5", GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 5, seed: 11 }),
-        ("top_k 40", GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 40, seed: 4242 }),
-        ("top_k 128", GenerationConfig { max_tokens: steps, temperature: 0.7, top_k: 128, seed: 7 }),
-        ("top_k 500", GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 500, seed: 99 }),
+        (
+            "top_k 5",
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.9,
+                top_k: 5,
+                seed: 11,
+            },
+        ),
+        (
+            "top_k 40",
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.8,
+                top_k: 40,
+                seed: 4242,
+            },
+        ),
+        (
+            "top_k 128",
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.7,
+                top_k: 128,
+                seed: 7,
+            },
+        ),
+        (
+            "top_k 500",
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.8,
+                top_k: 500,
+                seed: 99,
+            },
+        ),
     ];
 
     println!("prompts   {lens:?}");
@@ -1671,9 +1899,15 @@ fn gpu_prefill_graph_check(
 
     // --- eager vs graph, monolithic ----------------------------------------
     println!("monolithic prefill: eager vs graph");
-    let header = format!("{:>7}  {}", "prompt",
-                         configs.iter().map(|(l, _)| format!("{l:>11}"))
-                             .collect::<Vec<_>>().join(""));
+    let header = format!(
+        "{:>7}  {}",
+        "prompt",
+        configs
+            .iter()
+            .map(|(l, _)| format!("{l:>11}"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
     let mut eager = build(false, false, 1)?;
@@ -1693,14 +1927,18 @@ fn gpu_prefill_graph_check(
         println!();
     }
     let (captured, replays, secs) = graph.model().prefill_graph_stats();
-    println!("  {captured} graphs captured in {:.1} ms total, {replays} replays",
-             secs * 1000.0);
+    println!(
+        "  {captured} graphs captured in {:.1} ms total, {replays} replays",
+        secs * 1000.0
+    );
 
     // --- the four-way matrix ------------------------------------------------
     println!();
     println!("four paths, greedy and sampled, per chunk size");
-    let header = format!("{:>7} {:>6}  {:>12} {:>12} {:>12}",
-                         "prompt", "chunk", "mono-graph", "chunk-eager", "chunk-graph");
+    let header = format!(
+        "{:>7} {:>6}  {:>12} {:>12} {:>12}",
+        "prompt", "chunk", "mono-graph", "chunk-eager", "chunk-graph"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
     for &len in &lens {
@@ -1725,7 +1963,10 @@ fn gpu_prefill_graph_check(
                 }
                 row.push(if ok { "same" } else { "DIFFERS" });
             }
-            println!("{len:>7} {c:>6}  {:>12} {:>12} {:>12}", row[0], row[1], row[2]);
+            println!(
+                "{len:>7} {c:>6}  {:>12} {:>12} {:>12}",
+                row[0], row[1], row[2]
+            );
         }
     }
 
@@ -1742,8 +1983,12 @@ fn gpu_prefill_graph_check(
             .iter()
             .map(|t| (t + i as usize * 977) % cfg.vocab_size)
             .collect::<Vec<_>>();
-        let config = GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 40,
-                                        seed: 1000 + i };
+        let config = GenerationConfig {
+            max_tokens: steps,
+            temperature: 0.8,
+            top_k: 40,
+            seed: 1000 + i,
+        };
         let want = run(&mut eager, i, &prompt, config.clone())?;
         let got = run(&mut rt, i, &prompt, config)?;
         if got != want {
@@ -1752,17 +1997,30 @@ fn gpu_prefill_graph_check(
         }
         // Cancel a request mid-prefill between reuses, so the next one inherits
         // a pool that has been released and re-taken.
-        rt.submit(Request { id: 500 + i, prompt: prompt.clone(),
-                            config: GenerationConfig::greedy(steps) })?;
+        rt.submit(Request {
+            id: 500 + i,
+            prompt: prompt.clone(),
+            config: GenerationConfig::greedy(steps),
+        })?;
         rt.step()?;
         rt.cancel(500 + i)?;
         let _ = rt.completed();
     }
     let (captured, replays, _) = rt.model().prefill_graph_stats();
-    println!("  six different requests through the same graphs: {}",
-             if isolation_ok { "identical to eager" } else { "MISMATCH" });
+    println!(
+        "  six different requests through the same graphs: {}",
+        if isolation_ok {
+            "identical to eager"
+        } else {
+            "MISMATCH"
+        }
+    );
     println!("  {captured} graphs served {replays} replays");
-    println!("  pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+    println!(
+        "  pages free: {} of {}",
+        rt.free_pages(),
+        rt.model().page_pool().n_pages()
+    );
     if rt.free_pages() != rt.model().page_pool().n_pages() {
         anyhow::bail!("pages leaked");
     }
@@ -1782,9 +2040,11 @@ fn gpu_prefill_graph_check(
             failures += 1;
         }
         let (g, r, _) = rt.model().prefill_graph_stats();
-        println!("  chunk {c:>4}: {} ({g} graphs, {r} replays for {} chunks)",
-                 if ok { "same as eager" } else { "DIFFERS" },
-                 prompt.len().div_ceil(c));
+        println!(
+            "  chunk {c:>4}: {} ({g} graphs, {r} replays for {} chunks)",
+            if ok { "same as eager" } else { "DIFFERS" },
+            prompt.len().div_ceil(c)
+        );
     }
 
     println!();
@@ -1819,8 +2079,8 @@ fn gpu_prefill_check(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let lens: Vec<usize> = lengths
         .split(',')
@@ -1847,18 +2107,28 @@ fn gpu_prefill_check(
     };
 
     // One request at a time, so the only variable is where the prompt was cut.
-    let run_one = |rt: &mut Runtime, prompt: &[usize], config: GenerationConfig|
-     -> Result<Vec<usize>> {
-        rt.submit(Request { id: 0, prompt: prompt.to_vec(), config })?;
-        rt.run_to_completion(steps * 8 + 64)?;
-        Ok(rt.completed().pop().expect("one completion").tokens)
-    };
+    let run_one =
+        |rt: &mut Runtime, prompt: &[usize], config: GenerationConfig| -> Result<Vec<usize>> {
+            rt.submit(Request {
+                id: 0,
+                prompt: prompt.to_vec(),
+                config,
+            })?;
+            rt.run_to_completion(steps * 8 + 64)?;
+            Ok(rt.completed().pop().expect("one completion").tokens)
+        };
 
     let configs: [(&str, GenerationConfig); 2] = [
         ("greedy", GenerationConfig::greedy(steps)),
-        ("sampled", GenerationConfig {
-            max_tokens: steps, temperature: 0.8, top_k: 40, seed: 4242,
-        }),
+        (
+            "sampled",
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.8,
+                top_k: 40,
+                seed: 4242,
+            },
+        ),
     ];
 
     println!("page size    {PAGE_TOKENS} tokens");
@@ -1867,14 +2137,24 @@ fn gpu_prefill_check(
     println!();
 
     let mut failures = 0usize;
-    let header = format!("{:>7}  {:>9}  {}", "prompt", "mode",
-                         chunk_sizes.iter().map(|c| format!("{:>9}", format!("chunk {c}")))
-                             .collect::<Vec<_>>().join(""));
+    let header = format!(
+        "{:>7}  {:>9}  {}",
+        "prompt",
+        "mode",
+        chunk_sizes
+            .iter()
+            .map(|c| format!("{:>9}", format!("chunk {c}")))
+            .collect::<Vec<_>>()
+            .join("")
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
     let mut mono = build(false, 0)?;
-    let mut chunked: Vec<Runtime> = chunk_sizes.iter().map(|c| build(true, *c)).collect::<Result<_>>()?;
+    let mut chunked: Vec<Runtime> = chunk_sizes
+        .iter()
+        .map(|c| build(true, *c))
+        .collect::<Result<_>>()?;
 
     for &len in &lens {
         let prompt = probe_tokens(len, cfg.vocab_size);
@@ -1906,7 +2186,10 @@ fn gpu_prefill_check(
         if !ok {
             failures += 1;
         }
-        println!("  chunk {c:>4} vs monolithic: {}", if ok { "same" } else { "DIFFERS" });
+        println!(
+            "  chunk {c:>4} vs monolithic: {}",
+            if ok { "same" } else { "DIFFERS" }
+        );
     }
 
     // Concurrency: a request's output must not depend on other prompts being
@@ -1915,11 +2198,20 @@ fn gpu_prefill_check(
     println!("independence from concurrent prefill");
     let mut rt = build(true, 128)?;
     let solo_prompt = probe_tokens(300, cfg.vocab_size);
-    let solo_cfg = GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 20, seed: 77 };
+    let solo_cfg = GenerationConfig {
+        max_tokens: steps,
+        temperature: 0.9,
+        top_k: 20,
+        seed: 77,
+    };
     let solo = run_one(&mut rt, &solo_prompt, solo_cfg.clone())?;
 
     let mut rt = build(true, 128)?;
-    rt.submit(Request { id: 0, prompt: solo_prompt.clone(), config: solo_cfg })?;
+    rt.submit(Request {
+        id: 0,
+        prompt: solo_prompt.clone(),
+        config: solo_cfg,
+    })?;
     for i in 1..6u64 {
         rt.submit(Request {
             id: i,
@@ -1930,14 +2222,25 @@ fn gpu_prefill_check(
     rt.run_to_completion(steps * 16 + 256)?;
     let mut done = rt.completed();
     done.sort_by_key(|c| c.id);
-    let together = done.iter().find(|c| c.id == 0).expect("request 0").tokens.clone();
+    let together = done
+        .iter()
+        .find(|c| c.id == 0)
+        .expect("request 0")
+        .tokens
+        .clone();
     let ok = together == solo;
     if !ok {
         failures += 1;
     }
-    println!("  alone vs prefilled alongside five other prompts: {}",
-             if ok { "identical" } else { "MISMATCH" });
-    println!("  pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+    println!(
+        "  alone vs prefilled alongside five other prompts: {}",
+        if ok { "identical" } else { "MISMATCH" }
+    );
+    println!(
+        "  pages free: {} of {}",
+        rt.free_pages(),
+        rt.model().page_pool().n_pages()
+    );
     if rt.free_pages() != rt.model().page_pool().n_pages() {
         anyhow::bail!("pages leaked");
     }
@@ -1946,13 +2249,19 @@ fn gpu_prefill_check(
     println!();
     println!("cancellation during prefill");
     let long = probe_tokens(600, cfg.vocab_size);
-    for (label, chunks_before) in [("before the first chunk", 0usize),
-                                   ("after one chunk", 1),
-                                   ("midway", 3),
-                                   ("one chunk before the end", 4)] {
+    for (label, chunks_before) in [
+        ("before the first chunk", 0usize),
+        ("after one chunk", 1),
+        ("midway", 3),
+        ("one chunk before the end", 4),
+    ] {
         let mut rt = build(true, 128)?;
         let total = rt.model().page_pool().n_pages();
-        rt.submit(Request { id: 900, prompt: long.clone(), config: GenerationConfig::greedy(steps) })?;
+        rt.submit(Request {
+            id: 900,
+            prompt: long.clone(),
+            config: GenerationConfig::greedy(steps),
+        })?;
         for _ in 0..chunks_before {
             rt.step()?;
         }
@@ -1961,15 +2270,21 @@ fn gpu_prefill_check(
         let _ = rt.completed();
         // The pages must come back, and the runtime must still work afterwards.
         let freed = rt.free_pages() == total;
-        rt.submit(Request { id: 901, prompt: long.clone(), config: GenerationConfig::greedy(steps) })?;
+        rt.submit(Request {
+            id: 901,
+            prompt: long.clone(),
+            config: GenerationConfig::greedy(steps),
+        })?;
         rt.run_to_completion(steps * 16 + 256)?;
         let reused = rt.completed().pop().map(|c| c.tokens.len()) == Some(steps);
         let clean = rt.free_pages() == total;
         if !(freed && reused && clean) {
             failures += 1;
         }
-        println!("  {label:<26} prefilling {was_prefilling}, pages freed {freed}, \
-                  reuse {reused}, clean {clean}");
+        println!(
+            "  {label:<26} prefilling {was_prefilling}, pages freed {freed}, \
+                  reuse {reused}, clean {clean}"
+        );
     }
 
     println!();
@@ -1992,8 +2307,8 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     // Deliberately heterogeneous in every dimension at once: prompt length,
     // decoding policy, temperature, top-k and seed. A bug that only shows up
@@ -2004,13 +2319,69 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
     // That mixture inside a single batch is the case a per-batch dispatch would
     // get wrong.
     let specs: Vec<(usize, GenerationConfig)> = vec![
-        (15, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 1 }),
-        (16, GenerationConfig { max_tokens: steps, temperature: 0.7, top_k: 40, seed: 11 }),
-        (17, GenerationConfig { max_tokens: steps, temperature: 1.0, top_k: 5, seed: 22 }),
-        (63, GenerationConfig { max_tokens: steps, temperature: 0.0, top_k: 40, seed: 2 }),
-        (129, GenerationConfig { max_tokens: steps, temperature: 0.3, top_k: 20, seed: 33 }),
-        (511, GenerationConfig { max_tokens: steps, temperature: 0.9, top_k: 10, seed: 44 }),
-        (33, GenerationConfig { max_tokens: steps, temperature: 0.8, top_k: 500, seed: 55 }),
+        (
+            15,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.0,
+                top_k: 40,
+                seed: 1,
+            },
+        ),
+        (
+            16,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.7,
+                top_k: 40,
+                seed: 11,
+            },
+        ),
+        (
+            17,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 1.0,
+                top_k: 5,
+                seed: 22,
+            },
+        ),
+        (
+            63,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.0,
+                top_k: 40,
+                seed: 2,
+            },
+        ),
+        (
+            129,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.3,
+                top_k: 20,
+                seed: 33,
+            },
+        ),
+        (
+            511,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.9,
+                top_k: 10,
+                seed: 44,
+            },
+        ),
+        (
+            33,
+            GenerationConfig {
+                max_tokens: steps,
+                temperature: 0.8,
+                top_k: 500,
+                seed: 55,
+            },
+        ),
     ];
     let prompts: Vec<Vec<usize>> = specs
         .iter()
@@ -2048,7 +2419,10 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
 
     println!("steps        {steps} tokens per request");
     println!("pool         {pages} pages");
-    println!("capacity     device top-k holds {} candidates per row", TOPK_MAX);
+    println!(
+        "capacity     device top-k holds {} candidates per row",
+        TOPK_MAX
+    );
     println!();
 
     let mut failures = 0usize;
@@ -2066,14 +2440,20 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
         if !ok {
             failures += 1;
         }
-        println!("  request {i}: {}",
-                 if ok { "identical tokens" } else { "MISMATCH" });
+        println!(
+            "  request {i}: {}",
+            if ok { "identical tokens" } else { "MISMATCH" }
+        );
     }
 
     // Everything below is checked on both paths against the same reference, so
     // the fallback is held to the isolation guarantee too.
     for device_topk in [true, false] {
-        let path = if device_topk { "device top-k" } else { "full logits" };
+        let path = if device_topk {
+            "device top-k"
+        } else {
+            "full logits"
+        };
         println!();
         println!("=== {path} ===");
         let mut rt = load(max_batch, pages, device_topk)?;
@@ -2090,8 +2470,10 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
         let mut together = rt.completed();
         together.sort_by_key(|c| c.id);
 
-        println!("{:>4}  {:>7}  {:>12}  {:>6}  {:>5}  {:>14}",
-                 "req", "prompt", "mode", "top-k", "seed", "vs alone");
+        println!(
+            "{:>4}  {:>7}  {:>12}  {:>6}  {:>5}  {:>14}",
+            "req", "prompt", "mode", "top-k", "seed", "vs alone"
+        );
         println!("{}", "-".repeat(60));
         for c in &together {
             let (len, gc) = &specs[c.id as usize];
@@ -2105,16 +2487,20 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
             } else {
                 format!("temp {:.1}", gc.temperature)
             };
-            println!("{:>4}  {len:>7}  {mode:>12}  {:>6}  {:>5}  {:>14}",
-                     c.id, gc.top_k, gc.seed, if ok { "identical" } else { "MISMATCH" });
+            println!(
+                "{:>4}  {len:>7}  {mode:>12}  {:>6}  {:>5}  {:>14}",
+                c.id,
+                gc.top_k,
+                gc.seed,
+                if ok { "identical" } else { "MISMATCH" }
+            );
         }
 
         // --- staggered admission, forcing slot reordering -------------------
         println!();
         println!("staggered admission (forces swap_remove reordering)");
         let mut staggered: Vec<Completion> = Vec::new();
-        let mut pending: Vec<(usize, usize)> =
-            (0..prompts.len()).map(|i| (i * 3, i)).collect();
+        let mut pending: Vec<(usize, usize)> = (0..prompts.len()).map(|i| (i * 3, i)).collect();
         let mut t = 0usize;
         while t < steps * 12 {
             while let Some(pos) = pending.iter().position(|(at, _)| *at == t) {
@@ -2139,7 +2525,11 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
             if !ok {
                 failures += 1;
             }
-            println!("{:>4}  {:>14}", c.id, if ok { "identical" } else { "MISMATCH" });
+            println!(
+                "{:>4}  {:>14}",
+                c.id,
+                if ok { "identical" } else { "MISMATCH" }
+            );
         }
 
         // --- cancellation must not disturb a later identical request --------
@@ -2166,11 +2556,21 @@ fn gpu_sampling(dir: PathBuf, quant: &str, steps: usize, max_batch: usize) -> Re
         if !ok {
             failures += 1;
         }
-        println!("  request after a cancelled twin: {}",
-                 if ok { "identical to running alone" } else { "MISMATCH" });
+        println!(
+            "  request after a cancelled twin: {}",
+            if ok {
+                "identical to running alone"
+            } else {
+                "MISMATCH"
+            }
+        );
 
         println!();
-        println!("pages free: {} of {}", rt.free_pages(), rt.model().page_pool().n_pages());
+        println!(
+            "pages free: {} of {}",
+            rt.free_pages(),
+            rt.model().page_pool().n_pages()
+        );
         if rt.free_pages() != rt.model().page_pool().n_pages() {
             anyhow::bail!("pages leaked on the {path} path");
         }
@@ -2193,8 +2593,8 @@ fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Re
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let shape_list: Vec<usize> = shapes
         .split(',')
@@ -2223,9 +2623,14 @@ fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Re
     model.enable_paging(pages, max_batch)?;
 
     println!("shapes     {shape_list:?}");
-    println!("prompts    {:?}", prompts.iter().map(|p| p.len()).collect::<Vec<_>>());
-    println!("pool       {pages} pages, {:.2} MB",
-             model.page_pool().total_bytes() as f64 / 1e6);
+    println!(
+        "prompts    {:?}",
+        prompts.iter().map(|p| p.len()).collect::<Vec<_>>()
+    );
+    println!(
+        "pool       {pages} pages, {:.2} MB",
+        model.page_pool().total_bytes() as f64 / 1e6
+    );
     println!();
 
     model.set_batch_graph(false);
@@ -2236,7 +2641,10 @@ fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Re
     let graphed = run_shape_sequence(&mut model, &prompts, &shape_list)?;
     let free_after_graph = model.page_pool().free_pages();
 
-    println!("{:>5}  {:>6}  {:>14}  {:>10}", "step", "batch", "max abs diff", "verdict");
+    println!(
+        "{:>5}  {:>6}  {:>14}  {:>10}",
+        "step", "batch", "max abs diff", "verdict"
+    );
     println!("{}", "-".repeat(42));
     let mut failures = 0usize;
     for (i, (a, b)) in eager.iter().zip(&graphed).enumerate() {
@@ -2249,13 +2657,20 @@ fn gpu_graph_check(dir: PathBuf, quant: &str, shapes: &str, lengths: &str) -> Re
         if !ok {
             failures += 1;
         }
-        println!("{:>5}  {:>6}  {diff:>14.3e}  {:>10}",
-                 i, shape_list[i], if ok { "identical" } else { "MISMATCH" });
+        println!(
+            "{:>5}  {:>6}  {diff:>14.3e}  {:>10}",
+            i,
+            shape_list[i],
+            if ok { "identical" } else { "MISMATCH" }
+        );
     }
 
     println!();
     println!("graphs captured        {}", model.graphs_captured());
-    println!("capture time total     {:.1} ms", model.graph_capture_secs() * 1e3);
+    println!(
+        "capture time total     {:.1} ms",
+        model.graph_capture_secs() * 1e3
+    );
     println!("kernels per step       {}", model.batch_step_kernels());
     println!("pages free, eager pass {free_after_eager}");
     println!("pages free, graph pass {free_after_graph}");
@@ -2299,8 +2714,10 @@ fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
     println!("workload int8 weights, {iters} iterations, median of 3");
     println!();
 
-    let header = format!("{:<20} {:>6} {:>10} {:>10} {:>9} {:>10}",
-                         "shape", "batch", "gemm us", "gemv us", "speedup", "max reldiff");
+    let header = format!(
+        "{:<20} {:>6} {:>10} {:>10} {:>9} {:>10}",
+        "shape", "batch", "gemm us", "gemv us", "speedup", "max reldiff"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -2333,7 +2750,15 @@ fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
             let mut d_gemm = gpu.alloc(n * rows)?;
             let mut d_gemv = gpu.alloc(n * rows)?;
 
-            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm, n, rows, cols, false)?;
+            gpu.gemm(
+                &Proj2::Int8(&d_w, &d_s),
+                &d_x,
+                &mut d_gemm,
+                n,
+                rows,
+                cols,
+                false,
+            )?;
             gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv, rows, cols, n, false)?;
             gpu.sync()?;
             let a = gpu.to_host(&d_gemm)?;
@@ -2354,22 +2779,34 @@ fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
                     // Warm, then time.
                     for _ in 0..5 {
                         if gemm_path {
-                            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm,
-                                     n, rows, cols, false)?;
+                            gpu.gemm(
+                                &Proj2::Int8(&d_w, &d_s),
+                                &d_x,
+                                &mut d_gemm,
+                                n,
+                                rows,
+                                cols,
+                                false,
+                            )?;
                         } else {
-                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv,
-                                              rows, cols, n, false)?;
+                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv, rows, cols, n, false)?;
                         }
                     }
                     gpu.sync()?;
                     let t0 = Instant::now();
                     for _ in 0..iters {
                         if gemm_path {
-                            gpu.gemm(&Proj2::Int8(&d_w, &d_s), &d_x, &mut d_gemm,
-                                     n, rows, cols, false)?;
+                            gpu.gemm(
+                                &Proj2::Int8(&d_w, &d_s),
+                                &d_x,
+                                &mut d_gemm,
+                                n,
+                                rows,
+                                cols,
+                                false,
+                            )?;
                         } else {
-                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv,
-                                              rows, cols, n, false)?;
+                            gpu.gemv_batch_i8(&d_w, &d_s, &d_x, &mut d_gemv, rows, cols, n, false)?;
                         }
                     }
                     gpu.sync()?;
@@ -2379,9 +2816,13 @@ fn gpu_gemv_bench(batches: &str, iters: usize) -> Result<()> {
                 timings[slot] = runs[1];
             }
 
-            println!("{name:<20} {n:>6} {:>10.1} {:>10.1} {:>8.2}x {:>10.3e}",
-                     timings[0] * 1e6, timings[1] * 1e6,
-                     timings[0] / timings[1], reldiff);
+            println!(
+                "{name:<20} {n:>6} {:>10.1} {:>10.1} {:>8.2}x {:>10.3e}",
+                timings[0] * 1e6,
+                timings[1] * 1e6,
+                timings[0] / timings[1],
+                reldiff
+            );
         }
         println!();
     }
@@ -2405,8 +2846,8 @@ fn gpu_profile_batch(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let sizes: Vec<usize> = batches
         .split(',')
@@ -2448,16 +2889,31 @@ fn gpu_profile_batch(
         let total: f64 = rep.stages.iter().map(|s| s.adjusted).sum();
         let raw_total: f64 = rep.stages.iter().map(|s| s.raw).sum();
 
-        println!("batch {n}   raw step {:.3} ms, adjusted {:.3} ms, sync {:.1} us/call",
-                 raw_total * 1e3, total * 1e3, rep.sync_cost * 1e6);
-        println!("  {:<14} {:>6} {:>10} {:>10} {:>7}",
-                 "stage", "calls", "raw ms", "adj ms", "% adj");
+        println!(
+            "batch {n}   raw step {:.3} ms, adjusted {:.3} ms, sync {:.1} us/call",
+            raw_total * 1e3,
+            total * 1e3,
+            rep.sync_cost * 1e6
+        );
+        println!(
+            "  {:<14} {:>6} {:>10} {:>10} {:>7}",
+            "stage", "calls", "raw ms", "adj ms", "% adj"
+        );
         let mut ranked: Vec<_> = rep.stages.iter().collect();
         ranked.sort_by(|a, b| b.adjusted.partial_cmp(&a.adjusted).unwrap());
         for st in ranked {
-            println!("  {:<14} {:>6} {:>10.3} {:>10.3} {:>6.1}%",
-                     st.name, st.calls, st.raw * 1e3, st.adjusted * 1e3,
-                     if total > 0.0 { st.adjusted / total * 100.0 } else { 0.0 });
+            println!(
+                "  {:<14} {:>6} {:>10.3} {:>10.3} {:>6.1}%",
+                st.name,
+                st.calls,
+                st.raw * 1e3,
+                st.adjusted * 1e3,
+                if total > 0.0 {
+                    st.adjusted / total * 100.0
+                } else {
+                    0.0
+                }
+            );
         }
         println!();
 
@@ -2497,8 +2953,8 @@ fn gpu_serve_bench(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let sizes: Vec<usize> = batches
         .split(',')
@@ -2546,7 +3002,10 @@ fn gpu_serve_bench(
     println!("single-request baselines");
     legacy.set_paged(false);
     legacy.enable_graph(true);
-    let single_tps = baseline(&mut legacy, "contiguous cache + CUDA graph (today's engine)")?;
+    let single_tps = baseline(
+        &mut legacy,
+        "contiguous cache + CUDA graph (today's engine)",
+    )?;
     legacy.enable_graph(false);
     baseline(&mut legacy, "contiguous cache, eager")?;
     legacy.enable_paging(cfg.block_size.div_ceil(PAGE_TOKENS), 1)?;
@@ -2571,16 +3030,29 @@ fn gpu_serve_bench(
     let weight_bytes = model.weight_bytes();
 
     println!("weights      {:.1} MB", weight_bytes as f64 / 1e6);
-    println!("page pool    {total_pages} pages, {:.2} MB, {} resident tokens",
-             pool_bytes as f64 / 1e6, total_pages * PAGE_TOKENS);
-    println!("bytes/page   {} ({} per token across all layers, K and V)",
-             model.page_pool().page_bytes() * 2,
-             model.page_pool().page_bytes() * 2 / PAGE_TOKENS);
+    println!(
+        "page pool    {total_pages} pages, {:.2} MB, {} resident tokens",
+        pool_bytes as f64 / 1e6,
+        total_pages * PAGE_TOKENS
+    );
+    println!(
+        "bytes/page   {} ({} per token across all layers, K and V)",
+        model.page_pool().page_bytes() * 2,
+        model.page_pool().page_bytes() * 2 / PAGE_TOKENS
+    );
     println!();
 
-    let header = format!("{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>10}",
-                         "batch", "logits agg", "argmax agg", "argmax/req",
-                         "step ms", "speedup", "spread", "D2H/step");
+    let header = format!(
+        "{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>8}  {:>7}  {:>10}",
+        "batch",
+        "logits agg",
+        "argmax agg",
+        "argmax/req",
+        "step ms",
+        "speedup",
+        "spread",
+        "D2H/step"
+    );
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
@@ -2639,8 +3111,10 @@ fn gpu_serve_bench(
             v[v.len() / 2]
         };
         let spread = |v: &Vec<f64>| {
-            let (lo, hi) = (v.iter().cloned().fold(f64::INFINITY, f64::min),
-                            v.iter().cloned().fold(0.0f64, f64::max));
+            let (lo, hi) = (
+                v.iter().cloned().fold(f64::INFINITY, f64::min),
+                v.iter().cloned().fold(0.0f64, f64::max),
+            );
             (hi - lo) / v[v.len() / 2] * 100.0
         };
         let sp = spread(&secs[0]).max(spread(&secs[1]));
@@ -2678,42 +3152,64 @@ fn gpu_serve_bench(
         println!();
         println!("host argmax          {:.3} ms per request-step", per * 1e3);
         for &n in &sizes {
-            println!("  batch {n:<2}           {:.3} ms per step", per * n as f64 * 1e3);
+            println!(
+                "  batch {n:<2}           {:.3} ms per step",
+                per * n as f64 * 1e3
+            );
         }
     }
 
     // Pure replay: kernels only, no upload, no copy-back, no host work. The
     // gap to the measured step is everything graph replay cannot remove.
     println!();
-    println!("{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>9}",
-             "batch", "replay ms", "ids D2H", "logits D2H", "host/sched", "step ms");
+    println!(
+        "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>9}",
+        "batch", "replay ms", "ids D2H", "logits D2H", "host/sched", "step ms"
+    );
     for (i, &n) in sizes.iter().enumerate() {
         let replay = rt.model_mut().time_graph_replay(n, 200).unwrap_or(0.0);
         let d_ids = rt.model_mut().time_d2h(n, true, 200).unwrap_or(0.0);
         let d_log = rt.model_mut().time_d2h(n, false, 50).unwrap_or(0.0);
         let step = step_ms[i] / 1e3;
-        println!("{n:>6}  {:>10.3}  {:>10.3}  {:>10.3}  {:>10.3}  {:>9.3}",
-                 replay * 1e3, d_ids * 1e3, d_log * 1e3,
-                 (step - replay - d_ids).max(0.0) * 1e3, step * 1e3);
+        println!(
+            "{n:>6}  {:>10.3}  {:>10.3}  {:>10.3}  {:>10.3}  {:>9.3}",
+            replay * 1e3,
+            d_ids * 1e3,
+            d_log * 1e3,
+            (step - replay - d_ids).max(0.0) * 1e3,
+            step * 1e3
+        );
     }
     println!("(logits D2H is what the old path paid; it is not in the step total)");
 
     println!();
     println!("graphs captured      {}", rt.model().graphs_captured());
-    println!("capture time total   {:.1} ms ({:.1} ms per shape)",
-             rt.model().graph_capture_secs() * 1e3,
-             rt.model().graph_capture_secs() * 1e3
-                 / rt.model().graphs_captured().max(1) as f64);
+    println!(
+        "capture time total   {:.1} ms ({:.1} ms per shape)",
+        rt.model().graph_capture_secs() * 1e3,
+        rt.model().graph_capture_secs() * 1e3 / rt.model().graphs_captured().max(1) as f64
+    );
     println!("kernels per step     {}", rt.model().batch_step_kernels());
     println!();
-    println!("{:>6}  {:>14}  {:>14}  {:>10}", "batch", "logits D2H", "ids D2H", "reduction");
+    println!(
+        "{:>6}  {:>14}  {:>14}  {:>10}",
+        "batch", "logits D2H", "ids D2H", "reduction"
+    );
     for &n in &sizes {
         let a = rt.model().d2h_bytes(n, false);
         let b = rt.model().d2h_bytes(n, true);
-        println!("{n:>6}  {:>12} B  {:>12} B  {:>9.0}x", a, b, a as f64 / b as f64);
+        println!(
+            "{n:>6}  {:>12} B  {:>12} B  {:>9.0}x",
+            a,
+            b,
+            a as f64 / b as f64
+        );
     }
     match (mem_before, mem_after) {
-        (Some(a), Some(b)) => println!("VRAM used            {a} MB -> {b} MB (graph storage {} MB)", b - a),
+        (Some(a), Some(b)) => println!(
+            "VRAM used            {a} MB -> {b} MB (graph storage {} MB)",
+            b - a
+        ),
         _ => println!("VRAM used            unavailable"),
     }
 
@@ -2756,8 +3252,8 @@ fn gpu_batch(
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let lens: Vec<usize> = lengths
         .split(',')
@@ -2846,10 +3342,15 @@ fn gpu_batch(
     let mut rt = Runtime::new(model)?;
 
     println!("page size    {PAGE_TOKENS} tokens");
-    println!("pool         {total_pages} pages, {pool_mb:.2} MB, {} tokens",
-             total_pages * PAGE_TOKENS);
+    println!(
+        "pool         {total_pages} pages, {pool_mb:.2} MB, {} tokens",
+        total_pages * PAGE_TOKENS
+    );
     println!("max batch    {max_batch}");
-    println!("requests     {:?} prompt tokens, {steps} generated each", lens);
+    println!(
+        "requests     {:?} prompt tokens, {steps} generated each",
+        lens
+    );
     println!();
 
     for (i, prompt) in prompts.iter().enumerate() {
@@ -2864,7 +3365,10 @@ fn gpu_batch(
     got.sort_by_key(|c| c.id);
 
     let mut failures = 0usize;
-    println!("{:>4}  {:>7}  {:>9}  {:>12}", "req", "prompt", "generated", "vs reference");
+    println!(
+        "{:>4}  {:>7}  {:>9}  {:>12}",
+        "req", "prompt", "generated", "vs reference"
+    );
     println!("{}", "-".repeat(40));
     for c in &got {
         let want = &reference[c.id as usize];
@@ -2872,33 +3376,48 @@ fn gpu_batch(
         if !ok {
             failures += 1;
         }
-        println!("{:>4}  {:>7}  {:>9}  {:>12}",
-                 c.id, c.prompt_len, c.tokens.len(),
-                 if ok { "identical" } else { "MISMATCH" });
+        println!(
+            "{:>4}  {:>7}  {:>9}  {:>12}",
+            c.id,
+            c.prompt_len,
+            c.tokens.len(),
+            if ok { "identical" } else { "MISMATCH" }
+        );
         if !ok {
             let first = want
                 .iter()
                 .zip(&c.tokens)
                 .position(|(a, b)| a != b)
                 .unwrap_or(0);
-            println!("        diverged at step {first}: want {:?} got {:?}",
-                     &want[first..(first + 3).min(want.len())],
-                     &c.tokens[first..(first + 3).min(c.tokens.len())]);
+            println!(
+                "        diverged at step {first}: want {:?} got {:?}",
+                &want[first..(first + 3).min(want.len())],
+                &c.tokens[first..(first + 3).min(c.tokens.len())]
+            );
         }
     }
     println!();
-    println!("simultaneous admission: {} steps, all pages returned: {}",
-             all_at_once.len(),
-             rt.free_pages() == total_pages);
+    println!(
+        "simultaneous admission: {} steps, all pages returned: {}",
+        all_at_once.len(),
+        rt.free_pages() == total_pages
+    );
 
     println!();
     println!("against the single-request `forward` path (GEMV lm_head, so exact");
     println!("agreement is not expected -- see the note in the source):");
-    println!("{:>4}  {:>12}  {:>18}", "req", "vs forward", "closest top-2 gap");
+    println!(
+        "{:>4}  {:>12}  {:>18}",
+        "req", "vs forward", "closest top-2 gap"
+    );
     for (i, f) in fwd.iter().enumerate() {
         let same = f == &reference[i];
-        println!("{:>4}  {:>12}  {:>18.3e}",
-                 i, if same { "identical" } else { "diverges" }, fwd_gap[i]);
+        println!(
+            "{:>4}  {:>12}  {:>18.3e}",
+            i,
+            if same { "identical" } else { "diverges" },
+            fwd_gap[i]
+        );
     }
 
     // --- staggered: requests enter and leave at different times ------------
@@ -2948,8 +3467,12 @@ fn gpu_batch(
         if !ok {
             failures += 1;
         }
-        println!("{:>4}  {:>9}  {:>12}", c.id, c.tokens.len(),
-                 if ok { "identical" } else { "MISMATCH" });
+        println!(
+            "{:>4}  {:>9}  {:>12}",
+            c.id,
+            c.tokens.len(),
+            if ok { "identical" } else { "MISMATCH" }
+        );
     }
 
     let (pages, wasted) = rt.residency();
@@ -2957,15 +3480,25 @@ fn gpu_batch(
     println!("peak active batch     {peak_active}");
     println!("steps taken           {t}");
     println!("pages held after      {pages} (wasted slots {wasted})");
-    println!("pages free after      {} of {}", rt.free_pages(), total_pages);
+    println!(
+        "pages free after      {} of {}",
+        rt.free_pages(),
+        total_pages
+    );
 
     if staggered.len() != prompts.len() {
-        anyhow::bail!("staggered run produced {} completions, expected {}",
-                      staggered.len(), prompts.len());
+        anyhow::bail!(
+            "staggered run produced {} completions, expected {}",
+            staggered.len(),
+            prompts.len()
+        );
     }
     if rt.free_pages() != total_pages {
-        anyhow::bail!("pages leaked: {} of {} free after every request finished",
-                      rt.free_pages(), total_pages);
+        anyhow::bail!(
+            "pages leaked: {} of {} free after every request finished",
+            rt.free_pages(),
+            total_pages
+        );
     }
     if failures > 0 {
         anyhow::bail!("{failures} request(s) differed from independent execution");
@@ -3009,7 +3542,10 @@ fn gpu_batch(
         let mut top1_agree = 0usize;
         let mut worst_margin = f32::INFINITY;
         for i in 0..n {
-            let (ra, rb) = (&a[i * vocab..(i + 1) * vocab], &b[i * vocab..(i + 1) * vocab]);
+            let (ra, rb) = (
+                &a[i * vocab..(i + 1) * vocab],
+                &b[i * vocab..(i + 1) * vocab],
+            );
             for (x, y) in ra.iter().zip(rb) {
                 let d = ((*x as f64) - (*y as f64)).abs();
                 max_abs = max_abs.max(d);
@@ -3042,8 +3578,15 @@ fn gpu_batch(
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bool,
-            prefill_ctx: usize, paged: bool) -> Result<()> {
+fn gpu_eval(
+    dir: PathBuf,
+    data: PathBuf,
+    n_tokens: usize,
+    quant: &str,
+    graph: bool,
+    prefill_ctx: usize,
+    paged: bool,
+) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let cfg = Config::from_file(dir.join("config.json"))?;
@@ -3051,8 +3594,7 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
 
     // val.bin is a flat little-endian uint16 stream, the same format train.py
     // memory-maps. These tokens were held out of training.
-    let raw = std::fs::read(&data)
-        .with_context(|| format!("reading {}", data.display()))?;
+    let raw = std::fs::read(&data).with_context(|| format!("reading {}", data.display()))?;
     let all: Vec<usize> = raw
         .chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
@@ -3064,20 +3606,27 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
         n_tokens.min(cfg.block_size).min(all.len() - 1)
     };
     let ids = &all[..limit + 1];
-    println!("data        {} ({} tokens evaluated)", data.display(), limit);
+    println!(
+        "data        {} ({} tokens evaluated)",
+        data.display(),
+        limit
+    );
     println!();
 
     let mut results = Vec::new();
 
     for name in quant.split(',') {
         let name = name.trim();
-        let precision = Precision::parse(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown precision {name:?}"))?;
+        let precision =
+            Precision::parse(name).ok_or_else(|| anyhow::anyhow!("unknown precision {name:?}"))?;
 
         let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
         if paged {
             model.enable_paging(cfg.block_size.div_ceil(llm_engine::paged::PAGE_TOKENS), 1)?;
-            println!("cache       paged; attention {}", model.prefill_attention().name());
+            println!(
+                "cache       paged; attention {}",
+                model.prefill_attention().name()
+            );
         } else {
             println!("cache       contiguous (canonical attention)");
         }
@@ -3124,7 +3673,12 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
 
         let secs = started.elapsed().as_secs_f64();
         let ce = total_nll / scored as f64;
-        results.push((name.to_string(), ce, model.weight_bytes(), scored as f64 / secs));
+        results.push((
+            name.to_string(),
+            ce,
+            model.weight_bytes(),
+            scored as f64 / secs,
+        ));
 
         println!("{name:6}  cross-entropy {ce:.6}   perplexity {:.4}   weights {:.0} MB   {scored} positions in {secs:.1}s",
                  ce.exp(), model.weight_bytes() as f64 / 1e6);
@@ -3135,11 +3689,13 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
         println!();
         println!("relative to {base_name}:");
         for (name, ce, bytes, tps) in results.iter().skip(1) {
-            println!("  {name:6}  cross-entropy {:+.6} ({:+.4}%)   weights {:.2}x   speed {:.2}x",
-                     ce - base_ce,
-                     (ce - base_ce) / base_ce * 100.0,
-                     *bytes as f64 / base_bytes as f64,
-                     tps / base_tps);
+            println!(
+                "  {name:6}  cross-entropy {:+.6} ({:+.4}%)   weights {:.2}x   speed {:.2}x",
+                ce - base_ce,
+                (ce - base_ce) / base_ce * 100.0,
+                *bytes as f64 / base_bytes as f64,
+                tps / base_tps
+            );
         }
         println!();
         println!("Cross-entropy is the number that decides whether the speed is worth having.");
@@ -3148,15 +3704,14 @@ fn gpu_eval(dir: PathBuf, data: PathBuf, n_tokens: usize, quant: &str, graph: bo
     Ok(())
 }
 
-
 #[cfg(feature = "cuda")]
 fn gpu_profile(dir: PathBuf, quant: &str, iters: usize, warm: usize) -> Result<()> {
     use llm_engine::gpu_model::{GpuModel, Precision};
 
     let cfg = Config::from_file(dir.join("config.json"))?;
     let weights = Weights::open(dir.join("model.safetensors"))?;
-    let precision = Precision::parse(quant)
-        .ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
+    let precision =
+        Precision::parse(quant).ok_or_else(|| anyhow::anyhow!("unknown precision {quant:?}"))?;
 
     let mut model = GpuModel::load_with(cfg.clone(), &weights, cfg.block_size, precision)?;
 
@@ -3171,22 +3726,37 @@ fn gpu_profile(dir: PathBuf, quant: &str, iters: usize, warm: usize) -> Result<(
     let adj_total: f64 = report.stages.iter().map(|s| s.adjusted).sum();
 
     println!("precision {quant}, {iters} steps at position ~{warm}");
-    println!("launch+sync overhead ~{:.1} us/block (from the cheapest stage); subtracted",
-             report.sync_cost * 1e6);
+    println!(
+        "launch+sync overhead ~{:.1} us/block (from the cheapest stage); subtracted",
+        report.sync_cost * 1e6
+    );
     println!();
-    println!("{:<14} {:>6} {:>10} {:>10} {:>8}",
-             "stage", "calls", "raw ms", "adjusted", "share");
+    println!(
+        "{:<14} {:>6} {:>10} {:>10} {:>8}",
+        "stage", "calls", "raw ms", "adjusted", "share"
+    );
     println!("{}", "-".repeat(52));
 
     let mut sorted: Vec<&llm_engine::gpu_model::Stage> = report.stages.iter().collect();
     sorted.sort_by(|a, b| b.adjusted.partial_cmp(&a.adjusted).unwrap());
     for st in &sorted {
-        println!("{:<14} {:>6} {:>10.3} {:>10.3} {:>7.1}%",
-                 st.name, st.calls, st.raw * 1000.0, st.adjusted * 1000.0,
-                 st.adjusted / adj_total * 100.0);
+        println!(
+            "{:<14} {:>6} {:>10.3} {:>10.3} {:>7.1}%",
+            st.name,
+            st.calls,
+            st.raw * 1000.0,
+            st.adjusted * 1000.0,
+            st.adjusted / adj_total * 100.0
+        );
     }
     println!("{}", "-".repeat(52));
-    println!("{:<14} {:>6} {:>10.3} {:>10.3}", "total", "", raw_total * 1000.0, adj_total * 1000.0);
+    println!(
+        "{:<14} {:>6} {:>10.3} {:>10.3}",
+        "total",
+        "",
+        raw_total * 1000.0,
+        adj_total * 1000.0
+    );
     println!();
     println!("Raw includes one stream sync per timed block, so frequently-called");
     println!("stages absorb the most overhead. Adjusted removes it. Act on the");

@@ -102,10 +102,15 @@ async fn health_is_parsed() {
     let h = c.health().await.unwrap();
     assert_eq!(h.model, "120m");
     assert_eq!(h.max_batch, 16);
-    assert!(h.sampling.greedy && h.sampling.temperature,
-            "server should advertise both modes: {:?}", h.sampling);
-    assert_eq!(h.sampling.default_mode, "greedy",
-               "omitting sampling parameters must stay greedy");
+    assert!(
+        h.sampling.greedy && h.sampling.temperature,
+        "server should advertise both modes: {:?}",
+        h.sampling
+    );
+    assert_eq!(
+        h.sampling.default_mode, "greedy",
+        "omitting sampling parameters must stay greedy"
+    );
 }
 
 #[tokio::test]
@@ -148,7 +153,11 @@ async fn streams_tokens_then_done() {
     for m in &msgs {
         match m {
             StreamMessage::Token { text: t, .. } => text.push_str(t),
-            StreamMessage::Done { finish_reason, tokens_generated, text: tail } => {
+            StreamMessage::Done {
+                finish_reason,
+                tokens_generated,
+                text: tail,
+            } => {
                 text.push_str(tail);
                 done = Some((finish_reason.clone(), *tokens_generated));
             }
@@ -229,13 +238,19 @@ async fn keepalive_comments_and_unknown_events_are_skipped() {
 #[tokio::test]
 async fn malformed_sse_json_surfaces_as_a_protocol_error() {
     let addr = mock(|_| {
-        Reply::Once(format!("{}event: token\ndata: {{not json}}\n\n", sse_headers()))
+        Reply::Once(format!(
+            "{}event: token\ndata: {{not json}}\n\n",
+            sse_headers()
+        ))
     })
     .await;
 
     let msgs = collect(addr, "hi").await;
     assert!(
-        matches!(msgs.first(), Some(StreamMessage::Failed(ClientError::Protocol(_)))),
+        matches!(
+            msgs.first(),
+            Some(StreamMessage::Failed(ClientError::Protocol(_)))
+        ),
         "got {msgs:?}"
     );
 }
@@ -263,12 +278,21 @@ async fn a_server_error_status_is_reported_with_its_message() {
 #[tokio::test]
 async fn a_500_is_reported_rather_than_treated_as_a_stream() {
     let addr = mock(|_| {
-        Reply::Once("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into())
+        Reply::Once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+        )
     })
     .await;
     let msgs = collect(addr, "hi").await;
     assert!(
-        matches!(msgs.first(), Some(StreamMessage::Failed(ClientError::Rejected { status: 500, .. }))),
+        matches!(
+            msgs.first(),
+            Some(StreamMessage::Failed(ClientError::Rejected {
+                status: 500,
+                ..
+            }))
+        ),
         "got {msgs:?}"
     );
 }
@@ -287,7 +311,10 @@ async fn a_mid_stream_disconnect_ends_the_stream_without_done() {
     .await;
 
     let msgs = collect(addr, "hi").await;
-    let tokens = msgs.iter().filter(|m| matches!(m, StreamMessage::Token { .. })).count();
+    let tokens = msgs
+        .iter()
+        .filter(|m| matches!(m, StreamMessage::Token { .. }))
+        .count();
     assert_eq!(tokens, 2, "partial output was discarded: {msgs:?}");
     assert!(
         matches!(msgs.last(), Some(StreamMessage::Ended)),
@@ -355,5 +382,8 @@ async fn a_client_recovers_once_the_server_comes_back() {
     let c = Client::new(format!("http://{addr}")).unwrap();
     assert!(c.health().await.is_ok());
     assert!(c.metrics().await.is_err() || true); // metrics path returns HEALTH here; shape mismatch is fine
-    assert!(c.health().await.is_ok(), "client became unusable after one bad response");
+    assert!(
+        c.health().await.is_ok(),
+        "client became unusable after one bad response"
+    );
 }

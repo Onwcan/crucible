@@ -212,8 +212,14 @@ impl Fixture {
             out: gpu.to_device(&vec![SENTINEL; rows * D + 64])?,
             rows,
             max_chunk: case.slices.iter().map(|s| s.len).max().unwrap(),
-            score_capacity: case.slices.iter().map(|s| s.start + s.len)
-                .max().unwrap().div_ceil(256) * 256,
+            score_capacity: case
+                .slices
+                .iter()
+                .map(|s| s.start + s.len)
+                .max()
+                .unwrap()
+                .div_ceil(256)
+                * 256,
         })
     }
 
@@ -358,7 +364,9 @@ fn compare(
         let g_half = half::f16::from_f32(g);
         let e_half = half::f16::from_f32(e);
         errors.half_differences += usize::from(g_half.to_bits() != e_half.to_bits());
-        errors.half_abs = errors.half_abs.max((g_half.to_f32() as f64 - e_half.to_f32() as f64).abs());
+        errors.half_abs = errors
+            .half_abs
+            .max((g_half.to_f32() as f64 - e_half.to_f32() as f64).abs());
         if bit_exact {
             ensure!(
                 g.to_bits() == e.to_bits(),
@@ -680,7 +688,12 @@ pub fn check(fuzz: usize, seed: u64) -> Result<()> {
             e.abs,
             e.rel
         );
-        println!("tensor_half_rounding_error,{},{},{:.9e}", variant.name(), e.half_differences, e.half_abs);
+        println!(
+            "tensor_half_rounding_error,{},{},{:.9e}",
+            variant.name(),
+            e.half_differences,
+            e.half_abs
+        );
     }
     println!("PASS: {} fixed + {fuzz} fuzz cases; {comparisons} reference tensor comparisons; {future_checks} exact future-poison checks; {invariant_checks} exact composition/permutation/page-remap checks", fixed);
     println!("Model f32/int8 generation, RNG, cancellation and runtime page reuse: run gpu-packed-prefill-check separately for each attention variant.");
@@ -790,9 +803,15 @@ pub fn bench(iters: usize, trials: usize, requested: &str, filter: &str, seed: u
         let mut graphs = Vec::new();
         for variant in &variants {
             if matches!(variant, PrefillAttentionVariant::Exact { .. }) {
-                let resources = gpu.attention_kernel_resources(*variant, fixture.score_capacity, STRIDE)?;
-                println!("# case_resources,{},{},score_capacity={},{}", case.name,
-                    variant.name(), fixture.score_capacity, serde_json::to_string(&resources)?);
+                let resources =
+                    gpu.attention_kernel_resources(*variant, fixture.score_capacity, STRIDE)?;
+                println!(
+                    "# case_resources,{},{},score_capacity={},{}",
+                    case.name,
+                    variant.name(),
+                    fixture.score_capacity,
+                    serde_json::to_string(&resources)?
+                );
             }
             fixture.reset_output(&gpu)?;
             for _ in 0..5 {

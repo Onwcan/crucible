@@ -135,41 +135,104 @@ struct Prepared {
 fn prepare(req: &ChatRequest, st: &AppState) -> Result<Prepared, ApiError> {
     check_model(req.model.as_deref(), &st.model_id)?;
 
-    let messages = req.messages.as_ref().ok_or_else(|| ApiError::missing("messages"))?;
+    let messages = req
+        .messages
+        .as_ref()
+        .ok_or_else(|| ApiError::missing("messages"))?;
 
     // Refuse what is not implemented, by name, before doing any work.
-    reject_if_set(req.n, |n| *n == 1, "n",
-        "This server returns exactly one choice per request.")?;
-    reject_if_set(req.top_p, |v| *v == 1.0, "top_p",
-        "Crucible samples with top-k; nucleus sampling is not implemented.")?;
-    reject_if_set(req.frequency_penalty, |v| *v == 0.0, "frequency_penalty",
-        "Repetition penalties are not implemented.")?;
-    reject_if_set(req.presence_penalty, |v| *v == 0.0, "presence_penalty",
-        "Repetition penalties are not implemented.")?;
-    reject_if_set(req.logprobs, |v| !*v, "logprobs",
-        "Token log probabilities are not returned by this server.")?;
-    reject_if_set(req.top_logprobs, |_| false, "top_logprobs",
-        "Token log probabilities are not returned by this server.")?;
-    reject_if_set(req.stop.as_ref(), |v| json_is_empty(v), "stop",
+    reject_if_set(
+        req.n,
+        |n| *n == 1,
+        "n",
+        "This server returns exactly one choice per request.",
+    )?;
+    reject_if_set(
+        req.top_p,
+        |v| *v == 1.0,
+        "top_p",
+        "Crucible samples with top-k; nucleus sampling is not implemented.",
+    )?;
+    reject_if_set(
+        req.frequency_penalty,
+        |v| *v == 0.0,
+        "frequency_penalty",
+        "Repetition penalties are not implemented.",
+    )?;
+    reject_if_set(
+        req.presence_penalty,
+        |v| *v == 0.0,
+        "presence_penalty",
+        "Repetition penalties are not implemented.",
+    )?;
+    reject_if_set(
+        req.logprobs,
+        |v| !*v,
+        "logprobs",
+        "Token log probabilities are not returned by this server.",
+    )?;
+    reject_if_set(
+        req.top_logprobs,
+        |_| false,
+        "top_logprobs",
+        "Token log probabilities are not returned by this server.",
+    )?;
+    reject_if_set(
+        req.stop.as_ref(),
+        |v| json_is_empty(v),
+        "stop",
         "Stop sequences would have to be matched inside the scheduler across \
          token boundaries; the server does not do that yet, so accepting them \
-         would mean generating past the stop and trimming afterwards.")?;
-    reject_if_set(req.logit_bias.as_ref(), |v| json_is_empty(v), "logit_bias",
-        "Logit bias is not implemented.")?;
-    reject_if_set(req.tools.as_ref(), |v| json_is_empty(v), "tools",
-        "This model has no tool-calling training; it would never emit a valid call.")?;
-    reject_if_set(req.tool_choice.as_ref(), |v| json_is_empty(v), "tool_choice",
-        "Tool calling is not implemented.")?;
-    reject_if_set(req.functions.as_ref(), |v| json_is_empty(v), "functions",
-        "Function calling is not implemented.")?;
-    reject_if_set(req.function_call.as_ref(), |v| json_is_empty(v), "function_call",
-        "Function calling is not implemented.")?;
-    reject_if_set(req.modalities.as_ref(), |v| json_is_empty(v), "modalities",
-        "This server is text-only.")?;
-    reject_if_set(req.audio.as_ref(), |v| json_is_empty(v), "audio",
-        "This server is text-only.")?;
-    reject_if_set(req.reasoning_effort.as_ref(), |v| json_is_empty(v), "reasoning_effort",
-        "This is not a reasoning model.")?;
+         would mean generating past the stop and trimming afterwards.",
+    )?;
+    reject_if_set(
+        req.logit_bias.as_ref(),
+        |v| json_is_empty(v),
+        "logit_bias",
+        "Logit bias is not implemented.",
+    )?;
+    reject_if_set(
+        req.tools.as_ref(),
+        |v| json_is_empty(v),
+        "tools",
+        "This model has no tool-calling training; it would never emit a valid call.",
+    )?;
+    reject_if_set(
+        req.tool_choice.as_ref(),
+        |v| json_is_empty(v),
+        "tool_choice",
+        "Tool calling is not implemented.",
+    )?;
+    reject_if_set(
+        req.functions.as_ref(),
+        |v| json_is_empty(v),
+        "functions",
+        "Function calling is not implemented.",
+    )?;
+    reject_if_set(
+        req.function_call.as_ref(),
+        |v| json_is_empty(v),
+        "function_call",
+        "Function calling is not implemented.",
+    )?;
+    reject_if_set(
+        req.modalities.as_ref(),
+        |v| json_is_empty(v),
+        "modalities",
+        "This server is text-only.",
+    )?;
+    reject_if_set(
+        req.audio.as_ref(),
+        |v| json_is_empty(v),
+        "audio",
+        "This server is text-only.",
+    )?;
+    reject_if_set(
+        req.reasoning_effort.as_ref(),
+        |v| json_is_empty(v),
+        "reasoning_effort",
+        "This is not a reasoning model.",
+    )?;
     reject_if_set(
         req.response_format.as_ref(),
         |v| json_is_empty(v) || v.get("type").and_then(|t| t.as_str()) == Some("text"),
@@ -253,7 +316,11 @@ pub(crate) async fn chat_completions(
         while let Some(item) = rx.recv().await {
             match item {
                 StreamItem::Token { text: t, .. } => text.push_str(&t),
-                StreamItem::Done { reason, generated: g, tail } => {
+                StreamItem::Done {
+                    reason,
+                    generated: g,
+                    tail,
+                } => {
                     text.push_str(&tail);
                     generated = g;
                     finish = finish_reason_str(reason);
@@ -393,7 +460,9 @@ pub(crate) async fn chat_completions(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 #[cfg(test)]
@@ -450,7 +519,12 @@ mod tests {
 
     #[test]
     fn serialization_is_deterministic() {
-        let m = vec![msg("system", "s"), msg("user", "u"), msg("assistant", "a"), msg("user", "v")];
+        let m = vec![
+            msg("system", "s"),
+            msg("user", "u"),
+            msg("assistant", "a"),
+            msg("user", "v"),
+        ];
         assert_eq!(serialize(&m).unwrap(), serialize(&m).unwrap());
     }
 
@@ -465,8 +539,14 @@ mod tests {
         let m = ChatMessage {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
-                super::super::types::ContentPart { kind: "text".into(), text: Some("a".into()) },
-                super::super::types::ContentPart { kind: "text".into(), text: Some("b".into()) },
+                super::super::types::ContentPart {
+                    kind: "text".into(),
+                    text: Some("a".into()),
+                },
+                super::super::types::ContentPart {
+                    kind: "text".into(),
+                    text: Some("b".into()),
+                },
             ])),
             name: None,
             tool_calls: None,
@@ -479,10 +559,12 @@ mod tests {
     fn an_image_part_is_refused_rather_than_stringified() {
         let m = ChatMessage {
             role: "user".into(),
-            content: Some(MessageContent::Parts(vec![super::super::types::ContentPart {
-                kind: "image_url".into(),
-                text: None,
-            }])),
+            content: Some(MessageContent::Parts(vec![
+                super::super::types::ContentPart {
+                    kind: "image_url".into(),
+                    text: None,
+                },
+            ])),
             name: None,
             tool_calls: None,
             function_call: None,
@@ -527,7 +609,10 @@ mod tests {
             tool_calls: None,
             function_call: None,
         };
-        assert_eq!(serialize(&[msg("user", "x"), m]).unwrap(), "User: x\n\nAssistant:");
+        assert_eq!(
+            serialize(&[msg("user", "x"), m]).unwrap(),
+            "User: x\n\nAssistant:"
+        );
     }
 
     #[test]

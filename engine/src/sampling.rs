@@ -194,7 +194,10 @@ fn value_key(v: f32) -> u32 {
 /// worth doing on a 50304-entry vocabulary, where selection is the dominant
 /// cost of the full-logit path.
 fn sort_key(v: f32, i: usize) -> u64 {
-    debug_assert!(i <= u32::MAX as usize, "token id must fit the key's low half");
+    debug_assert!(
+        i <= u32::MAX as usize,
+        "token id must fit the key's low half"
+    );
     ((value_key(v) as u64) << 32) | (u32::MAX - i as u32) as u64
 }
 
@@ -477,7 +480,10 @@ mod tests {
                 hits += 1;
             }
         }
-        assert!(hits > 290, "low temperature was not concentrated: {hits}/300");
+        assert!(
+            hits > 290,
+            "low temperature was not concentrated: {hits}/300"
+        );
     }
 
     #[test]
@@ -497,7 +503,9 @@ mod tests {
         let run = || {
             let mut rng = Rng::new(4242);
             let c = cfg(0.8, 40, 4242);
-            (0..64).map(|_| sample(&logits, &c, &mut rng)).collect::<Vec<_>>()
+            (0..64)
+                .map(|_| sample(&logits, &c, &mut rng))
+                .collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
     }
@@ -508,7 +516,9 @@ mod tests {
         let run = |seed: u64| {
             let mut rng = Rng::new(seed);
             let c = cfg(1.0, 50, seed);
-            (0..64).map(|_| sample(&logits, &c, &mut rng)).collect::<Vec<_>>()
+            (0..64)
+                .map(|_| sample(&logits, &c, &mut rng))
+                .collect::<Vec<_>>()
         };
         assert_ne!(run(1), run(2));
     }
@@ -541,7 +551,10 @@ mod tests {
         assert!(cfg(0.0, 40, 1).is_greedy());
         assert!(cfg(-0.5, 40, 1).is_greedy());
         assert!(!cfg(0.0001, 40, 1).is_greedy());
-        assert!(cfg(f32::NAN, 40, 1).is_greedy(), "NaN temperature must not sample");
+        assert!(
+            cfg(f32::NAN, 40, 1).is_greedy(),
+            "NaN temperature must not sample"
+        );
     }
 
     #[test]
@@ -572,9 +585,9 @@ mod tests {
 
     fn same(a: &[(usize, f32)], b: &[(usize, f32)]) -> bool {
         a.len() == b.len()
-            && a.iter().zip(b).all(|(x, y)| {
-                x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan()))
-            })
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.0 == y.0 && (x.1 == y.1 || (x.1.is_nan() && y.1.is_nan())))
     }
 
     #[test]
@@ -584,8 +597,19 @@ mod tests {
         // different candidate set from the one the docs describe -- and from
         // the one the GPU kernel, which uses the same key, returns.
         let values = [
-            0.0f32, -0.0, 1.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
-            f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 3.4e38, -3.4e38, 1e-30, -1e-30,
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            3.4e38,
+            -3.4e38,
+            1e-30,
+            -1e-30,
         ];
         for (ia, a) in values.iter().enumerate() {
             for (ib, b) in values.iter().enumerate() {
@@ -617,7 +641,10 @@ mod tests {
         let logits = vec![1.0, 3.0, 3.0, 2.0, 3.0];
         let got = top_k(&logits, 4);
         // Three-way tie at 3.0 resolves by id: 1, 2, 4. Then 2.0 at index 3.
-        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![1, 2, 4, 3]);
+        assert_eq!(
+            got.iter().map(|c| c.0).collect::<Vec<_>>(),
+            vec![1, 2, 4, 3]
+        );
     }
 
     #[test]
@@ -644,7 +671,10 @@ mod tests {
     fn nan_sorts_below_negative_infinity() {
         let logits = vec![f32::NAN, f32::NEG_INFINITY, f32::NAN, -1.0e38];
         let got = top_k(&logits, 4);
-        assert_eq!(got.iter().map(|c| c.0).collect::<Vec<_>>(), vec![3, 1, 0, 2]);
+        assert_eq!(
+            got.iter().map(|c| c.0).collect::<Vec<_>>(),
+            vec![3, 1, 0, 2]
+        );
     }
 
     #[test]
@@ -690,7 +720,10 @@ mod tests {
         for seed in 0..300u64 {
             let mut rng = Rng::new(seed);
             let picked = sample_candidates(&cands, &cfg(1.5, 7, seed), &mut rng);
-            assert!(ids.contains(&picked), "seed {seed} escaped the candidate set");
+            assert!(
+                ids.contains(&picked),
+                "seed {seed} escaped the candidate set"
+            );
         }
     }
 

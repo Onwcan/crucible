@@ -31,11 +31,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let telemetry_height = if app.show_telemetry { 6 } else { 0 };
     let chunks = Layout::vertical([
-        Constraint::Length(1),                  // header
-        Constraint::Min(3),                     // conversation
-        Constraint::Length(3),                  // input
-        Constraint::Length(telemetry_height),   // telemetry
-        Constraint::Length(1),                  // status / hints
+        Constraint::Length(1),                // header
+        Constraint::Min(3),                   // conversation
+        Constraint::Length(3),                // input
+        Constraint::Length(telemetry_height), // telemetry
+        Constraint::Length(1),                // status / hints
     ])
     .split(area);
 
@@ -84,8 +84,20 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let lines = vec![
-        row(SettingField::Mode, "mode", if s.sample { "sample".into() } else { "greedy".into() }),
-        row(SettingField::Temperature, "temperature", format!("{:.2}", s.temperature)),
+        row(
+            SettingField::Mode,
+            "mode",
+            if s.sample {
+                "sample".into()
+            } else {
+                "greedy".into()
+            },
+        ),
+        row(
+            SettingField::Temperature,
+            "temperature",
+            format!("{:.2}", s.temperature),
+        ),
         row(SettingField::TopK, "top-k", s.top_k.to_string()),
         row(SettingField::Seed, "seed", s.seed.to_string()),
         Line::from(""),
@@ -96,8 +108,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     ];
 
     f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" generation ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" generation ")),
         popup,
     );
 }
@@ -167,17 +178,23 @@ fn conversation_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let (label, label_style, body_style) = match msg.role {
             Role::User => (
                 "You",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
                 Style::default(),
             ),
             Role::Assistant => (
                 "Crucible",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
                 Style::default(),
             ),
             Role::System => (
                 "System",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::Yellow),
             ),
         };
@@ -188,10 +205,9 @@ fn conversation_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 "  cancelled",
                 Style::default().fg(Color::Yellow),
             )),
-            MessageState::Failed => header.push(Span::styled(
-                "  failed",
-                Style::default().fg(Color::Red),
-            )),
+            MessageState::Failed => {
+                header.push(Span::styled("  failed", Style::default().fg(Color::Red)))
+            }
             _ => {}
         }
         out.push(Line::from(header));
@@ -260,7 +276,9 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_conversation(f: &mut Frame, area: Rect, app: &mut App) {
-    let block = Block::default().borders(Borders::ALL).title(" conversation ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" conversation ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -288,10 +306,7 @@ fn draw_conversation(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    f.render_widget(
-        Paragraph::new(lines).scroll((offset as u16, 0)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 
     // Only say the view is detached when it actually is.
     if !app.follow && app.scroll > 0 {
@@ -353,26 +368,35 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_telemetry(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
 
     let mut left = vec![Line::from(Span::styled(
         "this request (client-observed)",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     let s = &app.stats;
-    left.push(kv("TTFT", match s.ttft() {
-        Some(d) => format!("{:.1} ms", d.as_secs_f64() * 1e3),
-        None => "—".into(),
-    }));
-    left.push(kv("tok/s", match s.tokens_per_second() {
-        Some(v) => format!("{v:.0}"),
-        None => "—".into(),
-    }));
-    left.push(kv("gap median", match s.median_gap() {
-        Some(d) => format!("{:.2} ms", d.as_secs_f64() * 1e3),
-        None => "—".into(),
-    }));
+    left.push(kv(
+        "TTFT",
+        match s.ttft() {
+            Some(d) => format!("{:.1} ms", d.as_secs_f64() * 1e3),
+            None => "—".into(),
+        },
+    ));
+    left.push(kv(
+        "tok/s",
+        match s.tokens_per_second() {
+            Some(v) => format!("{v:.0}"),
+            None => "—".into(),
+        },
+    ));
+    left.push(kv(
+        "gap median",
+        match s.median_gap() {
+            Some(d) => format!("{:.2} ms", d.as_secs_f64() * 1e3),
+            None => "—".into(),
+        },
+    ));
     left.push(kv("generated", s.tokens.to_string()));
 
     let mut right = vec![Line::from(Span::styled(
@@ -381,15 +405,29 @@ fn draw_telemetry(f: &mut Frame, area: Rect, app: &App) {
     ))];
     match &app.metrics {
         Some(m) => {
-            right.push(kv("active / queued", format!("{} / {}", m.active_requests, m.queued_requests)));
+            right.push(kv(
+                "active / queued",
+                format!("{} / {}", m.active_requests, m.queued_requests),
+            ));
             right.push(kv(
                 "kv pages",
-                format!("{} / {} ({:.0}%)", m.kv_pages_used, m.kv_total(), m.kv_usage() * 100.0),
+                format!(
+                    "{} / {} ({:.0}%)",
+                    m.kv_pages_used,
+                    m.kv_total(),
+                    m.kv_usage() * 100.0
+                ),
             ));
-            right.push(kv("batch (last / avg)", format!("{} / {:.1}", m.last_batch_size, m.average_batch_size)));
+            right.push(kv(
+                "batch (last / avg)",
+                format!("{} / {:.1}", m.last_batch_size, m.average_batch_size),
+            ));
             right.push(kv(
                 "tokens / uptime",
-                format!("{} / {:.0}s", m.aggregate_tokens_generated, m.uptime_seconds),
+                format!(
+                    "{} / {:.0}s",
+                    m.aggregate_tokens_generated, m.uptime_seconds
+                ),
             ));
         }
         None => right.push(Line::from(Span::styled(
@@ -469,8 +507,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     )));
 
     f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" help ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" help ")),
         popup,
     );
 }
@@ -483,7 +520,10 @@ mod tests {
     fn wrapping_breaks_at_spaces_within_the_width() {
         let out = wrap_text("the quick brown fox jumps", 10);
         assert!(out.iter().all(|l| l.chars().count() <= 10), "{out:?}");
-        assert_eq!(out.concat().replace("  ", " ").trim(), "the quick brown fox jumps");
+        assert_eq!(
+            out.concat().replace("  ", " ").trim(),
+            "the quick brown fox jumps"
+        );
     }
 
     #[test]

@@ -37,8 +37,8 @@ impl Tokenizer {
     /// Load the binary vocabulary written by `scripts/export_tokenizer.py`.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading tokenizer {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading tokenizer {}", path.display()))?;
 
         let mut cursor = 0usize;
         let read_u32 = |cursor: &mut usize| -> Result<u32> {
@@ -66,7 +66,7 @@ impl Tokenizer {
         }
 
         Ok(Self {
-            eot: count as u32,          // <|endoftext|> sits just past the merges
+            eot: count as u32, // <|endoftext|> sits just past the merges
             tokens,
             ranks,
             pattern: Regex::new(GPT2_PATTERN).context("compiling GPT-2 pattern")?,

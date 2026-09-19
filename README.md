@@ -3274,8 +3274,7 @@ share decode steps in one scheduler.
 
 ## Continuous integration
 
-[Hosted CI](.github/workflows/ci.yml) reports existing Rust formatting debt
-informationally until a separate normalization commit, and gates Clippy correctness
+[Hosted CI](.github/workflows/ci.yml) enforces Rust formatting and gates Clippy correctness
 and suspicious-code diagnostics, locked CPU tests, feature isolation, and
 Python/JSON/documentation/repository hygiene. CUDA-feature Rust compilation and
 host protocol tests run without a toolkit or GPU; kernel execution and NVRTC

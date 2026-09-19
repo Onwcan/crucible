@@ -1,5 +1,19 @@
 # CI hardening milestone
 
+## Follow-up: blocking Rust formatting, 2026-09-19
+
+The Rust source has now been normalized by rustfmt, and
+`cargo fmt --manifest-path engine/Cargo.toml --all -- --check` is a blocking
+hosted quality gate. The informational exception and formatting-warning step
+were removed. See the [formatting normalization report](rustfmt-results.md) for
+the source-equivalence checks and validation results.
+
+The original milestone record below is preserved as historical evidence. Its
+references to pending formatting debt, informational rustfmt and the then-current
+HEAD describe the earlier CI milestone, not the current formatting policy.
+
+## Original CI milestone record
+
 Prepared against the attention milestone on 2026-09-13 and validated through
 2026-09-14. GitHub execution is
 **pending**: no project commit, push, runner registration, or branch-protection

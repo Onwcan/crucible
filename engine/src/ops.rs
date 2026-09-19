@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn rmsnorm_unit_weight_normalises() {
-        let x = vec![3.0, 4.0];             // rms = sqrt(12.5)
+        let x = vec![3.0, 4.0]; // rms = sqrt(12.5)
         let w = vec![1.0, 1.0];
         let mut out = vec![0.0; 2];
         rmsnorm(&x, &w, 1e-6, &mut out);

@@ -77,7 +77,11 @@ impl Model {
         }
 
         let rope = match cfg.pos_encoding.as_str() {
-            "rope" => Some(RopeTable::new(cfg.head_dim(), cfg.block_size, cfg.rope_theta)),
+            "rope" => Some(RopeTable::new(
+                cfg.head_dim(),
+                cfg.block_size,
+                cfg.rope_theta,
+            )),
             _ => None,
         };
         let pos_emb = match cfg.pos_encoding.as_str() {
@@ -284,7 +288,13 @@ impl Model {
 
         // lm_head is tied to tok_emb, so the embedding table is the projection.
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        ops::matvec(&self.tok_emb.data, cfg.vocab_size, d, &final_out, &mut logits);
+        ops::matvec(
+            &self.tok_emb.data,
+            cfg.vocab_size,
+            d,
+            &final_out,
+            &mut logits,
+        );
         Ok(logits)
     }
 }

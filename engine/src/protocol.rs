@@ -217,9 +217,18 @@ pub struct StreamError {
 /// One decoded server-sent event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SseEvent {
-    Token { token_id: usize, text: String },
-    Done { finish_reason: String, tokens_generated: usize, text: String },
-    Error { error: String },
+    Token {
+        token_id: usize,
+        text: String,
+    },
+    Done {
+        finish_reason: String,
+        tokens_generated: usize,
+        text: String,
+    },
+    Error {
+        error: String,
+    },
     /// A well-formed event this client does not know about. Ignored rather than
     /// treated as a failure, so adding an event type to the server does not
     /// break older clients.
@@ -261,14 +270,11 @@ pub fn parse_sse_block(block: &str) -> Result<Option<SseEvent>, String> {
         return Ok(None);
     }
 
-    let parse = |what: &str| -> String {
-        format!("malformed {what} event from server: {data}")
-    };
+    let parse = |what: &str| -> String { format!("malformed {what} event from server: {data}") };
 
     match event {
         Some("token") => {
-            let t: TokenEvent =
-                serde_json::from_str(&data).map_err(|_| parse("token"))?;
+            let t: TokenEvent = serde_json::from_str(&data).map_err(|_| parse("token"))?;
             Ok(Some(SseEvent::Token {
                 token_id: t.token_id,
                 text: t.text,
@@ -283,8 +289,7 @@ pub fn parse_sse_block(block: &str) -> Result<Option<SseEvent>, String> {
             }))
         }
         Some("error") => {
-            let e: StreamError =
-                serde_json::from_str(&data).map_err(|_| parse("error"))?;
+            let e: StreamError = serde_json::from_str(&data).map_err(|_| parse("error"))?;
             Ok(Some(SseEvent::Error { error: e.error }))
         }
         Some(other) => Ok(Some(SseEvent::Unknown(other.to_string()))),
@@ -340,16 +345,29 @@ mod tests {
 
     #[test]
     fn tolerates_crlf_comments_and_unknown_fields() {
-        let block = ": keep-alive\r\nid: 7\r\nevent: token\r\ndata: {\"token_id\":1,\"text\":\"a\"}\r\n";
+        let block =
+            ": keep-alive\r\nid: 7\r\nevent: token\r\ndata: {\"token_id\":1,\"text\":\"a\"}\r\n";
         let ev = parse_sse_block(block).unwrap().unwrap();
-        assert_eq!(ev, SseEvent::Token { token_id: 1, text: "a".into() });
+        assert_eq!(
+            ev,
+            SseEvent::Token {
+                token_id: 1,
+                text: "a".into()
+            }
+        );
     }
 
     #[test]
     fn concatenates_multiple_data_lines() {
         let block = "event: token\ndata: {\"token_id\":1,\ndata: \"text\":\"x\"}";
         let ev = parse_sse_block(block).unwrap().unwrap();
-        assert_eq!(ev, SseEvent::Token { token_id: 1, text: "x".into() });
+        assert_eq!(
+            ev,
+            SseEvent::Token {
+                token_id: 1,
+                text: "x".into()
+            }
+        );
     }
 
     #[test]
@@ -360,7 +378,9 @@ mod tests {
 
     #[test]
     fn unknown_event_types_are_ignored_rather_than_fatal() {
-        let ev = parse_sse_block("event: heartbeat\ndata: {}").unwrap().unwrap();
+        let ev = parse_sse_block("event: heartbeat\ndata: {}")
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev, SseEvent::Unknown(ref s) if s == "heartbeat"));
     }
 

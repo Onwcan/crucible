@@ -12,10 +12,10 @@
 //! that claim rather than assuming it.
 
 use anyhow::Result;
+use cudarc::driver::CudaGraph;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
-use cudarc::driver::CudaGraph;
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
 
@@ -101,33 +101,60 @@ pub enum PrefillAttentionVariant {
 }
 
 impl PrefillAttentionVariant {
-    pub fn is_reference(self) -> bool { matches!(self, Self::Reference) }
+    pub fn is_reference(self) -> bool {
+        matches!(self, Self::Reference)
+    }
 
     pub fn uses_hybrid(self) -> bool {
-        matches!(self, Self::Tiled { hybrid: true, .. } | Self::Exact { hybrid: true, .. })
+        matches!(
+            self,
+            Self::Tiled { hybrid: true, .. } | Self::Exact { hybrid: true, .. }
+        )
     }
 
     pub fn name(self) -> String {
         match self {
             Self::Reference => "reference".to_owned(),
-            Self::Tiled { query_tile, history_tile, hybrid, cache_page_table } => format!(
+            Self::Tiled {
+                query_tile,
+                history_tile,
+                hybrid,
+                cache_page_table,
+            } => format!(
                 "q{query_tile}-k{history_tile}{}{}",
                 if hybrid { "-hybrid" } else { "" },
-                if cache_page_table { "-cache" } else { "" }),
-            Self::Exact { query_tile, history_tile, hybrid, cache_page_table } => format!(
+                if cache_page_table { "-cache" } else { "" }
+            ),
+            Self::Exact {
+                query_tile,
+                history_tile,
+                hybrid,
+                cache_page_table,
+            } => format!(
                 "exact-q{query_tile}-k{history_tile}{}{}",
                 if hybrid { "-hybrid" } else { "" },
-                if cache_page_table { "-cache" } else { "" }),
+                if cache_page_table { "-cache" } else { "" }
+            ),
         }
     }
 
     pub fn validate(self) -> Result<()> {
-        if let Self::Tiled { query_tile, history_tile, .. } = self {
+        if let Self::Tiled {
+            query_tile,
+            history_tile,
+            ..
+        } = self
+        {
             if !matches!(query_tile, 1 | 2 | 4) || !matches!(history_tile, 16 | 32 | 64) {
                 anyhow::bail!("attention tiles must be query=1/2/4 and history=16/32/64");
             }
         }
-        if let Self::Exact { query_tile, history_tile, .. } = self {
+        if let Self::Exact {
+            query_tile,
+            history_tile,
+            ..
+        } = self
+        {
             if !matches!(query_tile, 1 | 2 | 4) || !matches!(history_tile, 16 | 32 | 64) {
                 anyhow::bail!("exact attention tiles must be query=1/2/4 and history=16/32/64");
             }
@@ -139,30 +166,60 @@ impl PrefillAttentionVariant {
         self.validate()?;
         match self {
             Self::Reference => anyhow::bail!("reference attention has no tiled kernel"),
-            Self::Tiled { query_tile, history_tile, .. }
-            | Self::Exact { query_tile, history_tile, .. } => Ok(
-                query_tile.trailing_zeros() as usize * 3 + (history_tile / 16).trailing_zeros() as usize),
+            Self::Tiled {
+                query_tile,
+                history_tile,
+                ..
+            }
+            | Self::Exact {
+                query_tile,
+                history_tile,
+                ..
+            } => Ok(query_tile.trailing_zeros() as usize * 3
+                + (history_tile / 16).trailing_zeros() as usize),
         }
     }
 
     pub fn threads_per_block(self) -> u32 {
         match self {
             Self::Reference => REDUCE_THREADS,
-            Self::Tiled { query_tile, .. } | Self::Exact { query_tile, .. } => (128 * query_tile) as u32,
+            Self::Tiled { query_tile, .. } | Self::Exact { query_tile, .. } => {
+                (128 * query_tile) as u32
+            }
         }
     }
 
     pub fn dynamic_shared_bytes(self, max_seq: usize, table_stride: usize) -> usize {
         match self {
             Self::Reference => max_seq * 4,
-            Self::Tiled { query_tile, history_tile, cache_page_table, .. } =>
+            Self::Tiled {
+                query_tile,
+                history_tile,
+                cache_page_table,
+                ..
+            } => {
                 (2 * history_tile * 64 + query_tile * 4 * history_tile) * 4
-                    + if cache_page_table { table_stride * 4 } else { 0 },
+                    + if cache_page_table {
+                        table_stride * 4
+                    } else {
+                        0
+                    }
+            }
             // Exact uses a launch-specific score capacity, which is also part
             // of the graph topology when history crosses a capacity bucket.
-            Self::Exact { query_tile, history_tile, cache_page_table, .. } =>
+            Self::Exact {
+                query_tile,
+                history_tile,
+                cache_page_table,
+                ..
+            } => {
                 (history_tile * 64 + query_tile * 4 * max_seq) * 4
-                    + if cache_page_table { table_stride * 4 } else { 0 },
+                    + if cache_page_table {
+                        table_stride * 4
+                    } else {
+                        0
+                    }
+            }
         }
     }
 }
@@ -171,38 +228,63 @@ impl std::str::FromStr for PrefillAttentionVariant {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        if value == "reference" { return Ok(Self::Reference); }
+        if value == "reference" {
+            return Ok(Self::Reference);
+        }
         let (mut base, mut hybrid, mut cache_page_table) = (value, false, false);
         loop {
             if let Some(prefix) = base.strip_suffix("-hybrid") {
-                if hybrid { anyhow::bail!("duplicate hybrid attention suffix"); }
+                if hybrid {
+                    anyhow::bail!("duplicate hybrid attention suffix");
+                }
                 hybrid = true;
                 base = prefix;
             } else if let Some(prefix) = base.strip_suffix("-cache") {
-                if cache_page_table { anyhow::bail!("duplicate cache attention suffix"); }
+                if cache_page_table {
+                    anyhow::bail!("duplicate cache attention suffix");
+                }
                 cache_page_table = true;
                 base = prefix;
-            } else { break; }
+            } else {
+                break;
+            }
         }
         let exact = base == "exact" || base.starts_with("exact-");
-        if let Some(prefix) = base.strip_prefix("exact-") { base = prefix; }
+        if let Some(prefix) = base.strip_prefix("exact-") {
+            base = prefix;
+        }
         let (query_tile, history_tile) = match base {
             "exact" => (4, 64),
             "grouped" => (1, 16),
             "tiled" => (2, 16),
-            "hybrid" => { hybrid = true; (2, 16) },
+            "hybrid" => {
+                hybrid = true;
+                (2, 16)
+            }
             _ => {
-                let (q, k) = base.split_once("-k")
-                    .ok_or_else(|| anyhow::anyhow!("invalid prefill attention variant {value:?}"))?;
-                let q = q.strip_prefix('q')
-                    .ok_or_else(|| anyhow::anyhow!("invalid prefill attention variant {value:?}"))?;
+                let (q, k) = base.split_once("-k").ok_or_else(|| {
+                    anyhow::anyhow!("invalid prefill attention variant {value:?}")
+                })?;
+                let q = q.strip_prefix('q').ok_or_else(|| {
+                    anyhow::anyhow!("invalid prefill attention variant {value:?}")
+                })?;
                 (q.parse()?, k.parse()?)
             }
         };
         let variant = if exact {
-            Self::Exact { query_tile, history_tile, hybrid, cache_page_table }
+            Self::Exact {
+                query_tile,
+                history_tile,
+                hybrid,
+                cache_page_table,
+            }
         } else {
-            Self::Tiled { query_tile, history_tile, hybrid, cache_page_table }
+            Self::Tiled {
+                query_tile,
+                history_tile,
+                hybrid,
+                cache_page_table,
+            }
         };
         variant.validate()?;
         Ok(variant)
@@ -527,7 +609,12 @@ impl Gpu {
         };
         let (r, c) = (rows as i32, cols as i32);
         let mut b = self.stream.launch_builder(&self.topk_rows);
-        b.arg(x).arg(row_k).arg(out_vals).arg(out_ids).arg(&r).arg(&c);
+        b.arg(x)
+            .arg(row_k)
+            .arg(out_vals)
+            .arg(out_ids)
+            .arg(&r)
+            .arg(&c);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -609,7 +696,15 @@ impl Gpu {
         let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
         let acc = i32::from(accumulate);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx).arg(&acc);
+        b.arg(w)
+            .arg(x)
+            .arg(y)
+            .arg(&r)
+            .arg(&c)
+            .arg(params)
+            .arg(&base)
+            .arg(&idx)
+            .arg(&acc);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -635,7 +730,15 @@ impl Gpu {
             v_idx as i32,
         );
         let mut b = self.stream.launch_builder(&self.rope);
-        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(params).arg(&pi).arg(&base).arg(&idx);
+        b.arg(v)
+            .arg(cos)
+            .arg(sin)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(params)
+            .arg(&pi)
+            .arg(&base)
+            .arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -698,8 +801,17 @@ impl Gpu {
         );
         let mut b = self.stream.launch_builder(&self.attention);
         let ms = max_seq as i32;
-        b.arg(q).arg(&k).arg(&v).arg(out)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs).arg(&ms);
+        b.arg(q)
+            .arg(&k)
+            .arg(&v)
+            .arg(out)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(params)
+            .arg(&si)
+            .arg(&cs)
+            .arg(&ms);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -716,7 +828,12 @@ impl Gpu {
         let cfg = LaunchConfig::for_num_elems(d as u32);
         let (ti, dd) = (PARAM_TOKEN as i32, d as i32);
         let mut b = self.stream.launch_builder(&self.embed_i8);
-        b.arg(table).arg(scales).arg(out).arg(params).arg(&ti).arg(&dd);
+        b.arg(table)
+            .arg(scales)
+            .arg(out)
+            .arg(params)
+            .arg(&ti)
+            .arg(&dd);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -837,7 +954,11 @@ impl Gpu {
             )
         } else {
             (
-                if vec4 { &self.gemv_i8_vec4 } else { &self.gemv_i8 },
+                if vec4 {
+                    &self.gemv_i8_vec4
+                } else {
+                    &self.gemv_i8
+                },
                 LaunchConfig {
                     grid_dim: (rows as u32, 1, 1),
                     block_dim: (REDUCE_THREADS, 1, 1),
@@ -848,7 +969,16 @@ impl Gpu {
         let (r, c, base, idx) = (rows as i32, cols as i32, y_base as i32, y_idx as i32);
         let acc = i32::from(accumulate);
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(params).arg(&base).arg(&idx).arg(&acc);
+        b.arg(w)
+            .arg(scales)
+            .arg(x)
+            .arg(y)
+            .arg(&r)
+            .arg(&c)
+            .arg(params)
+            .arg(&base)
+            .arg(&idx)
+            .arg(&acc);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -864,17 +994,27 @@ impl Gpu {
     ) -> Result<()> {
         // float4 loads need a multiple of four columns; every dimension in this
         // model qualifies, but fall back rather than silently corrupt if not.
-        let func = if cols % 4 == 0 { &self.gemv_vec4 } else { &self.gemv };
+        let func = if cols % 4 == 0 {
+            &self.gemv_vec4
+        } else {
+            &self.gemv
+        };
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (rows_i, cols_i, base, idx) =
-            (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
+        let (rows_i, cols_i, base, idx) = (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
         let zeros = self.zero_params()?;
         let mut b = self.stream.launch_builder(func);
-        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
+        b.arg(w)
+            .arg(x)
+            .arg(y)
+            .arg(&rows_i)
+            .arg(&cols_i)
+            .arg(&zeros)
+            .arg(&base)
+            .arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -946,16 +1086,36 @@ impl Gpu {
             };
             match w {
                 Proj2::Int8(data, scales) => {
-                    let f = if use_big { &self.gemm_i8_wmma_big } else { &self.gemm_i8_wmma };
+                    let f = if use_big {
+                        &self.gemm_i8_wmma_big
+                    } else {
+                        &self.gemm_i8_wmma
+                    };
                     let mut b = self.stream.launch_builder(f);
-                    b.arg(*data).arg(*scales).arg(a).arg(c)
-                        .arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                    b.arg(*data)
+                        .arg(*scales)
+                        .arg(a)
+                        .arg(c)
+                        .arg(&mi)
+                        .arg(&ni)
+                        .arg(&ki)
+                        .arg(&acc);
                     unsafe { cu(b.launch(cfg))? };
                 }
                 Proj2::F32(data) => {
-                    let f = if use_big { &self.gemm_f32_wmma_big } else { &self.gemm_f32_wmma };
+                    let f = if use_big {
+                        &self.gemm_f32_wmma_big
+                    } else {
+                        &self.gemm_f32_wmma
+                    };
                     let mut b = self.stream.launch_builder(f);
-                    b.arg(*data).arg(a).arg(c).arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                    b.arg(*data)
+                        .arg(a)
+                        .arg(c)
+                        .arg(&mi)
+                        .arg(&ni)
+                        .arg(&ki)
+                        .arg(&acc);
                     unsafe { cu(b.launch(cfg))? };
                 }
             }
@@ -963,24 +1123,32 @@ impl Gpu {
         }
 
         let cfg = LaunchConfig {
-            grid_dim: (
-                (n as u32).div_ceil(TILE),
-                (m as u32).div_ceil(TILE),
-                1,
-            ),
+            grid_dim: ((n as u32).div_ceil(TILE), (m as u32).div_ceil(TILE), 1),
             block_dim: (TILE, TILE, 1),
             shared_mem_bytes: 0,
         };
         match w {
             Proj2::Int8(data, scales) => {
                 let mut b = self.stream.launch_builder(&self.gemm_i8);
-                b.arg(*data).arg(*scales).arg(a).arg(c)
-                    .arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                b.arg(*data)
+                    .arg(*scales)
+                    .arg(a)
+                    .arg(c)
+                    .arg(&mi)
+                    .arg(&ni)
+                    .arg(&ki)
+                    .arg(&acc);
                 unsafe { cu(b.launch(cfg))? };
             }
             Proj2::F32(data) => {
                 let mut b = self.stream.launch_builder(&self.gemm_f32);
-                b.arg(*data).arg(a).arg(c).arg(&mi).arg(&ni).arg(&ki).arg(&acc);
+                b.arg(*data)
+                    .arg(a)
+                    .arg(c)
+                    .arg(&mi)
+                    .arg(&ni)
+                    .arg(&ki)
+                    .arg(&acc);
                 unsafe { cu(b.launch(cfg))? };
             }
         }
@@ -1031,7 +1199,14 @@ impl Gpu {
             row_stride as i32,
         );
         let mut b = self.stream.launch_builder(&self.rope_batch);
-        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(params);
+        b.arg(v)
+            .arg(cos)
+            .arg(sin)
+            .arg(&r)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&rs)
+            .arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1068,7 +1243,12 @@ impl Gpu {
             }
             Proj2::Int8(data, scales) => {
                 let mut b = self.stream.launch_builder(&self.embed_batch_i8);
-                b.arg(*data).arg(*scales).arg(tokens).arg(out).arg(&r).arg(&di);
+                b.arg(*data)
+                    .arg(*scales)
+                    .arg(tokens)
+                    .arg(out)
+                    .arg(&r)
+                    .arg(&di);
                 unsafe { cu(b.launch(cfg))? };
             }
         }
@@ -1112,15 +1292,16 @@ impl Gpu {
         params: &CudaSlice<i32>,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
-        let (r, kd, nl, l) = (
-            rows as i32,
-            kv_dim as i32,
-            n_layer as i32,
-            layer as i32,
-        );
+        let (r, kd, nl, l) = (rows as i32, kv_dim as i32, n_layer as i32, layer as i32);
         let mut b = self.stream.launch_builder(&self.cache_store_paged);
-        b.arg(src).arg(pool).arg(page_table)
-            .arg(&r).arg(&kd).arg(&nl).arg(&l).arg(params);
+        b.arg(src)
+            .arg(pool)
+            .arg(page_table)
+            .arg(&r)
+            .arg(&kd)
+            .arg(&nl)
+            .arg(&l)
+            .arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1149,8 +1330,10 @@ impl Gpu {
             anyhow::bail!("batched gemv needs cols divisible by 4, got {cols}");
         }
         if batch == 0 || batch > Self::GEMV_BATCH_MAX {
-            anyhow::bail!("batched gemv supports 1..={} rows, got {batch}",
-                          Self::GEMV_BATCH_MAX);
+            anyhow::bail!(
+                "batched gemv supports 1..={} rows, got {batch}",
+                Self::GEMV_BATCH_MAX
+            );
         }
         // Smallest instantiation that covers this batch.
         let idx = match batch {
@@ -1174,7 +1357,14 @@ impl Gpu {
             i32::from(accumulate),
         );
         let mut bl = self.stream.launch_builder(&self.gemv_batch_i8[idx]);
-        bl.arg(w).arg(scales).arg(x).arg(y).arg(&r).arg(&c).arg(&b).arg(&acc);
+        bl.arg(w)
+            .arg(scales)
+            .arg(x)
+            .arg(y)
+            .arg(&r)
+            .arg(&c)
+            .arg(&b)
+            .arg(&acc);
         unsafe { cu(bl.launch(cfg))? };
         Ok(())
     }
@@ -1193,9 +1383,21 @@ impl Gpu {
         row_stride: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((rows * n_heads * head_dim / 2) as u32);
-        let (r, nh, hd, rs) = (rows as i32, n_heads as i32, head_dim as i32, row_stride as i32);
+        let (r, nh, hd, rs) = (
+            rows as i32,
+            n_heads as i32,
+            head_dim as i32,
+            row_stride as i32,
+        );
         let mut b = self.stream.launch_builder(&self.rope_rows);
-        b.arg(v).arg(cos).arg(sin).arg(&r).arg(&nh).arg(&hd).arg(&rs).arg(positions);
+        b.arg(v)
+            .arg(cos)
+            .arg(sin)
+            .arg(&r)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&rs)
+            .arg(positions);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1223,8 +1425,15 @@ impl Gpu {
             layer as i32,
         );
         let mut b = self.stream.launch_builder(&self.cache_store_rows_paged);
-        b.arg(src).arg(pool).arg(page_tables).arg(positions)
-            .arg(&r).arg(&kd).arg(&ts).arg(&nl).arg(&l);
+        b.arg(src)
+            .arg(pool)
+            .arg(page_tables)
+            .arg(positions)
+            .arg(&r)
+            .arg(&kd)
+            .arg(&ts)
+            .arg(&nl)
+            .arg(&l);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1272,9 +1481,20 @@ impl Gpu {
             max_seq as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention_decode_paged);
-        b.arg(q).arg(k_pool).arg(v_pool).arg(out)
-            .arg(page_tables).arg(seq_lens)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(&ts).arg(&nl).arg(&l).arg(&kd).arg(&ms);
+        b.arg(q)
+            .arg(k_pool)
+            .arg(v_pool)
+            .arg(out)
+            .arg(page_tables)
+            .arg(seq_lens)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&ts)
+            .arg(&nl)
+            .arg(&l)
+            .arg(&kd)
+            .arg(&ms);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1312,8 +1532,18 @@ impl Gpu {
             kv_dim as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention_prefill_paged);
-        b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(page_table)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(&nl).arg(&l).arg(&kd).arg(params);
+        b.arg(q)
+            .arg(k_pool)
+            .arg(v_pool)
+            .arg(out)
+            .arg(page_table)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&nl)
+            .arg(&l)
+            .arg(&kd)
+            .arg(params);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1322,22 +1552,53 @@ impl Gpu {
     /// device metadata; arithmetic is shared with single-request prefill.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_packed(
-        &self, q: &CudaSlice<f32>, k_pool: &CudaSlice<f32>, v_pool: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>, tables: &CudaSlice<i32>, owners: &CudaSlice<i32>,
-        positions: &CudaSlice<i32>, rows: usize, table_stride: usize,
-        n_head: usize, n_kv_head: usize, head_dim: usize, n_layer: usize,
-        layer: usize, kv_dim: usize, max_seq: usize,
+        &self,
+        q: &CudaSlice<f32>,
+        k_pool: &CudaSlice<f32>,
+        v_pool: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        tables: &CudaSlice<i32>,
+        owners: &CudaSlice<i32>,
+        positions: &CudaSlice<i32>,
+        rows: usize,
+        table_stride: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        n_layer: usize,
+        layer: usize,
+        kv_dim: usize,
+        max_seq: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, rows as u32, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: (max_seq * std::mem::size_of::<f32>()) as u32,
         };
-        let (ts, nh, nk, hd, nl, l, kd) = (table_stride as i32, n_head as i32,
-            n_kv_head as i32, head_dim as i32, n_layer as i32, layer as i32, kv_dim as i32);
+        let (ts, nh, nk, hd, nl, l, kd) = (
+            table_stride as i32,
+            n_head as i32,
+            n_kv_head as i32,
+            head_dim as i32,
+            n_layer as i32,
+            layer as i32,
+            kv_dim as i32,
+        );
         let mut b = self.stream.launch_builder(&self.attention_prefill_packed);
-        b.arg(q).arg(k_pool).arg(v_pool).arg(out).arg(tables).arg(owners).arg(positions)
-            .arg(&ts).arg(&nh).arg(&nk).arg(&hd).arg(&nl).arg(&l).arg(&kd);
+        b.arg(q)
+            .arg(k_pool)
+            .arg(v_pool)
+            .arg(out)
+            .arg(tables)
+            .arg(owners)
+            .arg(positions)
+            .arg(&ts)
+            .arg(&nh)
+            .arg(&nk)
+            .arg(&hd)
+            .arg(&nl)
+            .arg(&l)
+            .arg(&kd);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1352,61 +1613,139 @@ impl Gpu {
     /// Online tiled variants ignore `score_capacity`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_tiled(
-        &self, q: &CudaSlice<f32>, k_pool: &CudaSlice<f32>, v_pool: &CudaSlice<f32>,
-        current_k: &CudaSlice<f32>, current_v: &CudaSlice<f32>, out: &mut CudaSlice<f32>,
-        tables: &CudaSlice<i32>, segments: &CudaSlice<i32>, requests: usize,
-        max_chunk: usize, table_stride: usize, n_head: usize, n_kv_head: usize,
-        head_dim: usize, n_layer: usize, layer: usize, kv_dim: usize,
-        variant: PrefillAttentionVariant, score_capacity: usize,
+        &self,
+        q: &CudaSlice<f32>,
+        k_pool: &CudaSlice<f32>,
+        v_pool: &CudaSlice<f32>,
+        current_k: &CudaSlice<f32>,
+        current_v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        tables: &CudaSlice<i32>,
+        segments: &CudaSlice<i32>,
+        requests: usize,
+        max_chunk: usize,
+        table_stride: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        n_layer: usize,
+        layer: usize,
+        kv_dim: usize,
+        variant: PrefillAttentionVariant,
+        score_capacity: usize,
     ) -> Result<()> {
         let index = variant.kernel_index()?;
         let (query_tile, hybrid, cache_page_table, function) = match variant {
-            PrefillAttentionVariant::Tiled { query_tile, hybrid, cache_page_table, .. } =>
-                (query_tile, hybrid, cache_page_table, &self.attention_prefill_tiled[index]),
-            PrefillAttentionVariant::Exact { query_tile, hybrid, cache_page_table, .. } =>
-                (query_tile, hybrid, cache_page_table, &self.attention_prefill_exact[index]),
+            PrefillAttentionVariant::Tiled {
+                query_tile,
+                hybrid,
+                cache_page_table,
+                ..
+            } => (
+                query_tile,
+                hybrid,
+                cache_page_table,
+                &self.attention_prefill_tiled[index],
+            ),
+            PrefillAttentionVariant::Exact {
+                query_tile,
+                hybrid,
+                cache_page_table,
+                ..
+            } => (
+                query_tile,
+                hybrid,
+                cache_page_table,
+                &self.attention_prefill_exact[index],
+            ),
             PrefillAttentionVariant::Reference => unreachable!("kernel_index rejected reference"),
         };
         if !supports_tiled_geometry(n_head, n_kv_head, head_dim)
             || n_kv_head.checked_mul(head_dim) != Some(kv_dim)
         {
-            anyhow::bail!("tiled prefill attention requires head_dim=64 and four query heads per KV head");
+            anyhow::bail!(
+                "tiled prefill attention requires head_dim=64 and four query heads per KV head"
+            );
         }
-        if requests == 0 || max_chunk == 0 || table_stride == 0 || n_layer == 0 || layer >= n_layer
-            || requests > u16::MAX as usize || max_chunk.div_ceil(query_tile) > u16::MAX as usize
+        if requests == 0
+            || max_chunk == 0
+            || table_stride == 0
+            || n_layer == 0
+            || layer >= n_layer
+            || requests > u16::MAX as usize
+            || max_chunk.div_ceil(query_tile) > u16::MAX as usize
             || [n_head, n_kv_head, n_layer, kv_dim, table_stride, max_chunk]
-                .iter().any(|&n| n > i32::MAX as usize)
+                .iter()
+                .any(|&n| n > i32::MAX as usize)
             || requests.checked_mul(4).is_none_or(|n| n > segments.len())
-            || requests.checked_mul(table_stride).is_none_or(|n| n > tables.len())
-            || n_head.checked_mul(head_dim).and_then(|d| d.checked_mul(max_chunk))
+            || requests
+                .checked_mul(table_stride)
+                .is_none_or(|n| n > tables.len())
+            || n_head
+                .checked_mul(head_dim)
+                .and_then(|d| d.checked_mul(max_chunk))
                 .is_none_or(|n| n > q.len() || n > out.len())
         {
             anyhow::bail!("invalid tiled attention launch dimensions or metadata capacity");
         }
-        if hybrid && max_chunk.checked_mul(kv_dim)
-            .is_none_or(|n| n > current_k.len() || n > current_v.len())
+        if hybrid
+            && max_chunk
+                .checked_mul(kv_dim)
+                .is_none_or(|n| n > current_k.len() || n > current_v.len())
         {
             anyhow::bail!("hybrid attention current K/V scratch is too small");
         }
         let exact = matches!(variant, PrefillAttentionVariant::Exact { .. });
-        if exact && (score_capacity < max_chunk || score_capacity > i32::MAX as usize
-            || table_stride.checked_mul(16).is_none_or(|n| score_capacity > n))
+        if exact
+            && (score_capacity < max_chunk
+                || score_capacity > i32::MAX as usize
+                || table_stride
+                    .checked_mul(16)
+                    .is_none_or(|n| score_capacity > n))
         {
-            anyhow::bail!("exact attention score capacity must cover max_chunk and fit the page table");
+            anyhow::bail!(
+                "exact attention score capacity must cover max_chunk and fit the page table"
+            );
         }
         let shared = variant.dynamic_shared_bytes(score_capacity, table_stride);
         let cfg = LaunchConfig {
-            grid_dim: (n_kv_head as u32, max_chunk.div_ceil(query_tile) as u32, requests as u32),
+            grid_dim: (
+                n_kv_head as u32,
+                max_chunk.div_ceil(query_tile) as u32,
+                requests as u32,
+            ),
             block_dim: (variant.threads_per_block(), 1, 1),
             shared_mem_bytes: u32::try_from(shared)?,
         };
-        let (ts, nh, nl, l, kd, hy, ct) = (table_stride as i32, n_head as i32,
-            n_layer as i32, layer as i32, kv_dim as i32, i32::from(hybrid), i32::from(cache_page_table));
+        let (ts, nh, nl, l, kd, hy, ct) = (
+            table_stride as i32,
+            n_head as i32,
+            n_layer as i32,
+            layer as i32,
+            kv_dim as i32,
+            i32::from(hybrid),
+            i32::from(cache_page_table),
+        );
         let mut b = self.stream.launch_builder(function);
-        b.arg(q).arg(k_pool).arg(v_pool).arg(current_k).arg(current_v).arg(out)
-            .arg(tables).arg(segments).arg(&ts).arg(&nh).arg(&nl).arg(&l).arg(&kd).arg(&hy).arg(&ct);
+        b.arg(q)
+            .arg(k_pool)
+            .arg(v_pool)
+            .arg(current_k)
+            .arg(current_v)
+            .arg(out)
+            .arg(tables)
+            .arg(segments)
+            .arg(&ts)
+            .arg(&nh)
+            .arg(&nl)
+            .arg(&l)
+            .arg(&kd)
+            .arg(&hy)
+            .arg(&ct);
         let score_stride = score_capacity as i32;
-        if exact { b.arg(&score_stride); }
+        if exact {
+            b.arg(&score_stride);
+        }
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1415,13 +1754,20 @@ impl Gpu {
     /// for this launch. This performs no timed kernel work and is benchmark
     /// diagnostics only; it does not report achieved occupancy or bandwidth.
     pub fn attention_kernel_resources(
-        &self, variant: PrefillAttentionVariant, max_seq: usize, table_stride: usize,
+        &self,
+        variant: PrefillAttentionVariant,
+        max_seq: usize,
+        table_stride: usize,
     ) -> Result<PrefillAttentionResources> {
         variant.validate()?;
         let function = match variant {
             PrefillAttentionVariant::Reference => &self.attention_prefill_packed,
-            PrefillAttentionVariant::Tiled { .. } => &self.attention_prefill_tiled[variant.kernel_index()?],
-            PrefillAttentionVariant::Exact { .. } => &self.attention_prefill_exact[variant.kernel_index()?],
+            PrefillAttentionVariant::Tiled { .. } => {
+                &self.attention_prefill_tiled[variant.kernel_index()?]
+            }
+            PrefillAttentionVariant::Exact { .. } => {
+                &self.attention_prefill_exact[variant.kernel_index()?]
+            }
         };
         let threads_per_block = variant.threads_per_block();
         let dynamic_shared_bytes = variant.dynamic_shared_bytes(max_seq, table_stride);
@@ -1429,36 +1775,72 @@ impl Gpu {
         let registers_per_thread = cu(function.num_regs())?;
         let static_shared_bytes = cu(function.shared_size_bytes())?;
         let local_bytes_per_thread = cu(function.local_size_bytes())?;
-        let max_active_blocks_per_sm = cu(function.occupancy_max_active_blocks_per_multiprocessor(
-            threads_per_block, dynamic_shared_bytes, None))?;
+        let max_active_blocks_per_sm = cu(function
+            .occupancy_max_active_blocks_per_multiprocessor(
+                threads_per_block,
+                dynamic_shared_bytes,
+                None,
+            ))?;
         use cudarc::driver::sys::CUdevice_attribute_enum as Attr;
-        let max_threads = cu(self.ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))?;
+        let max_threads = cu(self
+            .ctx
+            .attribute(Attr::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))?;
         Ok(PrefillAttentionResources {
-            threads_per_block, registers_per_thread, static_shared_bytes,
-            dynamic_shared_bytes, local_bytes_per_thread, max_active_blocks_per_sm,
-            estimated_occupancy: f64::from(max_active_blocks_per_sm * threads_per_block) / f64::from(max_threads),
+            threads_per_block,
+            registers_per_thread,
+            static_shared_bytes,
+            dynamic_shared_bytes,
+            local_bytes_per_thread,
+            max_active_blocks_per_sm,
+            estimated_occupancy: f64::from(max_active_blocks_per_sm * threads_per_block)
+                / f64::from(max_threads),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn cache_store_packed_paged(
-        &self, src: &CudaSlice<f32>, pool: &mut CudaSlice<f32>, tables: &CudaSlice<i32>,
-        owners: &CudaSlice<i32>, positions: &CudaSlice<i32>, rows: usize,
-        kv_dim: usize, table_stride: usize, n_layer: usize, layer: usize,
+        &self,
+        src: &CudaSlice<f32>,
+        pool: &mut CudaSlice<f32>,
+        tables: &CudaSlice<i32>,
+        owners: &CudaSlice<i32>,
+        positions: &CudaSlice<i32>,
+        rows: usize,
+        kv_dim: usize,
+        table_stride: usize,
+        n_layer: usize,
+        layer: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((rows * kv_dim) as u32);
-        let (r, kd, ts, nl, l) = (rows as i32, kv_dim as i32, table_stride as i32,
-            n_layer as i32, layer as i32);
+        let (r, kd, ts, nl, l) = (
+            rows as i32,
+            kv_dim as i32,
+            table_stride as i32,
+            n_layer as i32,
+            layer as i32,
+        );
         let mut b = self.stream.launch_builder(&self.cache_store_packed_paged);
-        b.arg(src).arg(pool).arg(tables).arg(owners).arg(positions)
-            .arg(&r).arg(&kd).arg(&ts).arg(&nl).arg(&l);
+        b.arg(src)
+            .arg(pool)
+            .arg(tables)
+            .arg(owners)
+            .arg(positions)
+            .arg(&r)
+            .arg(&kd)
+            .arg(&ts)
+            .arg(&nl)
+            .arg(&l);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
 
     pub fn gather_prefill_rows(
-        &self, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>, indices: &CudaSlice<i32>,
-        rows: usize, width: usize,
+        &self,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        indices: &CudaSlice<i32>,
+        rows: usize,
+        width: usize,
     ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems((rows * width) as u32);
         let (r, w) = (rows as i32, width as i32);
@@ -1472,8 +1854,13 @@ impl Gpu {
     /// WMMA here would make half rounding depend on unrelated final rows.
     #[allow(clippy::too_many_arguments)]
     pub fn project_final_rows(
-        &self, w: &Proj2, x: &CudaSlice<f32>, y: &mut CudaSlice<f32>,
-        rows: usize, cols: usize, batch: usize,
+        &self,
+        w: &Proj2,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        batch: usize,
     ) -> Result<()> {
         if let Proj2::Int8(data, scales) = w {
             if cols % 4 == 0 && cols / 4 < REDUCE_THREADS as usize {
@@ -1482,7 +1869,8 @@ impl Gpu {
         }
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, batch as u32, 1),
-            block_dim: (REDUCE_THREADS, 1, 1), shared_mem_bytes: 0,
+            block_dim: (REDUCE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
         };
         let (r, c) = (rows as i32, cols as i32);
         match w {
@@ -1532,8 +1920,15 @@ impl Gpu {
             pos_offset as i32,
         );
         let mut b = self.stream.launch_builder(&self.attention_prefill);
-        b.arg(q).arg(&k).arg(&v).arg(out)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(&cs).arg(&po);
+        b.arg(q)
+            .arg(&k)
+            .arg(&v)
+            .arg(out)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(&cs)
+            .arg(&po);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
@@ -1567,8 +1962,8 @@ impl Gpu {
         let v = v_cache.slice(layer_base..);
 
         // scores[chunk] followed by one partial vector per warp.
-        let shared = (ATTN_CHUNK + (REDUCE_THREADS as usize / 32) * head_dim)
-            * std::mem::size_of::<f32>();
+        let shared =
+            (ATTN_CHUNK + (REDUCE_THREADS as usize / 32) * head_dim) * std::mem::size_of::<f32>();
         let cfg = LaunchConfig {
             grid_dim: (n_head as u32, n_chunks as u32, 1),
             block_dim: (REDUCE_THREADS, 1, 1),
@@ -1585,8 +1980,19 @@ impl Gpu {
         let mut b = self.stream.launch_builder(&self.attention_partial);
         // Reborrow: the partials are written here and read by the combine
         // below, so the mutable references must survive both launches.
-        b.arg(q).arg(&k).arg(&v).arg(&mut *partial_o).arg(&mut *partial_m).arg(&mut *partial_l)
-            .arg(&nh).arg(&nkv).arg(&hd).arg(params).arg(&si).arg(&cs).arg(&ch);
+        b.arg(q)
+            .arg(&k)
+            .arg(&v)
+            .arg(&mut *partial_o)
+            .arg(&mut *partial_m)
+            .arg(&mut *partial_l)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(params)
+            .arg(&si)
+            .arg(&cs)
+            .arg(&ch);
         unsafe { cu(b.launch(cfg))? };
 
         let combine_cfg = LaunchConfig {
@@ -1596,8 +2002,13 @@ impl Gpu {
         };
         let nc = n_chunks as i32;
         let mut b = self.stream.launch_builder(&self.attention_combine);
-        b.arg(&*partial_o).arg(&*partial_m).arg(&*partial_l).arg(out)
-            .arg(&nh).arg(&hd).arg(&nc);
+        b.arg(&*partial_o)
+            .arg(&*partial_m)
+            .arg(&*partial_l)
+            .arg(out)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&nc);
         unsafe { cu(b.launch(combine_cfg))? };
         Ok(())
     }
@@ -1628,7 +2039,14 @@ impl Gpu {
                     shared_mem_bytes: 0,
                 };
                 let mut b = self.stream.launch_builder(&self.mlp_swiglu_i8);
-                b.arg(*gw).arg(*gs).arg(*uw).arg(*us).arg(x).arg(out).arg(&r).arg(&c);
+                b.arg(*gw)
+                    .arg(*gs)
+                    .arg(*uw)
+                    .arg(*us)
+                    .arg(x)
+                    .arg(out)
+                    .arg(&r)
+                    .arg(&c);
                 unsafe { cu(b.launch(cfg))? };
             }
             (Proj2::F32(gw), Proj2::F32(uw)) => {
@@ -1688,12 +2106,25 @@ impl Gpu {
             PARAM_ZERO as i32,
         );
         let mut b = self.stream.launch_builder(&self.rope);
-        b.arg(v).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&params).arg(&pi).arg(&base).arg(&idx);
+        b.arg(v)
+            .arg(cos)
+            .arg(sin)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&params)
+            .arg(&pi)
+            .arg(&base)
+            .arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }
 
-    pub fn add_inplace(&self, dst: &mut CudaSlice<f32>, src: &CudaSlice<f32>, n: usize) -> Result<()> {
+    pub fn add_inplace(
+        &self,
+        dst: &mut CudaSlice<f32>,
+        src: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<()> {
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let n_i = n as i32;
         let mut b = self.stream.launch_builder(&self.add_inplace);
@@ -1780,7 +2211,9 @@ pub fn validate() -> Result<()> {
     println!();
 
     let (rows, cols) = (2048usize, 768usize);
-    let w: Vec<f32> = (0..rows * cols).map(|i| ((i % 97) as f32 - 48.0) / 64.0).collect();
+    let w: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 64.0)
+        .collect();
     let x: Vec<f32> = (0..cols).map(|i| ((i % 31) as f32 - 15.0) / 16.0).collect();
 
     let mut cpu_y = vec![0.0f32; rows];
@@ -1792,7 +2225,10 @@ pub fn validate() -> Result<()> {
     gpu.gemv(&d_w, &d_x, &mut d_y, rows, cols)?;
     gpu.sync()?;
     let gpu_y = gpu.to_host(&d_y)?;
-    println!("gemv        max rel diff {:.3e}", max_rel_diff(&cpu_y, &gpu_y));
+    println!(
+        "gemv        max rel diff {:.3e}",
+        max_rel_diff(&cpu_y, &gpu_y)
+    );
 
     // rmsnorm
     let weight: Vec<f32> = (0..cols).map(|i| 1.0 + (i % 7) as f32 / 100.0).collect();
@@ -1803,7 +2239,10 @@ pub fn validate() -> Result<()> {
     let mut d_n = gpu.alloc(cols)?;
     gpu.rmsnorm(&d_x, &d_weight, &mut d_n, cols, 1e-6)?;
     gpu.sync()?;
-    println!("rmsnorm     max rel diff {:.3e}", max_rel_diff(&cpu_n, &gpu.to_host(&d_n)?));
+    println!(
+        "rmsnorm     max rel diff {:.3e}",
+        max_rel_diff(&cpu_n, &gpu.to_host(&d_n)?)
+    );
 
     // softmax
     let scores: Vec<f32> = (0..1024).map(|i| ((i % 53) as f32 - 26.0) / 8.0).collect();
@@ -1812,7 +2251,10 @@ pub fn validate() -> Result<()> {
     let mut d_s = gpu.to_device(&scores)?;
     gpu.softmax(&mut d_s, scores.len())?;
     gpu.sync()?;
-    println!("softmax     max rel diff {:.3e}", max_rel_diff(&cpu_s, &gpu.to_host(&d_s)?));
+    println!(
+        "softmax     max rel diff {:.3e}",
+        max_rel_diff(&cpu_s, &gpu.to_host(&d_s)?)
+    );
 
     // silu_mul
     let gate: Vec<f32> = (0..2048).map(|i| ((i % 41) as f32 - 20.0) / 10.0).collect();
@@ -1825,7 +2267,10 @@ pub fn validate() -> Result<()> {
     let d_u = gpu.to_device(&up)?;
     gpu.silu_mul(&mut d_g, &d_u, gate.len())?;
     gpu.sync()?;
-    println!("silu_mul    max rel diff {:.3e}", max_rel_diff(&cpu_g, &gpu.to_host(&d_g)?));
+    println!(
+        "silu_mul    max rel diff {:.3e}",
+        max_rel_diff(&cpu_g, &gpu.to_host(&d_g)?)
+    );
 
     // rope
     let (n_heads, head_dim, pos) = (12usize, 64usize, 37usize);
@@ -1842,7 +2287,10 @@ pub fn validate() -> Result<()> {
     let mut d_v = gpu.to_device(&vec_in)?;
     gpu.rope(&mut d_v, &d_cos, &d_sin, n_heads, head_dim, pos)?;
     gpu.sync()?;
-    println!("rope        max rel diff {:.3e}", max_rel_diff(&cpu_v, &gpu.to_host(&d_v)?));
+    println!(
+        "rope        max rel diff {:.3e}",
+        max_rel_diff(&cpu_v, &gpu.to_host(&d_v)?)
+    );
 
     // argmax, against the exact host rule the scheduler used before.
     //
@@ -1916,7 +2364,10 @@ pub fn validate() -> Result<()> {
     let got = gpu.to_host_i32_n(&d_ids, rows)?;
 
     println!();
-    println!("{:<14} {:>10} {:>10} {:>8}", "argmax case", "host", "device", "match");
+    println!(
+        "{:<14} {:>10} {:>10} {:>8}",
+        "argmax case", "host", "device", "match"
+    );
     let mut argmax_bad = 0usize;
     for (i, (name, v)) in cases.iter().enumerate() {
         let want = host_argmax(v);
@@ -1924,7 +2375,11 @@ pub fn validate() -> Result<()> {
         if !ok {
             argmax_bad += 1;
         }
-        println!("{name:<14} {want:>10} {:>10} {:>8}", got[i], if ok { "ok" } else { "MISMATCH" });
+        println!(
+            "{name:<14} {want:>10} {:>10} {:>8}",
+            got[i],
+            if ok { "ok" } else { "MISMATCH" }
+        );
     }
     {
         let want = host_argmax(&all_nan);
@@ -1932,8 +2387,12 @@ pub fn validate() -> Result<()> {
         if !ok {
             argmax_bad += 1;
         }
-        println!("{:<14} {want:>10} {:>10} {:>8}", "all NaN", got[rows - 1],
-                 if ok { "ok" } else { "MISMATCH" });
+        println!(
+            "{:<14} {want:>10} {:>10} {:>8}",
+            "all NaN",
+            got[rows - 1],
+            if ok { "ok" } else { "MISMATCH" }
+        );
     }
     if argmax_bad > 0 {
         anyhow::bail!("device argmax disagreed with the host rule in {argmax_bad} case(s)");
@@ -2008,7 +2467,10 @@ pub fn validate() -> Result<()> {
     let named: Vec<(&str, &[f32])> = topk_cases
         .iter()
         .map(|(n, v)| (*n, v.as_slice()))
-        .chain([("all NaN", all_nan.as_slice()), ("NaN + inf", nan_and_inf.as_slice())])
+        .chain([
+            ("all NaN", all_nan.as_slice()),
+            ("NaN + inf", nan_and_inf.as_slice()),
+        ])
         .collect();
 
     let d_rows2 = gpu.to_device(&flat2)?;
@@ -2023,7 +2485,10 @@ pub fn validate() -> Result<()> {
         // Bit equality, not value equality: the kernel returns the logit it
         // read, so a NaN has to come back as the same NaN.
         if got.len() != want.len()
-            || !got.iter().zip(&want).all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits())
+            || !got
+                .iter()
+                .zip(&want)
+                .all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits())
         {
             return false;
         }
@@ -2048,7 +2513,9 @@ pub fn validate() -> Result<()> {
     };
     let read_row = |cv: &[f32], ci: &[i32], row: usize, k: usize| -> Vec<(usize, f32)> {
         let base = row * TOPK_MAX;
-        (0..k).map(|j| (ci[base + j] as usize, cv[base + j])).collect()
+        (0..k)
+            .map(|j| (ci[base + j] as usize, cv[base + j]))
+            .collect()
     };
 
     let ks = [1usize, 2, 5, 40, TOPK_MAX];
@@ -2061,7 +2528,9 @@ pub fn validate() -> Result<()> {
         let cv = gpu.to_host_n(&d_cv, topk_rows * TOPK_MAX)?;
         let ci = gpu.to_host_i32_n(&d_ci, topk_rows * TOPK_MAX)?;
         grid.push(
-            named.iter().enumerate()
+            named
+                .iter()
+                .enumerate()
                 .map(|(row, (_, v))| check(v, &read_row(&cv, &ci, row, k), k))
                 .collect(),
         );
@@ -2085,7 +2554,9 @@ pub fn validate() -> Result<()> {
     // Every row a different k in one launch, which is what a mixed batch looks
     // like -- and the case a kernel that quietly assumed a uniform k would pass
     // every test above and still be wrong in production.
-    let mixed: Vec<i32> = (0..topk_rows).map(|r| ((r * 13) % TOPK_MAX + 1) as i32).collect();
+    let mixed: Vec<i32> = (0..topk_rows)
+        .map(|r| ((r * 13) % TOPK_MAX + 1) as i32)
+        .collect();
     let d_k = gpu.to_device_i32(&mixed)?;
     gpu.topk_rows(&d_rows2, &d_k, &mut d_cv, &mut d_ci, topk_rows, vocab)?;
     gpu.sync()?;
@@ -2098,27 +2569,37 @@ pub fn validate() -> Result<()> {
             mixed_ok = false;
         }
         // Slots past k must be marked, not left holding an earlier step's row.
-        if ci[row * TOPK_MAX + k..(row + 1) * TOPK_MAX].iter().any(|&x| x != -1) {
+        if ci[row * TOPK_MAX + k..(row + 1) * TOPK_MAX]
+            .iter()
+            .any(|&x| x != -1)
+        {
             mixed_ok = false;
         }
     }
     // Rows the caller did not ask for must not be touched at all.
-    let skip: Vec<i32> = (0..topk_rows).map(|r| if r % 2 == 0 { 0 } else { 7 }).collect();
+    let skip: Vec<i32> = (0..topk_rows)
+        .map(|r| if r % 2 == 0 { 0 } else { 7 })
+        .collect();
     let d_k = gpu.to_device_i32(&skip)?;
     let sentinel = vec![-42.0f32; topk_rows * TOPK_MAX];
     let mut d_cv2 = gpu.to_device(&sentinel)?;
     gpu.topk_rows(&d_rows2, &d_k, &mut d_cv2, &mut d_ci, topk_rows, vocab)?;
     gpu.sync()?;
     let cv2 = gpu.to_host_n(&d_cv2, topk_rows * TOPK_MAX)?;
-    let skipped_untouched = (0..topk_rows)
-        .filter(|r| r % 2 == 0)
-        .all(|r| cv2[r * TOPK_MAX..(r + 1) * TOPK_MAX].iter().all(|&x| x == -42.0));
+    let skipped_untouched = (0..topk_rows).filter(|r| r % 2 == 0).all(|r| {
+        cv2[r * TOPK_MAX..(r + 1) * TOPK_MAX]
+            .iter()
+            .all(|&x| x == -42.0)
+    });
     if !mixed_ok || !skipped_untouched {
         topk_bad += 1;
     }
-    println!("{:<14}{:>8}{:>8}", "per-row k",
-             if mixed_ok { "ok" } else { "MISMATCH" },
-             if skipped_untouched { "ok" } else { "TOUCHED" });
+    println!(
+        "{:<14}{:>8}{:>8}",
+        "per-row k",
+        if mixed_ok { "ok" } else { "MISMATCH" },
+        if skipped_untouched { "ok" } else { "TOUCHED" }
+    );
 
     // Random rows, because the adversarial cases above were all chosen by
     // someone who already knew where the kernel might break.
@@ -2130,7 +2611,11 @@ pub fn validate() -> Result<()> {
             for _ in 0..vocab {
                 // Heavy-tailed, so exact ties happen often enough to matter.
                 let u = rng.next_f32();
-                flat3.push(if u < 0.15 { (u * 40.0).round() * 0.25 } else { u * 24.0 - 12.0 });
+                flat3.push(if u < 0.15 {
+                    (u * 40.0).round() * 0.25
+                } else {
+                    u * 24.0 - 12.0
+                });
             }
         }
         let d3 = gpu.to_device(&flat3)?;
@@ -2147,8 +2632,12 @@ pub fn validate() -> Result<()> {
             }
         }
     }
-    println!("{:<14}{:>8}   {} random rows", "fuzz",
-             if fuzz_bad == 0 { "ok" } else { "MISMATCH" }, 8 * topk_rows);
+    println!(
+        "{:<14}{:>8}   {} random rows",
+        "fuzz",
+        if fuzz_bad == 0 { "ok" } else { "MISMATCH" },
+        8 * topk_rows
+    );
     topk_bad += fuzz_bad;
 
     if topk_bad > 0 {
@@ -2178,8 +2667,12 @@ pub fn validate() -> Result<()> {
     // Shifting both operands positive keeps the mantissas full while making the
     // sum accumulate monotonically, so relative error means what it says.
     let (gm, gn, gk) = (64usize, 512usize, 768usize);
-    let gw: Vec<f32> = (0..gn * gk).map(|i| ((i as f32) * 0.7391).sin() * 0.4 + 0.6).collect();
-    let ga: Vec<f32> = (0..gm * gk).map(|i| ((i as f32) * 1.2113).cos() * 0.3 + 0.5).collect();
+    let gw: Vec<f32> = (0..gn * gk)
+        .map(|i| ((i as f32) * 0.7391).sin() * 0.4 + 0.6)
+        .collect();
+    let ga: Vec<f32> = (0..gm * gk)
+        .map(|i| ((i as f32) * 1.2113).cos() * 0.3 + 0.5)
+        .collect();
     let mut cpu_c = vec![0.0f32; gm * gn];
     for row in 0..gm {
         for col in 0..gn {
@@ -2201,7 +2694,10 @@ pub fn validate() -> Result<()> {
         let mut p_c = probe.alloc(gm * gn)?;
         probe.gemm(&Proj2::F32(&p_w), &p_a, &mut p_c, gm, gn, gk, false)?;
         probe.sync()?;
-        println!("{label:11} max rel diff {:.3e}", max_rel_diff(&cpu_c, &probe.to_host(&p_c)?));
+        println!(
+            "{label:11} max rel diff {:.3e}",
+            max_rel_diff(&cpu_c, &probe.to_host(&p_c)?)
+        );
     }
     let _ = (&d_gw, &d_ga);
 
@@ -2238,7 +2734,10 @@ pub fn validate() -> Result<()> {
         let mut p_c = probe.alloc(gm * gn)?;
         probe.gemm(&Proj2::Int8(&p_w, &p_s), &p_a, &mut p_c, gm, gn, gk, false)?;
         probe.sync()?;
-        println!("{label:11} max rel diff {:.3e}", max_rel_diff(&cpu_q, &probe.to_host(&p_c)?));
+        println!(
+            "{label:11} max rel diff {:.3e}",
+            max_rel_diff(&cpu_q, &probe.to_host(&p_c)?)
+        );
     }
 
     Ok(())
@@ -2330,15 +2829,26 @@ pub fn bench(rows: usize, cols: usize, iters: usize) -> Result<()> {
     let mut r_sorted = ratios.clone();
     let r_med = median(&mut r_sorted);
 
-    println!("  scalar   {s_med:6.0} GB/s   [{:.0}-{:.0}]  spread {:4.1}%",
-             s_sorted[0], s_sorted[TRIALS - 1], spread(&s_sorted));
-    println!("  float4   {v_med:6.0} GB/s   [{:.0}-{:.0}]  spread {:4.1}%",
-             v_sorted[0], v_sorted[TRIALS - 1], spread(&v_sorted));
+    println!(
+        "  scalar   {s_med:6.0} GB/s   [{:.0}-{:.0}]  spread {:4.1}%",
+        s_sorted[0],
+        s_sorted[TRIALS - 1],
+        spread(&s_sorted)
+    );
+    println!(
+        "  float4   {v_med:6.0} GB/s   [{:.0}-{:.0}]  spread {:4.1}%",
+        v_sorted[0],
+        v_sorted[TRIALS - 1],
+        spread(&v_sorted)
+    );
     println!();
 
     let r_spread = (r_sorted[TRIALS - 1] - r_sorted[0]) / r_med * 100.0;
-    println!("  paired ratio float4/scalar: {r_med:.3}   [{:.3}-{:.3}]  spread {r_spread:4.1}%",
-             r_sorted[0], r_sorted[TRIALS - 1]);
+    println!(
+        "  paired ratio float4/scalar: {r_med:.3}   [{:.3}-{:.3}]  spread {r_spread:4.1}%",
+        r_sorted[0],
+        r_sorted[TRIALS - 1]
+    );
 
     // Within a trial both kernels see the same clocks, so the ratio is the
     // trustworthy comparison even when absolute throughput drifts.
@@ -2372,11 +2882,17 @@ impl Gpu {
             block_dim: (REDUCE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let (rows_i, cols_i, base, idx) =
-            (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
+        let (rows_i, cols_i, base, idx) = (rows as i32, cols as i32, 0i32, PARAM_ZERO as i32);
         let zeros = self.zero_params()?;
         let mut b = self.stream.launch_builder(&self.gemv);
-        b.arg(w).arg(x).arg(y).arg(&rows_i).arg(&cols_i).arg(&zeros).arg(&base).arg(&idx);
+        b.arg(w)
+            .arg(x)
+            .arg(y)
+            .arg(&rows_i)
+            .arg(&cols_i)
+            .arg(&zeros)
+            .arg(&base)
+            .arg(&idx);
         unsafe { cu(b.launch(cfg))? };
         Ok(())
     }

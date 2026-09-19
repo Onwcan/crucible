@@ -33,7 +33,10 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Unreachable(e) => write!(f, "Server unavailable: {e}"),
-            ClientError::Rejected { status: 429, message } => {
+            ClientError::Rejected {
+                status: 429,
+                message,
+            } => {
                 write!(f, "Server busy: {message}")
             }
             ClientError::Rejected { status, message } => {
@@ -155,7 +158,9 @@ impl Client {
         };
 
         if !resp.status().is_success() {
-            let _ = out.send(StreamMessage::Failed(status_error(resp).await)).await;
+            let _ = out
+                .send(StreamMessage::Failed(status_error(resp).await))
+                .await;
             return;
         }
 
@@ -260,8 +265,15 @@ async fn status_error(r: reqwest::Response) -> ClientError {
 /// What the streaming task reports back to the application.
 #[derive(Debug)]
 pub enum StreamMessage {
-    Token { token_id: usize, text: String },
-    Done { finish_reason: String, tokens_generated: usize, text: String },
+    Token {
+        token_id: usize,
+        text: String,
+    },
+    Done {
+        finish_reason: String,
+        tokens_generated: usize,
+        text: String,
+    },
     Failed(ClientError),
     /// Body closed without a `done` event.
     Ended,

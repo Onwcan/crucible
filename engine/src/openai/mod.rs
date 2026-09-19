@@ -203,11 +203,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(ApiErrorEnvelope { error: self.body }),
-        )
-            .into_response()
+        (self.status, Json(ApiErrorEnvelope { error: self.body })).into_response()
     }
 }
 
@@ -249,7 +245,11 @@ pub fn new_id(prefix: &str) -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     // 96 bits of hex, the same shape upstream ids have.
-    format!("{prefix}-{:016x}{:08x}", base ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15), n as u32)
+    format!(
+        "{prefix}-{:016x}{:08x}",
+        base ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        n as u32
+    )
 }
 
 pub fn unix_now() -> i64 {
@@ -339,13 +339,14 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("chatcmpl-"), "{a}");
         assert_eq!(a.len(), "chatcmpl-".len() + 24);
-        assert!(a["chatcmpl-".len()..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(a["chatcmpl-".len()..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn many_ids_do_not_collide() {
-        let ids: std::collections::HashSet<String> =
-            (0..10_000).map(|_| new_id("cmpl")).collect();
+        let ids: std::collections::HashSet<String> = (0..10_000).map(|_| new_id("cmpl")).collect();
         assert_eq!(ids.len(), 10_000);
     }
 
@@ -358,7 +359,11 @@ mod tests {
         assert_eq!(e.body.code.as_deref(), Some("model_not_found"));
         // The message must name what is actually served, or a client that
         // guessed wrong has nothing to go on.
-        assert!(e.body.message.contains("crucible-120m"), "{}", e.body.message);
+        assert!(
+            e.body.message.contains("crucible-120m"),
+            "{}",
+            e.body.message
+        );
     }
 
     #[test]

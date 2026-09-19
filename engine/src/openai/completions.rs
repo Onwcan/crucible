@@ -67,27 +67,67 @@ fn prepare(req: &CompletionRequest, st: &AppState) -> Result<Prepared, ApiError>
         }
     };
 
-    reject_if_set(req.n, |n| *n == 1, "n",
-        "This server returns exactly one choice per request.")?;
-    reject_if_set(req.best_of, |n| *n == 1, "best_of",
-        "Generating several candidates and ranking them is not implemented.")?;
-    reject_if_set(req.echo, |v| !*v, "echo",
-        "Echoing the prompt back is not implemented.")?;
-    reject_if_set(req.suffix.as_ref(), |s| s.is_empty(), "suffix",
-        "Infilling is not implemented; this model was not trained for it.")?;
-    reject_if_set(req.top_p, |v| *v == 1.0, "top_p",
-        "Crucible samples with top-k; nucleus sampling is not implemented.")?;
-    reject_if_set(req.frequency_penalty, |v| *v == 0.0, "frequency_penalty",
-        "Repetition penalties are not implemented.")?;
-    reject_if_set(req.presence_penalty, |v| *v == 0.0, "presence_penalty",
-        "Repetition penalties are not implemented.")?;
-    reject_if_set(req.logprobs, |_| false, "logprobs",
-        "Token log probabilities are not returned by this server.")?;
-    reject_if_set(req.stop.as_ref(), |v| json_is_empty(v), "stop",
+    reject_if_set(
+        req.n,
+        |n| *n == 1,
+        "n",
+        "This server returns exactly one choice per request.",
+    )?;
+    reject_if_set(
+        req.best_of,
+        |n| *n == 1,
+        "best_of",
+        "Generating several candidates and ranking them is not implemented.",
+    )?;
+    reject_if_set(
+        req.echo,
+        |v| !*v,
+        "echo",
+        "Echoing the prompt back is not implemented.",
+    )?;
+    reject_if_set(
+        req.suffix.as_ref(),
+        |s| s.is_empty(),
+        "suffix",
+        "Infilling is not implemented; this model was not trained for it.",
+    )?;
+    reject_if_set(
+        req.top_p,
+        |v| *v == 1.0,
+        "top_p",
+        "Crucible samples with top-k; nucleus sampling is not implemented.",
+    )?;
+    reject_if_set(
+        req.frequency_penalty,
+        |v| *v == 0.0,
+        "frequency_penalty",
+        "Repetition penalties are not implemented.",
+    )?;
+    reject_if_set(
+        req.presence_penalty,
+        |v| *v == 0.0,
+        "presence_penalty",
+        "Repetition penalties are not implemented.",
+    )?;
+    reject_if_set(
+        req.logprobs,
+        |_| false,
+        "logprobs",
+        "Token log probabilities are not returned by this server.",
+    )?;
+    reject_if_set(
+        req.stop.as_ref(),
+        |v| json_is_empty(v),
+        "stop",
         "Stop sequences would have to be matched inside the scheduler across \
-         token boundaries; the server does not do that yet.")?;
-    reject_if_set(req.logit_bias.as_ref(), |v| json_is_empty(v), "logit_bias",
-        "Logit bias is not implemented.")?;
+         token boundaries; the server does not do that yet.",
+    )?;
+    reject_if_set(
+        req.logit_bias.as_ref(),
+        |v| json_is_empty(v),
+        "logit_bias",
+        "Logit bias is not implemented.",
+    )?;
 
     Ok(Prepared {
         prompt,
@@ -151,7 +191,11 @@ pub(crate) async fn completions(
         while let Some(item) = rx.recv().await {
             match item {
                 StreamItem::Token { text: t, .. } => text.push_str(&t),
-                StreamItem::Done { reason, generated: g, tail } => {
+                StreamItem::Done {
+                    reason,
+                    generated: g,
+                    tail,
+                } => {
                     text.push_str(&tail);
                     generated = g;
                     finish = finish_reason_str(reason);
@@ -226,5 +270,7 @@ pub(crate) async fn completions(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

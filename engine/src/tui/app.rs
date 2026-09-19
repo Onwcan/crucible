@@ -40,7 +40,10 @@ impl GenSettings {
     /// Header summary: what this client will actually ask for.
     pub fn summary(&self) -> String {
         if self.sample {
-            format!("temp {:.2}  top-k {}  seed {}", self.temperature, self.top_k, self.seed)
+            format!(
+                "temp {:.2}  top-k {}  seed {}",
+                self.temperature, self.top_k, self.seed
+            )
         } else {
             "greedy".into()
         }
@@ -188,7 +191,10 @@ pub enum RequestState {
 
 impl RequestState {
     pub fn is_busy(&self) -> bool {
-        matches!(self, RequestState::Submitting | RequestState::Streaming | RequestState::Cancelling)
+        matches!(
+            self,
+            RequestState::Submitting | RequestState::Streaming | RequestState::Cancelling
+        )
     }
 }
 
@@ -494,7 +500,10 @@ impl App {
     /// server notices the disconnect and reclaims the request at its next
     /// scheduler boundary, so there is no second cancellation protocol.
     pub fn begin_cancel(&mut self) -> bool {
-        if !matches!(self.request, RequestState::Streaming | RequestState::Submitting) {
+        if !matches!(
+            self.request,
+            RequestState::Streaming | RequestState::Submitting
+        ) {
             return false;
         }
         self.request = RequestState::Cancelling;
@@ -512,13 +521,25 @@ impl App {
             } else {
                 MessageState::Failed
             };
-            m.finish_reason = Some(if cancelling { "cancelled" } else { "disconnected" }.into());
+            m.finish_reason = Some(
+                if cancelling {
+                    "cancelled"
+                } else {
+                    "disconnected"
+                }
+                .into(),
+            );
             if !cancelling {
                 m.error = Some("stream disconnected".into());
             }
         }
         self.status = Some(
-            if cancelling { "Generation cancelled" } else { "Stream disconnected" }.into(),
+            if cancelling {
+                "Generation cancelled"
+            } else {
+                "Stream disconnected"
+            }
+            .into(),
         );
         self.request = RequestState::Idle;
         self.active = None;
@@ -602,10 +623,18 @@ impl App {
                 s.temperature = (s.temperature * 100.0).round() / 100.0;
             }
             SettingField::TopK => {
-                s.top_k = if up { (s.top_k + 5).min(1000) } else { s.top_k.saturating_sub(5).max(1) };
+                s.top_k = if up {
+                    (s.top_k + 5).min(1000)
+                } else {
+                    s.top_k.saturating_sub(5).max(1)
+                };
             }
             SettingField::Seed => {
-                s.seed = if up { s.seed.wrapping_add(1) } else { s.seed.wrapping_sub(1) };
+                s.seed = if up {
+                    s.seed.wrapping_add(1)
+                } else {
+                    s.seed.wrapping_sub(1)
+                };
             }
         }
     }
@@ -719,7 +748,11 @@ mod tests {
         assert_eq!(a.messages[1].text, "kept", "streamed text was discarded");
         assert_eq!(a.messages[1].state, MessageState::Failed);
         assert_eq!(a.messages[1].error.as_deref(), Some("server exploded"));
-        assert_eq!(a.request, RequestState::Idle, "app left unusable after error");
+        assert_eq!(
+            a.request,
+            RequestState::Idle,
+            "app left unusable after error"
+        );
     }
 
     #[test]
@@ -914,7 +947,10 @@ mod tests {
         assert!(s.tokens_per_second().is_none());
         s.on_token();
         assert!(s.ttft().is_some());
-        assert!(s.tokens_per_second().is_none(), "rate reported from one token");
+        assert!(
+            s.tokens_per_second().is_none(),
+            "rate reported from one token"
+        );
         s.on_token();
         assert_eq!(s.tokens, 2);
     }

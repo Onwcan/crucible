@@ -22,7 +22,6 @@ export CARGO_TARGET_DIR=engine/target
 export PYTHONDONTWRITEBYTECODE=1
 
 # quality
-# Informational until the dedicated formatting-only normalization commit:
 cargo fmt --manifest-path engine/Cargo.toml --all -- --check
 python scripts/ci_source.py
 python -m unittest discover -s tests -p 'test_ci_*.py'
@@ -56,19 +55,16 @@ hidden. It does not initialize a CUDA device, compile NVRTC kernels, execute
 GPU code, or validate SM120 correctness. No NVIDIA toolkit or model download
 belongs in the hosted lane.
 
-Formatting is currently informational and never rewrites source in CI. To format
-intentional Rust edits locally, run
-`cargo fmt --manifest-path engine/Cargo.toml --all`. The initial milestone
-audit found formatting drift in 27 existing Rust files on the committed
-baseline. The maintainer chose to preserve runtime-source scope and defer
-normalization to a separate formatting-only commit. CI still runs the full check,
-shows the failure and emits a warning; its step explicitly permits failure so
-known debt does not keep `quality` red. This is not a passing mandatory gate.
-After the separate normalization commit is verified, remove that step's
-`continue-on-error` and its warning step to make formatting blocking.
-Validation status is recorded in the [CI report](docs/ci-results.md).
+The Rust source is rustfmt-clean, and formatting is a blocking hosted CI gate.
+Before submitting changes, run
+`cargo fmt --manifest-path engine/Cargo.toml --all -- --check`.
+To format intentional Rust edits locally, run
+`cargo fmt --manifest-path engine/Cargo.toml --all`; CI only checks and never
+rewrites source. The [formatting report](docs/rustfmt-results.md) records the
+normalization and validation, while the [CI report](docs/ci-results.md) preserves
+the earlier milestone's historical formatting-debt policy.
 Strict Clippy `-D warnings`
-also fails on existing style/performance warning debt. The gate therefore
+still fails on existing style/performance warning debt. The gate therefore
 denies `clippy::correctness` and `clippy::suspicious`, leaving other warnings
 visible without adding global allow attributes or changing inference logic.
 

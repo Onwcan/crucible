@@ -301,7 +301,10 @@ mod tests {
         assert_eq!(s.n_pages(), 3);
 
         assert_eq!(s.translate(0).unwrap(), (s.pages()[0], 0));
-        assert_eq!(s.translate(PAGE_TOKENS - 1).unwrap(), (s.pages()[0], PAGE_TOKENS - 1));
+        assert_eq!(
+            s.translate(PAGE_TOKENS - 1).unwrap(),
+            (s.pages()[0], PAGE_TOKENS - 1)
+        );
         assert_eq!(s.translate(PAGE_TOKENS).unwrap(), (s.pages()[1], 0));
         assert_eq!(s.translate(PAGE_TOKENS + 1).unwrap(), (s.pages()[1], 1));
         assert_eq!(s.translate(2 * PAGE_TOKENS).unwrap(), (s.pages()[2], 0));
@@ -334,7 +337,11 @@ mod tests {
         all.extend(c.pages());
         let unique: std::collections::HashSet<PageId> = all.iter().copied().collect();
         assert_eq!(all.len(), 9);
-        assert_eq!(unique.len(), 9, "a physical page was handed to two sequences");
+        assert_eq!(
+            unique.len(),
+            9,
+            "a physical page was handed to two sequences"
+        );
     }
 
     #[test]
@@ -400,7 +407,10 @@ mod tests {
         let mut s = SequencePages::new();
         s.grow(&mut pl, 40).unwrap();
         s.release(&mut pl).unwrap();
-        assert!(s.translate(0).is_err(), "released sequence still translates");
+        assert!(
+            s.translate(0).is_err(),
+            "released sequence still translates"
+        );
         s.grow(&mut pl, 3).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s.n_pages(), 1);
@@ -430,13 +440,20 @@ mod tests {
         assert_eq!(pl.free_pages(), 0);
 
         let mut waiting = SequencePages::new();
-        assert!(waiting.grow(&mut pl, PAGE_TOKENS).is_err(), "admitted with no pages");
+        assert!(
+            waiting.grow(&mut pl, PAGE_TOKENS).is_err(),
+            "admitted with no pages"
+        );
 
         a.release(&mut pl).unwrap();
         waiting.grow(&mut pl, PAGE_TOKENS * 2).unwrap();
         assert_eq!(pl.free_pages(), 0);
         assert_eq!(waiting.n_pages(), 2);
-        assert_eq!(b.len(), PAGE_TOKENS * 2, "retirement disturbed a live sequence");
+        assert_eq!(
+            b.len(),
+            PAGE_TOKENS * 2,
+            "retirement disturbed a live sequence"
+        );
     }
 
     #[test]

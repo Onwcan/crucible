@@ -137,7 +137,10 @@ pub fn conversation(
 /// A free function rather than a macro used inside the `stream!` block:
 /// `async_stream` is a proc macro that rewrites `yield` where it can see it,
 /// and a `yield` nested inside a `macro_rules!` body is not somewhere it can.
-fn sse(name: &'static str, value: &impl serde::Serialize) -> Result<Event, std::convert::Infallible> {
+fn sse(
+    name: &'static str,
+    value: &impl serde::Serialize,
+) -> Result<Event, std::convert::Infallible> {
     Ok(Event::default()
         .event(name)
         .data(serde_json::to_string(value).unwrap_or_default()))
@@ -207,24 +210,47 @@ fn prepare(req: &MessagesRequest, st: &AppState) -> Result<Prepared, ApiError> {
         }
     }
 
-    refuse_if_set(req.stop_sequences.as_ref().map(|s| serde_json::json!(s)).as_ref(),
+    refuse_if_set(
+        req.stop_sequences
+            .as_ref()
+            .map(|s| serde_json::json!(s))
+            .as_ref(),
         "stop_sequences",
         "stop sequences are not implemented. Matching them would have to happen \
          inside the scheduler across token boundaries; generating past the \
          sequence and trimming afterwards would leave the KV cache and token \
-         accounting describing text you never received.")?;
-    refuse_if_set(req.tools.as_ref(), "tools",
-        "tool use is not implemented. This model has no tool-calling training.")?;
-    refuse_if_set(req.tool_choice.as_ref(), "tool_choice",
-        "tool use is not implemented.")?;
-    refuse_if_set(req.thinking.as_ref(), "thinking",
-        "extended thinking is not implemented. This is not a reasoning model.")?;
-    refuse_if_set(req.output_config.as_ref(), "output_config",
-        "structured output and effort levels are not implemented.")?;
-    refuse_if_set(req.container.as_ref(), "container",
-        "code execution containers are not implemented.")?;
-    refuse_if_set(req.cache_control.as_ref(), "cache_control",
-        "prompt caching is not implemented; this server has no prompt cache.")?;
+         accounting describing text you never received.",
+    )?;
+    refuse_if_set(
+        req.tools.as_ref(),
+        "tools",
+        "tool use is not implemented. This model has no tool-calling training.",
+    )?;
+    refuse_if_set(
+        req.tool_choice.as_ref(),
+        "tool_choice",
+        "tool use is not implemented.",
+    )?;
+    refuse_if_set(
+        req.thinking.as_ref(),
+        "thinking",
+        "extended thinking is not implemented. This is not a reasoning model.",
+    )?;
+    refuse_if_set(
+        req.output_config.as_ref(),
+        "output_config",
+        "structured output and effort levels are not implemented.",
+    )?;
+    refuse_if_set(
+        req.container.as_ref(),
+        "container",
+        "code execution containers are not implemented.",
+    )?;
+    refuse_if_set(
+        req.cache_control.as_ref(),
+        "cache_control",
+        "prompt caching is not implemented; this server has no prompt cache.",
+    )?;
 
     let messages = req
         .messages
@@ -245,10 +271,9 @@ fn prepare(req: &MessagesRequest, st: &AppState) -> Result<Prepared, ApiError> {
 fn with_request_id(id: &str, response: Response) -> Response {
     let mut response = response;
     if let Ok(v) = axum::http::HeaderValue::from_str(id) {
-        response.headers_mut().insert(
-            axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
-            v,
-        );
+        response
+            .headers_mut()
+            .insert(axum::http::HeaderName::from_static(REQUEST_ID_HEADER), v);
     }
     response
 }
@@ -300,7 +325,11 @@ pub(crate) async fn messages(
         while let Some(item) = rx.recv().await {
             match item {
                 StreamItem::Token { text: t, .. } => text.push_str(&t),
-                StreamItem::Done { reason, generated, tail } => {
+                StreamItem::Done {
+                    reason,
+                    generated,
+                    tail,
+                } => {
                     text.push_str(&tail);
                     output_tokens = generated;
                     stop = stop_reason(reason);
@@ -415,7 +444,9 @@ pub(crate) async fn messages(
 
     with_request_id(
         &request_id,
-        Sse::new(stream).keep_alive(KeepAlive::default()).into_response(),
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response(),
     )
 }
 
@@ -453,7 +484,11 @@ pub(crate) async fn count_tokens(
     }
     if let Err(e) = refuse_if_set(req.tools.as_ref(), "tools", "tool use is not implemented.")
         .and_then(|_| {
-            refuse_if_set(req.tool_choice.as_ref(), "tool_choice", "tool use is not implemented.")
+            refuse_if_set(
+                req.tool_choice.as_ref(),
+                "tool_choice",
+                "tool use is not implemented.",
+            )
         })
         .and_then(|_| {
             refuse_if_set(
@@ -518,7 +553,11 @@ mod tests {
         // must not be able to tell which client asked.
         let anthropic = prompt_of(
             Some(SystemField::Text("be terse".into())),
-            &[msg("user", "hi"), msg("assistant", "hello"), msg("user", "again")],
+            &[
+                msg("user", "hi"),
+                msg("assistant", "hello"),
+                msg("user", "again"),
+            ],
         );
         let openai = chat_template::serialize(&[
             Turn::new(Role::System, "be terse"),
@@ -532,8 +571,14 @@ mod tests {
     #[test]
     fn system_blocks_are_concatenated_like_a_string() {
         let blocks = SystemField::Blocks(vec![
-            super::super::types::ContentBlockIn { kind: "text".into(), text: Some("a".into()) },
-            super::super::types::ContentBlockIn { kind: "text".into(), text: Some("b".into()) },
+            super::super::types::ContentBlockIn {
+                kind: "text".into(),
+                text: Some("a".into()),
+            },
+            super::super::types::ContentBlockIn {
+                kind: "text".into(),
+                text: Some("b".into()),
+            },
         ]);
         assert_eq!(
             prompt_of(Some(blocks), &[msg("user", "hi")]),
@@ -576,7 +621,10 @@ mod tests {
         let m = InMessage {
             role: "user".into(),
             content: Some(MessageContent::Blocks(vec![
-                super::super::types::ContentBlockIn { kind: "image".into(), text: None },
+                super::super::types::ContentBlockIn {
+                    kind: "image".into(),
+                    text: None,
+                },
             ])),
         };
         let e = conversation(None, &[m]).unwrap_err();
