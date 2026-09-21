@@ -118,11 +118,11 @@ impl Client {
 
     /// Open a generation stream, forwarding decoded events into `out`.
     ///
-    /// Runs until the stream ends, the server sends `done`, or the returned
-    /// task is aborted. Aborting drops the HTTP response, which closes the
+    /// Runs until the stream ends, the server sends `done`, or this future is
+    /// dropped. The future owns the HTTP response, so dropping it closes the
     /// connection; the server sees the disconnect and cancels the request at
-    /// its next scheduler boundary. That is the entire cancellation path --
-    /// there is deliberately no second protocol for it.
+    /// its next scheduler boundary. There is deliberately no second protocol
+    /// for cancellation.
     ///
     /// No timeout on the stream itself. A queued request behind fifteen others
     /// can legitimately wait, and killing it on a fixed deadline would make the
@@ -134,8 +134,8 @@ impl Client {
         sampling: Option<(f32, usize, u64)>,
         out: mpsc::Sender<StreamMessage>,
     ) {
-        // None sends no sampling fields at all, so the request is byte-for-byte
-        // what this client sent before sampling existed.
+        // None serializes the optional sampling fields as null, which the
+        // server interprets as greedy sampling.
         let req = GenerateRequest {
             prompt,
             max_tokens,
@@ -164,7 +164,7 @@ impl Client {
             return;
         }
 
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
@@ -176,15 +176,26 @@ impl Client {
                     return;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
-            // Events are separated by a blank line. Anything after the last
-            // separator is a partial event and stays buffered.
-            while let Some(idx) = find_separator(&buf) {
-                let (block, rest) = buf.split_at(idx.0);
-                let block = block.to_string();
-                buf = rest[idx.1..].to_string();
-                match parse_sse_block(&block) {
+            // Transport chunks may split UTF-8 as well as SSE framing. Decode
+            // only complete event blocks, retaining partial bytes verbatim.
+            let mut consumed = 0;
+            while let Some((block_len, separator_len)) = find_separator(&buf[consumed..]) {
+                let end = consumed + block_len;
+                let block = match std::str::from_utf8(&buf[consumed..end]) {
+                    Ok(block) => block,
+                    Err(_) => {
+                        let _ = out
+                            .send(StreamMessage::Failed(ClientError::Protocol(
+                                "SSE event contains invalid UTF-8".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                consumed = end + separator_len;
+                match parse_sse_block(block) {
                     Ok(Some(SseEvent::Token { token_id, text })) => {
                         if out
                             .send(StreamMessage::Token { token_id, text })
@@ -225,6 +236,9 @@ impl Client {
                     }
                 }
             }
+            // Compact once per chunk rather than copying the remaining bytes
+            // after every event. No consumed data survives into the next read.
+            buf.drain(..consumed);
         }
 
         // Body ended without `done`: a cancellation or a dropped connection.
@@ -236,9 +250,12 @@ impl Client {
 ///
 /// Returns (block length, separator length). Handles both `\n\n` and `\r\n\r\n`
 /// so a proxy that rewrites line endings cannot stall the stream.
-fn find_separator(s: &str) -> Option<(usize, usize)> {
-    let lf = s.find("\n\n").map(|i| (i, 2));
-    let crlf = s.find("\r\n\r\n").map(|i| (i, 4));
+fn find_separator(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let crlf = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4));
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
         (Some(a), None) => Some(a),
@@ -285,18 +302,37 @@ mod tests {
 
     #[test]
     fn separator_detection_handles_both_line_endings() {
-        assert_eq!(find_separator("a\n\nb"), Some((1, 2)));
-        assert_eq!(find_separator("a\r\n\r\nb"), Some((1, 4)));
-        assert_eq!(find_separator("no separator yet"), None);
-        // A partial event must not be consumed.
-        assert_eq!(find_separator("event: token\ndata: {"), None);
+        assert_eq!(find_separator(b"a\n\nb"), Some((1, 2)));
+        assert_eq!(find_separator(b"a\r\n\r\nb"), Some((1, 4)));
+        assert_eq!(find_separator(b"no separator yet"), None);
+        // Partial separators and individual line endings are not blank lines.
+        for partial in [
+            b"".as_slice(),
+            b"a\r",
+            b"a\r\n",
+            b"a\r\n\r",
+            b"a\n",
+            b"event: token\ndata: {",
+        ] {
+            assert_eq!(find_separator(partial), None, "{partial:?}");
+        }
     }
 
     #[test]
     fn separator_prefers_whichever_terminator_comes_first() {
-        // A block ending in \n\n followed later by \r\n\r\n.
-        let s = "one\n\ntwo\r\n\r\n";
-        assert_eq!(find_separator(s), Some((3, 2)));
+        for bytes in [
+            b"one\n\ntwo\r\n\r\nthree\n\n".as_slice(),
+            b"one\r\n\r\ntwo\n\nthree\r\n\r\n",
+        ] {
+            let mut remaining = bytes;
+            for expected in [b"one".as_slice(), b"two", b"three"] {
+                let (block_len, separator_len) = find_separator(remaining).unwrap();
+                assert_eq!(&remaining[..block_len], expected);
+                remaining = &remaining[block_len + separator_len..];
+            }
+            assert!(remaining.is_empty());
+            assert_eq!(find_separator(remaining), None);
+        }
     }
 
     #[test]

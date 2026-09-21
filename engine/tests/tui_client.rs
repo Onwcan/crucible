@@ -21,6 +21,8 @@ enum Reply {
     Once(String),
     /// Write each piece with a delay before it, then close.
     Pieces(Vec<(Duration, String)>),
+    /// Encode every byte as its own HTTP body chunk, including partial UTF-8.
+    ByteChunks(Vec<u8>),
     /// Accept and close without writing anything.
     Hangup,
 }
@@ -61,6 +63,24 @@ where
                         let _ = sock.flush().await;
                     }
                 }
+                Reply::ByteChunks(body) => {
+                    sock.set_nodelay(true).unwrap();
+                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    for byte in body {
+                        if sock
+                            .write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n'])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        // Give the client a chance to consume each HTTP frame.
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                }
                 Reply::Hangup => {}
             }
             let _ = sock.shutdown().await;
@@ -87,12 +107,137 @@ async fn collect(addr: SocketAddr, prompt: &str) -> Vec<StreamMessage> {
     let client = Client::new(format!("http://{addr}")).unwrap();
     let (tx, mut rx) = mpsc::channel(256);
     let p = prompt.to_string();
-    tokio::spawn(async move { client.stream(p, 8, None, tx).await });
-    let mut out = Vec::new();
-    while let Some(m) = rx.recv().await {
-        out.push(m);
+    let task = tokio::spawn(async move { client.stream(p, 8, None, tx).await });
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        while let Some(m) = rx.recv().await {
+            out.push(m);
+        }
+        out
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
     }
+    let out = result.expect("stream collection hung");
+    task.await.unwrap();
     out
+}
+
+// Compare all decoded fields and ordering without depending on reqwest's
+// internal chunk sizes or adding equality traits to the public client types.
+fn message_values(messages: &[StreamMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| match message {
+            StreamMessage::Token { token_id, text } => serde_json::json!(["token", token_id, text]),
+            StreamMessage::Done {
+                finish_reason,
+                tokens_generated,
+                text,
+            } => serde_json::json!(["done", finish_reason, tokens_generated, text]),
+            StreamMessage::Failed(ClientError::Protocol(message)) => {
+                serde_json::json!(["protocol", message])
+            }
+            StreamMessage::Failed(error) => panic!("unexpected transport/status failure: {error}"),
+            StreamMessage::Ended => serde_json::json!(["ended"]),
+        })
+        .collect()
+}
+
+async fn assert_whole_and_fragmented(body: String, expected: Vec<serde_json::Value>) {
+    let whole_body = body.clone();
+    let whole = mock(move |_| Reply::Once(format!("{}{whole_body}", sse_headers()))).await;
+    let split = mock(move |_| Reply::ByteChunks(body.as_bytes().to_vec())).await;
+    let whole_messages = message_values(&collect(whole, "hi").await);
+    let split_messages = message_values(&collect(split, "hi").await);
+    assert_eq!(whole_messages, expected, "whole-body SSE changed");
+    assert_eq!(
+        split_messages, whole_messages,
+        "one-byte HTTP chunks changed the decoded SSE messages"
+    );
+}
+
+#[tokio::test]
+async fn one_byte_http_chunks_preserve_utf8_tokens_and_done() {
+    let body = concat!(
+        "event: token\ndata: {\"token_id\":1,\"text\":\"Hello\"}\n\n",
+        ": keepalive\n\n",
+        "event: token\ndata: {\"token_id\":2,\"text\":\"é雪🦀\"}\n\n",
+        "event: heartbeat\ndata: {}\n\n",
+        "event: token\ndata: {\"token_id\":3,\"text\":\" world\"}\n\n",
+        "event: token\ndata: {\"token_id\":4,\"text\":\"!\"}\n\n",
+        "event: done\ndata: {\"finish_reason\":\"length\",\"tokens_generated\":4,\"text\":\"終\"}\n\n",
+    );
+    for newline in ["\n", "\r\n"] {
+        assert_whole_and_fragmented(
+            body.replace('\n', newline),
+            vec![
+                serde_json::json!(["token", 1, "Hello"]),
+                serde_json::json!(["token", 2, "é雪🦀"]),
+                serde_json::json!(["token", 3, " world"]),
+                serde_json::json!(["token", 4, "!"]),
+                serde_json::json!(["done", "length", 4, "終"]),
+            ],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn one_byte_http_chunks_preserve_utf8_error_details() {
+    let body = "event: error\ndata: {\"error\":\"server refused é雪🦀\"}\n\n";
+    for newline in ["\n", "\r\n"] {
+        assert_whole_and_fragmented(
+            body.replace('\n', newline),
+            vec![serde_json::json!(["protocol", "server refused é雪🦀"])],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn complete_sse_events_with_invalid_utf8_are_protocol_errors() {
+    for newline in ["\n", "\r\n"] {
+        let mut body = b"event: token\ndata: {\"token_id\":1,\"text\":\"".to_vec();
+        body.push(0xff);
+        body.extend_from_slice(b"\"}\n\n");
+        let body: Vec<_> = body
+            .into_iter()
+            .flat_map(|byte| {
+                if byte == b'\n' {
+                    newline.as_bytes().to_vec()
+                } else {
+                    vec![byte]
+                }
+            })
+            .collect();
+        let addr = mock(move |_| Reply::ByteChunks(body.clone())).await;
+        let messages = collect(addr, "hi").await;
+        assert!(
+            matches!(messages.as_slice(), [StreamMessage::Failed(ClientError::Protocol(message))]
+                if message.contains("UTF-8")),
+            "invalid complete SSE event was not rejected: {messages:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_incomplete_utf8_event_at_body_end_preserves_ended_semantics() {
+    let addr = mock(|_| {
+        Reply::ByteChunks(
+            b"event: token\ndata: {\"token_id\":1,\"text\":\"a\"}\n\nevent: token\ndata: {\"token_id\":2,\"text\":\"\xc3"
+                .to_vec(),
+        )
+    })
+    .await;
+    assert_eq!(
+        message_values(&collect(addr, "hi").await),
+        vec![
+            serde_json::json!(["token", 1, "a"]),
+            serde_json::json!(["ended"]),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -336,9 +481,8 @@ async fn a_hangup_before_any_body_is_an_error_not_a_hang() {
 
 #[tokio::test]
 async fn dropping_the_receiver_stops_the_stream_task() {
-    // How cancellation works: the UI drops its end, the client stops, the
-    // connection closes, and the server sees the disconnect. Repeated here to
-    // confirm the task exits rather than leaking.
+    // A failed send also stops an actively producing client. TUI Escape aborts
+    // the owning generation task instead, so it can stop a stalled body too.
     let addr = mock(|_| {
         let mut parts = vec![(Duration::from_millis(0), sse_headers())];
         for i in 0..500 {

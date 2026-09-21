@@ -68,7 +68,10 @@ enum AppEvent {
     Resize,
     Health(Result<crate::protocol::Health, String>),
     Metrics(Result<crate::protocol::Metrics, String>),
-    Stream(StreamMessage),
+    Stream {
+        generation: u64,
+        message: StreamMessage,
+    },
 }
 
 /// Restores the terminal on every exit path, including panics.
@@ -166,10 +169,12 @@ pub async fn run(server: String, max_tokens: usize) -> Result<()> {
     });
 
     let mut stream_task: Option<JoinHandle<()>> = None;
+    let mut generation = 0;
     let mut ticker = tokio::time::interval(Duration::from_millis(FRAME_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut dirty = true;
 
+    let result = async {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -186,23 +191,11 @@ pub async fn run(server: String, max_tokens: usize) -> Result<()> {
                     AppEvent::Health(Err(e)) => app.on_poll_failure(e),
                     AppEvent::Metrics(Ok(m)) => app.on_metrics(m),
                     AppEvent::Metrics(Err(e)) => app.on_poll_failure(e),
-                    AppEvent::Stream(msg) => match msg {
-                        StreamMessage::Token { text, .. } => app.on_token(&text),
-                        StreamMessage::Done { finish_reason, tokens_generated, text } => {
-                            app.on_done(finish_reason, tokens_generated, &text);
-                            stream_task = None;
-                        }
-                        StreamMessage::Failed(e) => {
-                            app.on_stream_error(e.to_string());
-                            stream_task = None;
-                        }
-                        StreamMessage::Ended => {
-                            app.on_stream_ended();
-                            stream_task = None;
-                        }
-                    },
+                    AppEvent::Stream { generation: source, message } => {
+                        apply_stream_message(source, generation, message, &mut app, &mut stream_task);
+                    }
                     AppEvent::Key(k) => {
-                        if handle_key(k, &mut app, &client, &tx, &mut stream_task) {
+                        if handle_key(k, &mut app, &client, &tx, &mut stream_task, &mut generation) {
                             break;
                         }
                     }
@@ -213,16 +206,94 @@ pub async fn run(server: String, max_tokens: usize) -> Result<()> {
             break;
         }
     }
+    Ok::<(), anyhow::Error>(())
+    }.await;
 
-    // Abort outstanding work before the guard restores the terminal, so no task
-    // can write to a screen that is being torn down.
-    if let Some(t) = stream_task.take() {
-        t.abort();
-    }
+    // Wait for cancellation before terminal teardown, including on draw errors.
+    stop_generation(&mut stream_task).await;
     keys.abort();
     polls.abort();
+    let _ = keys.await;
+    let _ = polls.await;
     drop(guard);
-    Ok(())
+    result
+}
+
+async fn stop_generation(stream_task: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = stream_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+fn apply_stream_message(
+    source: u64,
+    generation: u64,
+    message: StreamMessage,
+    app: &mut App,
+    stream_task: &mut Option<JoinHandle<()>>,
+) {
+    // A cancelled task may already have queued events. They must not resume
+    // the cancelled message or finish a subsequent prompt's generation.
+    if source != generation || stream_task.is_none() {
+        return;
+    }
+    match message {
+        StreamMessage::Token { text, .. } => app.on_token(&text),
+        StreamMessage::Done {
+            finish_reason,
+            tokens_generated,
+            text,
+        } => {
+            app.on_done(finish_reason, tokens_generated, &text);
+            *stream_task = None;
+        }
+        StreamMessage::Failed(e) => {
+            app.on_stream_error(e.to_string());
+            *stream_task = None;
+        }
+        StreamMessage::Ended => {
+            app.on_stream_ended();
+            *stream_task = None;
+        }
+    }
+}
+
+/// Poll the HTTP producer and its forwarding channel in the same task. Aborting
+/// this task drops the producer (and its response), even with no body bytes.
+async fn forward_stream(
+    producer: impl std::future::Future<Output = ()>,
+    mut messages: mpsc::Receiver<StreamMessage>,
+    out: mpsc::Sender<AppEvent>,
+    generation: u64,
+) {
+    tokio::pin!(producer);
+    loop {
+        tokio::select! {
+            _ = out.closed() => return,
+            _ = &mut producer => break,
+            message = messages.recv() => {
+                let Some(message) = message else { return };
+                if out.send(AppEvent::Stream { generation, message }).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    // Completion may have queued Done/Failed immediately before returning.
+    // The producer cannot send again, so drain the finite backlog before exit.
+    while let Ok(message) = messages.try_recv() {
+        if out
+            .send(AppEvent::Stream {
+                generation,
+                message,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// Apply one key. Returns true to quit.
@@ -232,6 +303,7 @@ fn handle_key(
     client: &Client,
     tx: &mpsc::Sender<AppEvent>,
     stream_task: &mut Option<JoinHandle<()>>,
+    generation: &mut u64,
 ) -> bool {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -268,9 +340,9 @@ fn handle_key(
         KeyCode::F(3) => app.toggle_settings(),
 
         KeyCode::Esc => {
-            // Dropping the task drops the HTTP response, which closes the
-            // connection. The server sees the disconnect and cancels at its
-            // next scheduler boundary; there is no second cancel protocol.
+            // This task directly owns the HTTP future. Aborting it drops the
+            // response even while body.next() is stalled; no nested pump is
+            // left waiting for a token to discover cancellation.
             if app.begin_cancel() {
                 if let Some(t) = stream_task.take() {
                     t.abort();
@@ -286,16 +358,12 @@ fn handle_key(
                 let out = tx.clone();
                 let max = app.max_tokens;
                 let sampling = app.settings.request_params();
+                *generation += 1;
+                let current = *generation;
                 *stream_task = Some(tokio::spawn(async move {
-                    let (stx, mut srx) = mpsc::channel::<StreamMessage>(STREAM_BUFFER);
-                    let pump =
-                        tokio::spawn(async move { c.stream(prompt, max, sampling, stx).await });
-                    while let Some(m) = srx.recv().await {
-                        if out.send(AppEvent::Stream(m)).await.is_err() {
-                            break;
-                        }
-                    }
-                    let _ = pump.await;
+                    let (stx, srx) = mpsc::channel::<StreamMessage>(STREAM_BUFFER);
+                    let producer = c.stream(prompt, max, sampling, stx);
+                    forward_stream(producer, srx, out, current).await;
                 }));
             } else if app.conn != ConnState::Connected {
                 app.status = Some(format!("Not connected to {}", app.server));
@@ -323,4 +391,328 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::{MessageState, RequestState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    const LIMIT: Duration = Duration::from_secs(2);
+
+    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(LIMIT, future)
+            .await
+            .expect("TUI task did not finish promptly")
+    }
+
+    async fn read_request(socket: &mut TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut bytes = [0; 1024];
+            let count = bounded(socket.read(&mut bytes)).await.unwrap();
+            assert_ne!(count, 0);
+            request.extend_from_slice(&bytes[..count]);
+            assert!(request.len() < 16 * 1024);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                assert!(headers.starts_with("POST /v1/generate/stream HTTP/1.1"));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    struct Stall {
+        base: String,
+        ready: oneshot::Receiver<()>,
+        closed: oneshot::Receiver<()>,
+        server: JoinHandle<()>,
+    }
+
+    async fn stall(initial: &'static str, reuse: bool) -> Stall {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready) = oneshot::channel();
+        let (closed_tx, closed) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = bounded(listener.accept()).await.unwrap();
+            // Consume the JSON body: the next read must measure EOF, not payload.
+            read_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            if !initial.is_empty() {
+                socket
+                    .write_all(format!("{:x}\r\n{initial}\r\n", initial.len()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            // No more bytes are sent. Cancellation must close this idle body.
+            let mut byte = [0];
+            assert_eq!(bounded(socket.read(&mut byte)).await.unwrap(), 0);
+            closed_tx.send(()).unwrap();
+            if reuse {
+                let (mut socket, _) = bounded(listener.accept()).await.unwrap();
+                read_request(&mut socket).await;
+                let body = "event: done\ndata: {\"finish_reason\":\"length\",\"tokens_generated\":0,\"text\":\"reused\"}\n\n";
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        Stall {
+            base,
+            ready,
+            closed,
+            server,
+        }
+    }
+
+    struct Session {
+        app: App,
+        client: Client,
+        tx: mpsc::Sender<AppEvent>,
+        rx: mpsc::Receiver<AppEvent>,
+        task: Option<JoinHandle<()>>,
+        generation: u64,
+    }
+
+    impl Session {
+        fn new(base: &str) -> Self {
+            let mut app = App::new(base.into(), 8);
+            app.conn = ConnState::Connected;
+            let (tx, rx) = mpsc::channel(16);
+            Self {
+                app,
+                client: Client::new(base).unwrap(),
+                tx,
+                rx,
+                task: None,
+                generation: 0,
+            }
+        }
+
+        fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+            handle_key(
+                KeyEvent::new(code, modifiers),
+                &mut self.app,
+                &self.client,
+                &self.tx,
+                &mut self.task,
+                &mut self.generation,
+            )
+        }
+
+        fn submit(&mut self) {
+            self.app.input.insert_str("test prompt");
+            assert!(!self.key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(self.task.is_some());
+            assert_eq!(self.app.request, RequestState::Submitting);
+        }
+
+        async fn receive(&mut self) {
+            let event = bounded(self.rx.recv())
+                .await
+                .expect("generation channel closed");
+            if let AppEvent::Stream {
+                generation,
+                message,
+            } = event
+            {
+                apply_stream_message(
+                    generation,
+                    self.generation,
+                    message,
+                    &mut self.app,
+                    &mut self.task,
+                );
+            } else {
+                panic!("unexpected event {event:?}");
+            }
+        }
+    }
+
+    async fn escape_and_reuse(initial: &'static str) {
+        let server = stall(initial, true).await;
+        let mut session = Session::new(&server.base);
+        session.submit();
+        bounded(server.ready).await.unwrap();
+        if !initial.is_empty() {
+            session.receive().await;
+            assert_eq!(session.app.messages.last().unwrap().text, "first");
+        }
+        let cancelled = session.generation;
+        assert!(!session.key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(session.task.is_none());
+        assert_eq!(session.app.request, RequestState::Idle);
+        assert_eq!(
+            session.app.messages.last().unwrap().state,
+            MessageState::Cancelled
+        );
+        assert!(session.app.messages.last().unwrap().error.is_none());
+        assert_eq!(session.app.conn, ConnState::Connected);
+        bounded(server.closed).await.unwrap();
+
+        // Already-buffered updates are ignored both while idle and after a new
+        // submission; an old terminal event must not clear the new task handle.
+        apply_stream_message(
+            cancelled,
+            session.generation,
+            StreamMessage::Token {
+                token_id: 99,
+                text: "late".into(),
+            },
+            &mut session.app,
+            &mut session.task,
+        );
+        assert_eq!(session.app.request, RequestState::Idle);
+        session.submit();
+        apply_stream_message(
+            cancelled,
+            session.generation,
+            StreamMessage::Token {
+                token_id: 99,
+                text: "late".into(),
+            },
+            &mut session.app,
+            &mut session.task,
+        );
+        apply_stream_message(
+            cancelled,
+            session.generation,
+            StreamMessage::Done {
+                finish_reason: "length".into(),
+                tokens_generated: 1,
+                text: "late".into(),
+            },
+            &mut session.app,
+            &mut session.task,
+        );
+        assert!(session.task.is_some());
+        assert!(session.app.messages.last().unwrap().text.is_empty());
+        session.receive().await;
+        assert_eq!(session.app.messages.last().unwrap().text, "reused");
+        assert_eq!(
+            session.app.messages.last().unwrap().state,
+            MessageState::Complete
+        );
+        assert_eq!(session.app.request, RequestState::Idle);
+        assert!(session.task.is_none());
+        bounded(server.server).await.unwrap();
+        assert!(session.rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn escape_closes_a_header_only_stream_and_allows_the_next_prompt() {
+        escape_and_reuse("").await;
+    }
+
+    #[tokio::test]
+    async fn escape_keeps_partial_text_cancelled_and_rejects_stale_events() {
+        escape_and_reuse("event: token\ndata: {\"token_id\":1,\"text\":\"first\"}\n\n").await;
+    }
+
+    #[tokio::test]
+    async fn quit_waits_for_a_stalled_generation_to_drop_its_socket() {
+        let server = stall("", false).await;
+        let mut session = Session::new(&server.base);
+        session.submit();
+        bounded(server.ready).await.unwrap();
+        assert!(session.key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        // The same cleanup invoked by run(), before terminal teardown.
+        bounded(stop_generation(&mut session.task)).await;
+        bounded(server.closed).await.unwrap();
+        bounded(server.server).await.unwrap();
+        drop(session.tx);
+        assert!(
+            bounded(session.rx.recv()).await.is_none(),
+            "generation retained an event sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_app_receiver_drops_a_stalled_generation() {
+        let server = stall("", false).await;
+        let mut session = Session::new(&server.base);
+        session.submit();
+        bounded(server.ready).await.unwrap();
+        drop(session.rx);
+        bounded(session.task.take().unwrap()).await.unwrap();
+        bounded(server.closed).await.unwrap();
+        bounded(server.server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn producer_completion_drains_tokens_and_every_terminal_message() {
+        for terminal in [
+            StreamMessage::Done {
+                finish_reason: "length".into(),
+                tokens_generated: 2,
+                text: "終".into(),
+            },
+            StreamMessage::Failed(client::ClientError::Protocol("bad event".into())),
+            StreamMessage::Ended,
+        ] {
+            let expected = format!("{terminal:?}");
+            let (tx, rx) = mpsc::channel(4);
+            let (out, mut events) = mpsc::channel(4);
+            let producer = async move {
+                tx.send(StreamMessage::Token {
+                    token_id: 1,
+                    text: "é".into(),
+                })
+                .await
+                .unwrap();
+                tx.send(StreamMessage::Token {
+                    token_id: 2,
+                    text: "雪🦀".into(),
+                })
+                .await
+                .unwrap();
+                tx.send(terminal).await.unwrap();
+            };
+            // All sends fit immediately. Producer completion wins while the
+            // forwarding channel still holds tokens and its terminal message.
+            bounded(tokio::spawn(forward_stream(producer, rx, out, 7)))
+                .await
+                .unwrap();
+            let mut messages = Vec::new();
+            while let Some(event) = bounded(events.recv()).await {
+                match event {
+                    AppEvent::Stream {
+                        generation: 7,
+                        message,
+                    } => messages.push(format!("{message:?}")),
+                    other => panic!("wrong generation: {other:?}"),
+                }
+            }
+            assert_eq!(
+                messages,
+                vec![
+                    "Token { token_id: 1, text: \"é\" }".to_string(),
+                    "Token { token_id: 2, text: \"雪🦀\" }".to_string(),
+                    expected
+                ]
+            );
+        }
+    }
 }
