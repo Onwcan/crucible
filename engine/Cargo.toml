@@ -44,7 +44,7 @@ async-stream = { version = "0.3", optional = true }
 # HTTP client.
 ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", features = ["event-stream"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [features]
