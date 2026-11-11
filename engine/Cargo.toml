@@ -18,7 +18,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # The GPT-2 pre-tokenizer pattern uses a negative lookahead, which the standard
 # regex crate does not support.
-fancy-regex = "0.13"
+fancy-regex = "0.19"
 
 # CUDA via the driver API. Kernels are compiled at runtime with NVRTC rather
 # than offline with nvcc: CUDA 13's headers conflict with glibc 2.43 on Ubuntu
